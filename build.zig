@@ -23,12 +23,17 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the demo client").dependOn(&run.step);
 
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/agent.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    // src/agent.zig pulls in every library module, and src/main.zig reaches
+    // the demo tools, so between them the two roots cover the whole tree.
+    const test_step = b.step("test", "Run unit tests");
+    for ([_][]const u8{ "src/agent.zig", "src/main.zig" }) |root| {
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(root),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
 }

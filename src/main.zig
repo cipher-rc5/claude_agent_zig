@@ -1,64 +1,10 @@
 // src/main.zig
-// Streams one turn from the agent, exposing an in-process tool the agent can call.
+// Streams one turn from the agent, exposing an in-process tool the agent can
+// call. The tools themselves live in demo_tools.zig.
 
 const std = @import("std");
 const agent = @import("agent.zig");
-
-/// Reads from the host process's environment, reached through the context
-/// pointer rather than a global.
-fn hostEnv(context: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
-    const environ: *const std.process.Environ.Map = @ptrCast(@alignCast(context.?));
-    const obj = switch (arguments) {
-        .object => |o| o,
-        else => return .{ .text = "expected an object", .is_error = true },
-    };
-    const name = switch (obj.get("name") orelse return .{ .text = "missing name", .is_error = true }) {
-        .string => |v| v,
-        else => return .{ .text = "name must be a string", .is_error = true },
-    };
-    const value = environ.get(name) orelse return .{ .text = "not set", .is_error = true };
-    return .{ .text = try arena.dupe(u8, value) };
-}
-
-fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
-    const obj = switch (arguments) {
-        .object => |o| o,
-        else => return .{ .text = "expected an object", .is_error = true },
-    };
-    const a = numberOf(obj.get("a")) orelse return .{ .text = "missing a", .is_error = true };
-    const b = numberOf(obj.get("b")) orelse return .{ .text = "missing b", .is_error = true };
-    return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{a + b}) };
-}
-
-fn numberOf(value: ?std.json.Value) ?f64 {
-    return switch (value orelse return null) {
-        .integer => |i| @floatFromInt(i),
-        .float => |f| f,
-        else => null,
-    };
-}
-
-fn buildTools(environ: *const std.process.Environ.Map) [2]agent.Tool {
-    return .{
-        .{
-            .name = "host_env",
-            .description = "Read an environment variable from the host process.",
-            .input_schema =
-            \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
-            ,
-            .handler = hostEnv,
-            .context = @constCast(@ptrCast(environ)),
-        },
-        .{
-            .name = "add",
-            .description = "Add two numbers.",
-            .input_schema =
-            \\{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}
-            ,
-            .handler = addNumbers,
-        },
-    };
-}
+const demo_tools = @import("demo_tools.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -72,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const out = &stdout.interface;
 
-    const tools = buildTools(init.environ_map);
+    const tools = demo_tools.build(init.environ_map);
     const servers = [_]agent.McpServer{.{ .name = "host", .tools = &tools }};
 
     // AGENT_SKILLS, when set, is a comma list restricting which skills the

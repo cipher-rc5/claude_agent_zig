@@ -109,8 +109,18 @@ whole turn**: call `closeStdin` after the `result` event, not before.
 
 ## Layout
 
-- `src/agent.zig` is the client. No dependencies beyond the standard library.
-- `src/main.zig` is a demo that streams one turn to stdout.
+No dependencies beyond the standard library.
+
+| File | |
+|---|---|
+| `src/agent.zig` | Public surface. Re-exports the types below; import just this. |
+| `src/options.zig` | `Options`, `PermissionMode`, and the CLI flags they become. |
+| `src/event.zig` | `Event` and `Kind`: one protocol line, and how to read it. |
+| `src/tool.zig` | `Tool`, `ToolResult`, `McpServer`: in-process tools. |
+| `src/protocol.zig` | The wire format — every line this process writes to the CLI. |
+| `src/client.zig` | `Client`: process lifecycle, the read loop, control dispatch. |
+| `src/main.zig` | Demo that streams one turn to stdout. |
+| `src/demo_tools.zig` | The two example tools that demo exposes. |
 
 ## Usage
 
