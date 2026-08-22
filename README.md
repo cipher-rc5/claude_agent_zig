@@ -31,9 +31,13 @@ Three layers, all supported.
 Skill, and the rest) run inside the CLI. Nothing to implement; scope them with
 `allowed_tools`, `tools`, and `permission_mode`.
 
-Note that `bare` narrows the built-in set to the shell and file tools, so
-WebSearch, WebFetch, Agent and Skill are simply not registered in a bare
-session. It defaults to off here for that reason.
+Note that `bare` is not a tool sandbox. Per the CLI's own description it skips
+hooks, LSP, plugin sync, attribution, auto-memory, background prefetches,
+keychain reads, and `CLAUDE.md` auto-discovery, and it forces authentication
+through `ANTHROPIC_API_KEY` rather than an existing login. It does not
+deregister WebSearch, WebFetch, or Agent. To actually constrain what the agent
+may reach for, use `tools`, `allowed_tools`, and `permission_mode`; those are
+the tool boundary, and `bare` is not.
 
 **Skills** are filesystem artifacts the CLI discovers and runs. Neither the
 official SDKs nor this one register them programmatically: you author a
@@ -59,8 +63,11 @@ discovery, scoping, and dispatch, all of which are here:
   before the session starts working, which is worth doing when a missing skill
   would be an expensive silent no-op.
 
-`bare` disables skill discovery outright, which is the other reason it now
-defaults to off.
+`bare` skips `CLAUDE.md` auto-discovery and plugin sync, so it changes what a
+session picks up from the filesystem. It does not disable skills outright: the
+CLI states that skills still resolve via `/skill-name` in a bare session. It
+defaults to off here so a session inherits project configuration and an
+existing `claude` login.
 
 `skills` restricts which discovered skills Claude may invoke on its own. It is
 an invocation allowlist rather than a discovery filter: `system/init` still
@@ -141,6 +148,15 @@ while (try client.next()) |event| {
     if (e.textDelta()) |text| try out.writeAll(text);
     if (e.kind == .result) client.closeStdin();
 }
+
+// A CLI that fails on startup produces no events at all, so the loop above
+// ends normally and the exit status is the only thing that says otherwise.
+// `wait` reports it; `close` still returns it for callers who only need the
+// happy path.
+switch (try client.wait()) {
+    .exited => |code| if (code != 0) return error.AgentFailed,
+    else => return error.AgentFailed,
+}
 ```
 
 Multi-turn conversations skip `closeStdin` entirely, read events until a
@@ -161,24 +177,44 @@ guidance.
   schema gains fields regularly, and a strict struct would break on the next
   CLI release. Typed accessors sit on top.
 - `--bare` defaults to off, so a session picks up project configuration and
-  works with an existing `claude` login. Turning it on skips discovery of
-  hooks, plugins, MCP servers, auto memory, and `CLAUDE.md`, and in that mode
-  `ANTHROPIC_API_KEY` must be set.
+  works with an existing `claude` login. Turning it on skips hooks, LSP, plugin
+  sync, auto memory, and `CLAUDE.md` auto-discovery, and in that mode
+  `ANTHROPIC_API_KEY` must be set. It is not a tool boundary; see the note
+  under Tools.
+- `--verbose` is always passed. The streaming protocol requires it, and
+  `extra_args` is appended after the generated flags, so it cannot be removed.
+  Combined with inherited stderr, CLI diagnostics reach the host's terminal.
 - stderr is inherited so CLI startup warnings stay visible. Change to `.pipe`
   if the host needs to capture them.
 - The control channel is pumped only while the caller is inside `next()`. That
   is fine for a turn-driven loop, since the caller is always there while the
   agent is working, but a host that wants to service tool calls from another
   thread needs its own reader task.
+- `Client` is not thread safe. Every method must be called from one thread:
+  there is no lock, and `send` racing `next` interleaves two JSON objects on a
+  single line, which the CLI reads as malformed protocol. This is why
+  `interrupt` is of limited use in practice — abandoning an in-flight turn
+  means calling it while another thread sits in `next`, which is exactly the
+  race above. It is here for hosts that drive the client from their own reader
+  task and can serialize the two.
+- `Options` slices are borrowed, not copied. `sdk_mcp_servers` and `skills`
+  are held by pointer for the life of the client, so whatever backs them has
+  to outlive it. A local array in the function that calls `open` is the easy
+  mistake: the handshake happens inside `open` while the frame is still alive,
+  so the session starts cleanly and only misbehaves later, when a tool call
+  reads freed stack. Give them the same lifetime as the client.
 - The `mcp_response` wrapper on tool replies is load-bearing and undocumented.
   Omit it and the CLI never matches the reply to its request; it stalls until
   its own timeout.
-- Permission callbacks are not implemented. `--permission-prompt-tool stdio`
-  routes prompts through this same control channel as a `permission` request,
-  so it slots into `serveControlRequest` the same way `mcp_message` does.
-  Until then, pre-authorize with `allowed_tools` or a permission mode; an
-  unsupported control request gets an error response rather than silence, so
-  the CLI does not hang.
+- Permission callbacks are not implemented. A permission prompt would arrive as
+  a control request with a subtype other than `mcp_message`, so it would slot
+  into `serveControlRequest` the same way `mcp_message` does. (Earlier notes
+  here cited a `--permission-prompt-tool` flag as the way to route them; no
+  such flag exists in the CLI as of 2.1.228, so the exact mechanism is unknown
+  and would need to be rediscovered against a version that supports it.) Until
+  then, pre-authorize with `allowed_tools` or a permission mode; an unsupported
+  control request gets an error response rather than silence, so the CLI does
+  not hang.
 
 ## Build
 
@@ -187,3 +223,27 @@ zig build
 zig build test
 CLAUDE_BIN=claude zig build run -- "explain this repo"
 ```
+
+A `justfile` wraps the same commands and is the usual entry point. `just`
+alone lists every recipe:
+
+```
+just build                        # zig build
+just test                         # zig build test
+just dev "explain this repo"      # build and run one turn
+just ci                           # fmt-check + test + build, the gate
+just canary                       # check the CLI still accepts what we emit
+just ci-full                      # ci plus the canary
+```
+
+CI is local. A git pre-push hook runs `just ci` and blocks a push whose tree
+does not pass; install it once per clone with `just hooks-install`. The hook
+lives in `.githooks/` rather than `.git/hooks/`, so it is version-controlled.
+`just canary` is deliberately not part of `ci`: it needs the `claude` binary
+and tests the installed CLI rather than the commit, so it belongs in
+`ci-full`, before a release or after a CLI upgrade.
+
+Two environment variables are read by the demo: `CLAUDE_BIN` selects the CLI
+binary, and `AGENT_SKILLS` is a comma list restricting which skills the agent
+may invoke on its own. Leaving `AGENT_SKILLS` unset allows every discovered
+skill; setting it to the empty string allows none.

@@ -1,0 +1,37 @@
+#!/bin/sh
+# Local CI gate. Blocks a push whose tree does not pass `just ci`.
+# Enabled with `just hooks-install` (sets core.hooksPath=.githooks).
+set -e
+
+echo "──────────────────────────────────────────────"
+echo " pre-push: running the local CI gate"
+echo "──────────────────────────────────────────────"
+
+blocked() {
+    echo ""
+    echo "──────────────────────────────────────────────"
+    echo " PUSH BLOCKED — the local CI gate failed."
+    echo " Fix the failure above, or bypass with:"
+    echo "     git push --no-verify"
+    echo "──────────────────────────────────────────────"
+    exit 1
+}
+
+if command -v just >/dev/null 2>&1; then
+    just ci || blocked
+else
+    # `just` is missing. Run the same steps directly rather than passing
+    # silently — a gate that green-lights because a tool is absent is worse
+    # than no gate at all.
+    echo "pre-push: 'just' not found; running the raw zig gate instead."
+    if ! command -v zig >/dev/null 2>&1; then
+        echo "pre-push: neither 'just' nor 'zig' is on PATH; cannot verify this push."
+        blocked
+    fi
+    zig fmt --check build.zig src || blocked
+    zig build test || blocked
+    zig build || blocked
+fi
+
+echo ""
+echo "pre-push: local CI gate passed. Pushing."

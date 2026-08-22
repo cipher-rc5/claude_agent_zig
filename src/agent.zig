@@ -34,6 +34,7 @@ pub const McpServer = tool.McpServer;
 pub const Client = client.Client;
 pub const OpenError = client.OpenError;
 pub const ReadError = client.ReadError;
+pub const WriteError = client.WriteError;
 
 test {
     @import("std").testing.refAllDecls(@This());

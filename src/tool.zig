@@ -12,7 +12,9 @@ pub const ToolResult = struct {
 };
 
 /// Invoked on the client's thread when Claude calls the tool. `arena` is reset
-/// after the result is written, so the handler can allocate freely.
+/// immediately before each dispatch, so the handler can allocate freely and
+/// whatever it returns stays valid until the reply has been written. Nothing
+/// allocated in it survives the next tool call.
 pub const ToolHandler = *const fn (
     context: ?*anyopaque,
     arena: Allocator,
@@ -32,6 +34,9 @@ pub const Tool = struct {
 /// for them looks like `mcp__calc__*`.
 pub const McpServer = struct {
     name: []const u8,
+    /// Reported to the CLI in the `initialize` handshake as this server's own
+    /// version. It matches the package version only by coincidence; the two
+    /// are unrelated and version independently.
     version: []const u8 = "0.1.0",
     tools: []const Tool = &.{},
 

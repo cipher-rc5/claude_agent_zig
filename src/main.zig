@@ -6,6 +6,12 @@ const std = @import("std");
 const agent = @import("agent.zig");
 const demo_tools = @import("demo_tools.zig");
 
+test {
+    // `main` is only reachable at runtime, so without this the test runner
+    // never pulls in the demo tools and their tests silently do not run.
+    _ = demo_tools;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -44,6 +50,9 @@ pub fn main(init: std.process.Init) !void {
         else
             null,
     });
+    // `close` reaps the child; the status it returns is the only signal when
+    // the CLI dies on startup, since that produces no events at all and the
+    // read loop below just ends. Checked after the loop rather than discarded.
     defer _ = client.close();
 
     // A prompt beginning with /name dispatches that skill or command; there
@@ -80,5 +89,20 @@ pub fn main(init: std.process.Init) !void {
             },
             else => {},
         }
+    }
+
+    // A CLI that failed to start streams nothing, so the loop above ends
+    // normally and the exit status is what distinguishes that from success.
+    switch (try client.wait()) {
+        .exited => |code| if (code != 0) {
+            try out.print("[exit] the CLI exited with status {d}\n", .{code});
+            try out.flush();
+            return error.ClaudeCliFailed;
+        },
+        else => |term| {
+            try out.print("[exit] the CLI ended abnormally: {any}\n", .{term});
+            try out.flush();
+            return error.ClaudeCliFailed;
+        },
     }
 }

@@ -11,6 +11,11 @@ pub const PermissionMode = enum {
     auto,
     dont_ask,
     accept_edits,
+    /// Skips every permission check, for every tool, with no prompt and no
+    /// allowlist consulted. That includes writes and shell commands, so the
+    /// agent can do anything the host process can. Use it only where the blast
+    /// radius is already contained, such as a disposable container or VM.
+    bypass_permissions,
     plan,
 
     pub fn cliName(mode: PermissionMode) []const u8 {
@@ -19,6 +24,7 @@ pub const PermissionMode = enum {
             .auto => "auto",
             .dont_ask => "dontAsk",
             .accept_edits => "acceptEdits",
+            .bypass_permissions => "bypassPermissions",
             .plan => "plan",
         };
     }

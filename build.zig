@@ -23,8 +23,9 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the demo client").dependOn(&run.step);
 
-    // src/agent.zig pulls in every library module, and src/main.zig reaches
-    // the demo tools, so between them the two roots cover the whole tree.
+    // src/agent.zig pulls in every library module, and src/main.zig references
+    // the demo tools from a test block so the test runner reaches them, so
+    // between them the two roots cover the whole tree.
     const test_step = b.step("test", "Run unit tests");
     for ([_][]const u8{ "src/agent.zig", "src/main.zig" }) |root| {
         const tests = b.addTest(.{
