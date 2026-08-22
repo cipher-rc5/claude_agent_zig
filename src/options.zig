@@ -142,6 +142,14 @@ pub fn buildArgv(arena: Allocator, options: Options) Allocator.Error![]const []c
     return argv.toOwnedSlice(arena);
 }
 
+// --- tests ---
+
+// These stay here: they exercise `buildArgv`, which is `pub` so client.zig
+// can call it but is not re-exported by agent.zig, so it is not public API.
+// Moving them would mean widening the public surface purely for test layout.
+// `containsPair` is a test helper, so tests/options_test.zig keeps its own
+// copy rather than this one being made public.
+
 fn containsPair(argv: []const []const u8, flag: []const u8, value: []const u8) bool {
     for (argv, 0..) |arg, i| {
         if (!std.mem.eql(u8, arg, flag)) continue;
@@ -186,12 +194,4 @@ test "argv carries skill discovery flags" {
     try std.testing.expect(containsPair(argv, "--max-turns", "12"));
     // --bare would defeat all of the above.
     for (argv) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--bare"));
-}
-
-test "initialize is needed only for sdk servers or a skill allowlist" {
-    const servers = [_]McpServer{.{ .name = "host" }};
-    try std.testing.expect(!(Options{}).needsInitialize());
-    try std.testing.expect((Options{ .sdk_mcp_servers = &servers }).needsInitialize());
-    // An empty allowlist still has to be declared, so it counts.
-    try std.testing.expect((Options{ .skills = &.{} }).needsInitialize());
 }

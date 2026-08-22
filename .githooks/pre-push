@@ -28,7 +28,7 @@ else
         echo "pre-push: neither 'just' nor 'zig' is on PATH; cannot verify this push."
         blocked
     fi
-    zig fmt --check build.zig src || blocked
+    zig fmt --check build.zig src examples tests || blocked
     zig build test || blocked
     zig build || blocked
 fi

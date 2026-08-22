@@ -33,11 +33,11 @@ check:
 
 # Format all Zig sources in place.
 fmt:
-    zig fmt build.zig src
+    zig fmt build.zig src examples tests
 
 # Fail if any Zig source is unformatted; use in CI.
 fmt-check:
-    zig fmt --check build.zig src
+    zig fmt --check build.zig src examples tests
 
 # fmt-check, test, then build — the pre-commit gate.
 ci: fmt-check test build

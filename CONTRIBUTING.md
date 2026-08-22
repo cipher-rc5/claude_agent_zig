@@ -58,7 +58,7 @@ hidden in `.git/hooks/`.
 | `just build` | `zig build` — executable into `zig-out/bin/`. |
 | `just test` | `zig build test` — unit tests across all modules. |
 | `just check` | Build and test with a full `--summary all` step breakdown. |
-| `just fmt` | `zig fmt build.zig src` — formats in place. |
+| `just fmt` | `zig fmt build.zig src examples tests` — formats in place. |
 | `just fmt-check` | Fails if anything is unformatted. Used by `ci`. |
 | `just ci` | `fmt-check` + `test` + `build`. The gate. |
 | `just dev "<prompt>"` | Build and run one turn against the agent. |
@@ -85,8 +85,9 @@ means all).
 it, and do not argue with its output — `just fmt-check` is part of `ci`, so
 unformatted code cannot be committed.
 
-**Every file under `src/` begins with a path comment naming itself**, followed
-by a short line describing the file's role:
+**Every source file begins with a path comment naming itself**, followed by a
+short line describing the file's role. This holds in `src/`, `examples/`, and
+`tests/` alike:
 
 ```zig
 // src/options.zig
@@ -96,21 +97,70 @@ by a short line describing the file's role:
 New source files must follow this. It is how the layout table in the README
 stays checkable against the tree.
 
-**Tests live beside the code they cover**, at the bottom of the module, after a
-`// --- tests ---` divider where the file has one.
+### Where a test goes
 
-Be careful here: Zig only runs tests it can *reach* from a test root's import
-graph. A plain `const x = @import("foo.zig")` does not pull in `foo.zig`'s
-`test` blocks — only an explicit `_ = @import("foo.zig")` or a `refAllDecls`
-reference does. A module that is imported but not referenced that way is
-silently untested, and the summary still prints a reassuring pass line.
+The repo is three directories by role: `src/` is the library, `examples/` is
+the demo, `tests/` is the black-box suite.
 
-So after adding tests, confirm they actually ran. `just test` prints the count;
-if your new tests are not in it, they are not being executed:
+**The rule for a new test is what it needs to touch.**
+
+- Touches only names re-exported by `src/agent.zig` → it goes in `tests/`, as
+  a black-box test, reaching the library through the `agent` module.
+- Touches anything else — a private function, a private field, a private test
+  helper, or a `pub` decl that `agent.zig` does not re-export → it stays in
+  its own module, under the `// --- tests ---` divider, with a brief comment
+  saying which name keeps it there.
+
+That second case is not a stylistic preference. Zig cannot expose a private
+decl to another file without making it public, and the public API is not
+widened for test layout. Note the subtlety in the last clause: several decls
+are `pub` so a sibling module can call them (`buildArgv`, `findServer`, all of
+`protocol.zig`) yet are deliberately absent from `agent.zig`. Those are
+internal, so their tests stay put too.
+
+Two Zig rules make this a hard boundary rather than a soft one:
+
+- **A file belongs to exactly one module.** `protocol.zig` cannot become its
+  own module while `agent.zig` also imports it — the compiler rejects it with
+  "files must belong to only one module".
+- **A root cannot import upward out of its module path.** A file in `tests/`
+  writing `@import("../src/protocol.zig")` fails with "import of file outside
+  module path". The `agent` module is the only route across directories.
+
+### Test discovery
+
+Zig only runs tests it can *reach* from a test root's import graph. A plain
+`const x = @import("foo.zig")` does not pull in `foo.zig`'s `test` blocks —
+only an explicit `_ = @import("foo.zig")` or a `refAllDecls` reference does. A
+module imported but not referenced that way is silently untested, and the
+summary still prints a reassuring pass line.
+
+`build.zig` therefore names three test roots, and each one earns its coverage
+with an explicit `_ =`:
+
+| Root | Reaches |
+|---|---|
+| `src/agent.zig` | The library. Its `test` block `_ =`s every module. |
+| `tests/all.zig` | The black-box suite. Lists each `*_test.zig` with `_ =`. |
+| `examples/demo.zig` | The demo. Its `test` block `_ =`s `demo_tools.zig`. |
+
+**Adding a file to `tests/` means adding a line to `tests/all.zig`.** Without
+it the file compiles, reports success, and runs nothing.
+
+After adding tests, confirm they actually ran:
 
 ```
 zig build test --summary all      # check the reported test count went up
 ```
+
+Read that summary per root, not just the total. A root whose count did not
+move is the signal that an `_ =` is missing.
+
+One caveat on comparing totals across a refactor: a test compiled into two
+roots runs twice and is counted twice. Before the `agent` module existed the
+demo root imported the library by relative path, so the whole library suite
+was compiled into both roots and the reported total was almost double the
+number of distinct tests. Count distinct tests, not summary lines.
 
 **Public API changes go through `src/agent.zig`**, which is the single public
 surface and re-exports everything callers should touch. Keep the README's

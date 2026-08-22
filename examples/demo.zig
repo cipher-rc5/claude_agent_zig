@@ -1,9 +1,13 @@
-// src/main.zig
+// examples/demo.zig
 // Streams one turn from the agent, exposing an in-process tool the agent can
 // call. The tools themselves live in demo_tools.zig.
+//
+// The library is reached through the `agent` module declared in build.zig,
+// not by a relative path: a file may belong to only one module, and a root
+// under examples/ cannot import upward out of its own module path.
 
 const std = @import("std");
-const agent = @import("agent.zig");
+const agent = @import("agent");
 const demo_tools = @import("demo_tools.zig");
 
 test {

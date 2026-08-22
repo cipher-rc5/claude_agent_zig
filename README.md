@@ -118,6 +118,9 @@ whole turn**: call `closeStdin` after the `result` event, not before.
 
 No dependencies beyond the standard library.
 
+Three directories, by role: `src/` is the library, `examples/` is the demo,
+`tests/` is the black-box suite.
+
 | File | |
 |---|---|
 | `src/agent.zig` | Public surface. Re-exports the types below; import just this. |
@@ -126,8 +129,17 @@ No dependencies beyond the standard library.
 | `src/tool.zig` | `Tool`, `ToolResult`, `McpServer`: in-process tools. |
 | `src/protocol.zig` | The wire format — every line this process writes to the CLI. |
 | `src/client.zig` | `Client`: process lifecycle, the read loop, control dispatch. |
-| `src/main.zig` | Demo that streams one turn to stdout. |
-| `src/demo_tools.zig` | The two example tools that demo exposes. |
+| `examples/demo.zig` | Demo that streams one turn to stdout. |
+| `examples/demo_tools.zig` | The two example tools that demo exposes. |
+| `tests/all.zig` | Test root for the suite below; lists each file with `_ =`. |
+| `tests/client_test.zig` | The public shape of `Client` and the re-export surface. |
+| `tests/event_test.zig` | `Event` accessors, over fixed protocol lines. |
+| `tests/options_test.zig` | `Options` and `PermissionMode` on the public surface. |
+| `tests/tool_test.zig` | `Tool`, `ToolResult`, `McpServer` defaults and lookup. |
+
+`build.zig` exposes `src/agent.zig` as a module named `agent`, which is how
+`examples/` and `tests/` reach the library — a Zig file belongs to exactly one
+module, so a root outside `src/` cannot import upward by relative path.
 
 ## Usage
 

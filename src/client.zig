@@ -558,6 +558,12 @@ fn readLine(
 
 // --- tests ---
 
+// Everything below stays in this file. Each test drives one of `readLine`,
+// `writeCommandMessage`, or `serveControlRequest`, all of which are private,
+// and the fixtures reach `reply_override`, a private field. Moving them would
+// mean making internals public purely for test layout. The public shape of
+// `Client` is covered from tests/client_test.zig instead.
+
 /// What one `readLine` call should produce: a line, the clean end of the
 /// stream, or an error.
 const Expected = union(enum) {
@@ -623,26 +629,6 @@ test "a trailing line without a newline is still returned" {
         1024,
         &.{ .{ .line = "{\"a\":1}" }, .{ .line = "{\"b\":2}" }, .end },
     );
-}
-
-test "the write API declares an explicit error set" {
-    // Inferred sets resolve through std.json.Stringify, so a stdlib change
-    // would silently widen the public surface. Pin the three signatures.
-    const Fn = @typeInfo(@TypeOf(Client.send)).@"fn";
-    try std.testing.expectEqual(WriteError!void, Fn.return_type.?);
-    try std.testing.expectEqual(
-        WriteError!void,
-        @typeInfo(@TypeOf(Client.sendCommand)).@"fn".return_type.?,
-    );
-    try std.testing.expectEqual(
-        WriteError!void,
-        @typeInfo(@TypeOf(Client.interrupt)).@"fn".return_type.?,
-    );
-    // StdinClosed is what a post-closeStdin write reports instead of landing
-    // on a stale descriptor, so it has to stay in the set. Coercing it is a
-    // compile error if it is ever dropped.
-    const closed: WriteError = error.StdinClosed;
-    try std.testing.expectEqual(WriteError.StdinClosed, closed);
 }
 
 test "sendCommand builds the command turn without a temporary buffer" {
