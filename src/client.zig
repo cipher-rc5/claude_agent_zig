@@ -276,6 +276,16 @@ pub const Client = struct {
     /// escape hatch at the one moment it is needed. `term` alone is the guard
     /// because re-killing a reaped child is a double-reap, which trips an
     /// assert in the stdlib.
+    ///
+    /// Same thread as every other method. The `term` guard is a plain field
+    /// read with nothing synchronizing it, so calling this from a watchdog
+    /// thread while another sits in `close` or `wait` is that double-reap
+    /// rather than a way around it. Which rules out the tempting use —
+    /// bounding a blocked `close` — and no reordering here recovers it: Zig
+    /// 0.16 exposes no timed or cancellable child wait, so a deadline has to
+    /// come from outside the process. This is for a host that is between turns
+    /// and has decided the child has had long enough, not one already parked
+    /// in a reap.
     pub fn kill(client: *Client) void {
         if (client.term != null) return;
         client.closeStdin();
@@ -1347,17 +1357,4 @@ test "a failed reap leaves kill armed" {
     // rather than the syscall: the condition it branches on names `term` alone.
     try std.testing.expect(client.term == null);
     try std.testing.expect(client.wait_error != null);
-}
-
-test "closeStdin records a failed flush instead of swallowing it" {
-    // A dropped flush loses a queued turn or control reply with no signal at
-    // all, which reads downstream as a CLI that ignored a message. `kill`
-    // returns void and `wait` returns the child's status, so neither can carry
-    // the failure out; the field is how it stays observable.
-    var client: Client = undefined;
-    client.flush_error = null;
-    try std.testing.expect(client.flush_error == null);
-
-    client.flush_error = error.WriteFailed;
-    try std.testing.expectEqual(Io.Writer.Error.WriteFailed, client.flush_error.?);
 }

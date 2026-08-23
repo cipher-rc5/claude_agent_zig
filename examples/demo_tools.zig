@@ -4,8 +4,30 @@
 const std = @import("std");
 const agent = @import("agent");
 
-/// Reads from the host process's environment, reached through the context
-/// pointer rather than a global.
+/// Names `host_env` will answer for. The allowlist is the point of the tool
+/// rather than a detail of it.
+///
+/// A handler's arguments are model-influenced: they arrive over the wire from a
+/// turn the host does not control, so a tool that reads whatever name it is
+/// handed reads whatever name an injected instruction asks for. This process
+/// inherits its parent's environment, which on a developer machine routinely
+/// holds cloud and API credentials, and the demo pre-authorizes `mcp__host__*`
+/// — so an unrestricted version of this tool hands those secrets to the model
+/// on request. Enumerating what may be read is what keeps that from being true,
+/// and it is the pattern to copy: name what a tool may reach, rather than
+/// filtering what it may not.
+const readable_env = [_][]const u8{
+    "HOME",
+    "LANG",
+    "PATH",
+    "PWD",
+    "SHELL",
+    "TERM",
+    "USER",
+};
+
+/// Reads one of `readable_env` from the host process's environment, reached
+/// through the context pointer rather than a global.
 fn hostEnv(context: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
     const environ: *const std.process.Environ.Map = @ptrCast(@alignCast(context.?));
     const obj = switch (arguments) {
@@ -16,8 +38,20 @@ fn hostEnv(context: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.V
         .string => |v| v,
         else => return .{ .text = "name must be a string", .is_error = true },
     };
+
+    // Refused before the lookup, so the reply cannot separate a set secret from
+    // an unset one and confirm a name by which error comes back.
+    if (!isReadable(name)) return .{ .text = "not a readable variable", .is_error = true };
+
     const value = environ.get(name) orelse return .{ .text = "not set", .is_error = true };
     return .{ .text = try arena.dupe(u8, value) };
+}
+
+fn isReadable(name: []const u8) bool {
+    for (readable_env) |allowed| {
+        if (std.mem.eql(u8, allowed, name)) return true;
+    }
+    return false;
 }
 
 /// Adds two operands, keeping integer arithmetic exact.
@@ -187,9 +221,15 @@ pub fn build(environ: *const std.process.Environ.Map) [2]agent.Tool {
     return .{
         .{
             .name = "host_env",
-            .description = "Read an environment variable from the host process.",
+            .description = "Read one of a fixed set of non-secret environment " ++
+                "variables from the host process: HOME, LANG, PATH, PWD, SHELL, " ++
+                "TERM, USER. Any other name is refused.",
+            // `enum` states the same restriction the handler enforces, so the
+            // model is told the boundary rather than discovering it by refusal.
+            // The handler still checks: a schema is a hint to the model, never
+            // a control on what arrives.
             .input_schema =
-            \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+            \\{"type":"object","properties":{"name":{"type":"string","enum":["HOME","LANG","PATH","PWD","SHELL","TERM","USER"]}},"required":["name"]}
             ,
             .handler = hostEnv,
             .context = @ptrCast(@constCast(environ)),
@@ -403,4 +443,47 @@ test "integer addition stays exact past the f64 mantissa" {
         .{},
     );
     try std.testing.expect((try addNumbers(null, a, overflow.value)).is_error);
+}
+
+test "host_env answers only for the allowlisted names" {
+    // The regression this pins is a credential disclosure, not a nicety: the
+    // demo pre-authorizes `mcp__host__*`, the process inherits its parent's
+    // environment, and the tool's argument comes from the model. Drop the
+    // allowlist and a turn that asks for AWS_SECRET_ACCESS_KEY gets it.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var environ: std.process.Environ.Map = .init(a);
+    defer environ.deinit();
+    try environ.put("HOME", "/home/demo");
+    try environ.put("AWS_SECRET_ACCESS_KEY", "sk-must-not-leak");
+
+    const ctx: ?*anyopaque = @ptrCast(@constCast(&environ));
+
+    const allowed = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"HOME\"}", .{});
+    const ok = try hostEnv(ctx, a, allowed.value);
+    try std.testing.expect(!ok.is_error);
+    try std.testing.expectEqualStrings("/home/demo", ok.text);
+
+    // Set, secret, and refused — the value must not appear in the reply.
+    const secret = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        "{\"name\":\"AWS_SECRET_ACCESS_KEY\"}",
+        .{},
+    );
+    const refused = try hostEnv(ctx, a, secret.value);
+    try std.testing.expect(refused.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, refused.text, "sk-must-not-leak") == null);
+
+    // An allowlisted name that happens to be unset is a different answer from a
+    // refusal, and neither reveals whether a non-allowlisted name exists.
+    const unset = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"TERM\"}", .{});
+    try std.testing.expectEqualStrings("not set", (try hostEnv(ctx, a, unset.value)).text);
+    const absent = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"NOPE\"}", .{});
+    try std.testing.expectEqualStrings(
+        "not a readable variable",
+        (try hostEnv(ctx, a, absent.value)).text,
+    );
 }

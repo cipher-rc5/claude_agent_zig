@@ -203,14 +203,30 @@ return — so nothing on this path times out and the host thread stays parked in
 a wait under `Io.Select` clears `child.id`, discarding the handle needed to
 escalate afterwards.
 
-The remedy is `kill()`, and the deadline is the caller's to set, since only the
-host knows what "too long" means for its workload. Arm a timer or a watchdog
-thread before entering the read loop and have it call `kill` when the deadline
-passes; `kill` signals the child and reaps it, which releases the thread parked
-in `close`. Note that `kill` synthesizes `.signal = TERM` rather than observing
-a status, so read `killed` before branching on `term`. A host that cannot
-tolerate a wedged child must arrange this itself — the plain `defer _ =
-client.close()` idiom does not.
+`kill()` is the escape hatch, and the deadline is the caller's to set, since
+only the host knows what "too long" means for its workload. It signals the
+child and reaps it, which releases a thread parked in `close`. Note that `kill`
+synthesizes `.signal = TERM` rather than observing a status, so read `killed`
+before branching on `term`.
+
+**But do not call it from a watchdog thread while another thread sits in
+`close` or `wait`.** That is the obvious shape and it is unsound: `kill` guards
+only on `term`, which nothing synchronizes, so racing it against an in-flight
+reap is a double reap, and the standard library asserts on the second one. The
+`Client` is single threaded (see below), and `kill` is not an exception to
+that.
+
+What this leaves is honest rather than comfortable: within one thread there is
+no way to bound `close`, because the thread that would enforce the deadline is
+the one already blocked. A host that cannot tolerate a wedged child needs the
+bound somewhere this library does not reach — supervise the process externally,
+or spawn the CLI under a wrapper that imposes its own timeout. `kill` is for
+the case where the host is *not* blocked: a turn that has gone on too long by
+the host's own accounting, called between turns rather than during one.
+
+Removing this limitation needs a timed or cancellable child wait, which Zig
+0.16's `Io` vtable does not expose. It is a real constraint of the platform,
+not a decision to revisit here.
 
 Multi-turn conversations skip `closeStdin` entirely, read events until a
 `result` arrives, then call `send` again on the same client. Calling `send`

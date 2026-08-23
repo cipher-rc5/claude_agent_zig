@@ -3,8 +3,14 @@
 
 # Path to the Claude Code CLI the agent spawns.
 export CLAUDE_BIN := env_var_or_default("CLAUDE_BIN", "claude")
-# Comma list restricting which skills the agent may invoke. Unset means all.
-export AGENT_SKILLS := env_var_or_default("AGENT_SKILLS", "")
+# AGENT_SKILLS is deliberately NOT exported here. The demo distinguishes unset
+# (every discovered skill may be invoked) from empty (none may be), and `just`
+# cannot export a variable only when it already exists — an
+# `env_var_or_default(..., "")` export sets it to empty on every run, which
+# turned the documented default into its exact opposite: `just dev` could invoke
+# no skills at all. Left alone, the caller's environment passes straight
+# through, so `AGENT_SKILLS=a,b just dev` still scopes a run and a bare
+# `just dev` still gets the documented default.
 
 default:
     @just --list

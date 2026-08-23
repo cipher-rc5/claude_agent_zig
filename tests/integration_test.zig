@@ -940,3 +940,49 @@ test "kill terminates a child that has not exited on its own" {
     // pid that no longer exists.
     try std.testing.expect(try client.next() == null);
 }
+
+test "closeStdin records a flush that failed against a dead child" {
+    // The field only earns its place if `closeStdin` writes to it. The previous
+    // version of this test assigned `flush_error` directly and read it back,
+    // which passes whether or not `closeStdin` records anything at all.
+    //
+    // Driving a real child is what makes it a regression test, and the ordering
+    // matters: `wait` closes stdin itself, so anything sent after it is refused
+    // with `StdinClosed` and never reaches a flush. The child has to be gone
+    // while stdin is still open, which a stub that exits immediately gives —
+    // queue more than the 16 KiB writer buffer so the data is pushed to a pipe
+    // whose reader is dead, then let `closeStdin` flush the remainder.
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\exit 0
+        \\
+    );
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    // Drain to end of stream: the stub emits nothing and exits, so this returns
+    // as soon as the child is gone, without closing stdin the way `wait` would.
+    while (try client.next()) |event| {
+        var e = event;
+        e.deinit();
+    }
+
+    var sends: usize = 0;
+    var send_error: ?anyerror = null;
+    while (sends < 64) : (sends += 1) {
+        client.send("x" ** 512) catch |err| {
+            send_error = err;
+            break;
+        };
+    }
+
+    client.closeStdin();
+
+    // Writing to a pipe with no reader must be reported somewhere: either the
+    // send that pushed past the buffer saw it, or the closing flush did. A
+    // silent success would mean a queued turn vanished with no signal, which is
+    // exactly what this field exists to prevent.
+    try std.testing.expect(client.flush_error != null or send_error != null);
+}

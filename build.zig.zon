@@ -10,5 +10,10 @@
         "src",
         "examples",
         "tests",
+        "LICENSE",
+        "README.md",
+        "SECURITY.md",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
     },
 }
