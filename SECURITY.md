@@ -24,7 +24,7 @@ review.
 Report privately. Do **not** open a public issue for a security problem.
 
 - Open a private security advisory on the repository:
-  <https://github.com/cipher-rc5/claude_zig> → Security → Report a vulnerability
+  <https://github.com/cipher-rc5/claude_agent_zig> → Security → Report a vulnerability
 - Or contact the repository owner directly on GitHub: [@cipher-rc5](https://github.com/cipher-rc5)
 
 There is no published security contact address, no bug bounty, and no

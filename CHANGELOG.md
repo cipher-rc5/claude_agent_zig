@@ -137,5 +137,5 @@ Initial implementation.
 
 <!-- Both links resolve once `v0.1.0` is tagged and pushed. -->
 
-[Unreleased]: https://github.com/cipher-rc5/claude_zig/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/cipher-rc5/claude_zig/releases/tag/v0.1.0
+[Unreleased]: https://github.com/cipher-rc5/claude_agent_zig/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/cipher-rc5/claude_agent_zig/releases/tag/v0.1.0
