@@ -34,8 +34,22 @@ just versions
 `just ci` is the pre-commit and pre-push gate. It runs, in order:
 
 ```
-just ci   ->  fmt-check  ->  test  ->  build
+just ci   ->  fmt-check  ->  docs-check  ->  test  ->  build
 ```
+
+`docs-check` is there because doc-vs-code drift, not compile failure, is this
+repo's most common defect. `fmt-check`, `test` and `build` are all blind to it.
+It runs `scripts/docs-check.sh`, which checks two things mechanically:
+
+- the README `## Layout` table lists **exactly** the `.zig` files present under
+  `src/`, `examples/` and `tests/` — a missing row and a stale row both fail;
+- the README's `## Usage` ```zig block still **compiles** against the current
+  `agent` module. The block is wrapped in a `main()` and handed to
+  `zig build-exe`; a renamed field or a changed signature fails the build.
+
+It is offline, needs no `claude` binary, runs nothing it compiles, and takes
+about a second. When it fails it prints the compiler error and points at the
+README line — it never edits the README for you.
 
 Run it before every commit. A git **pre-push hook** enforces the same thing, so
 a push whose tree does not pass `just ci` is rejected before it leaves your
@@ -49,6 +63,14 @@ The hook lives under `.githooks/` and is wired up by pointing `core.hooksPath`
 at that directory, so it is version-controlled alongside the code rather than
 hidden in `.git/hooks/`.
 
+The hook validates the **working tree**, while git is pushing specific commits.
+Those coincide only when you are pushing `HEAD` with a clean tree. It reads the
+refs git passes on stdin and prints a warning when they diverge — pushing a
+non-`HEAD` commit, or pushing with uncommitted changes — so a green gate is not
+mistaken for a verdict on the commits actually leaving the machine. The warning
+does not block: pushing a side branch is legitimate, and failing there would
+force `--no-verify`, which also skips the CI run that matters.
+
 ## Recipes
 
 `just` with no arguments lists everything. The full set:
@@ -60,7 +82,8 @@ hidden in `.git/hooks/`.
 | `just check` | Build and test with a full `--summary all` step breakdown. |
 | `just fmt` | `zig fmt build.zig src examples tests` — formats in place. |
 | `just fmt-check` | Fails if anything is unformatted. Used by `ci`. |
-| `just ci` | `fmt-check` + `test` + `build`. The gate. |
+| `just docs-check` | Fails if the README has drifted from the code. Used by `ci`. |
+| `just ci` | `fmt-check` + `docs-check` + `test` + `build`. The gate. |
 | `just dev "<prompt>"` | Build and run one turn against the agent. |
 | `just dev-release "<prompt>"` | Same, `-Doptimize=ReleaseFast`. |
 | `just clean` | Removes `zig-out/` and `.zig-cache/`. |
@@ -68,6 +91,7 @@ hidden in `.git/hooks/`.
 | `just hooks-install` | Points `core.hooksPath` at `.githooks/`. |
 | `just hooks-uninstall` | Clears `core.hooksPath`, disabling the gate. |
 | `just canary` | Checks the installed CLI still accepts every flag and permission mode this client emits. |
+| `just ci-full` | `ci` plus `canary`. Run before a release or after a CLI upgrade. |
 
 `canary` is worth knowing about: the Claude Code CLI is versioned independently
 of this library, so an upgrade can silently break the wire protocol. It probes
@@ -75,9 +99,40 @@ the CLI's `--help` for each flag `buildArgv` generates and exits 0 with a SKIP
 when the CLI is not on `PATH`, so it is safe to run anywhere. It is not part of
 `ci` — run it after upgrading the CLI.
 
+Two details of how it matches matter, because both were once wrong:
+
+- Flag names are matched **anchored** on a word boundary, not as substrings. An
+  unanchored match reports `ok --add-dir` against a CLI that has renamed the
+  flag to `--add-dirs`, which is precisely the drift the canary exists to catch.
+- The permission-mode list is **derived from `src/options.zig`** by parsing the
+  wire names out of `cliName()`, rather than being repeated in the justfile. A
+  hardcoded copy drifts silently when a mode is added, and the mode that went
+  missing was `bypassPermissions` — the one that disables every permission
+  check. If `cliName()` stops being a flat `.tag => "wireName",` switch, the
+  parse yields nothing and the canary fails rather than passing on an empty
+  list.
+
 Two environment variables are honoured: `CLAUDE_BIN` (path to the CLI, default
 `claude`) and `AGENT_SKILLS` (comma list restricting invocable skills; unset
 means all).
+
+## What is not published
+
+`_dev/` holds internal working material — code reviews enumerating this
+codebase's weaknesses, and similar notes. It is **git-ignored and untracked**:
+this is a proprietary all-rights-reserved project, and that material must not
+reach the public repository.
+
+The directory stays on your disk; it is only absent from git. If you add
+anything under `_dev/`, leave it there — do not `git add -f` it, and do not
+move internal notes into a tracked path.
+
+`.gitignore` covers `.zig-cache/`, `zig-out/` and `_dev/`. Confirm a path is
+ignored before assuming it is:
+
+```
+git check-ignore -v _dev
+```
 
 ## Conventions
 

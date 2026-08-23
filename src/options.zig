@@ -81,9 +81,20 @@ pub const Options = struct {
     /// null to allow every discovered skill; pass an empty slice to allow
     /// none. Sent on the `initialize` control request rather than as a CLI
     /// flag, so it needs no `extra_args`.
+    ///
+    /// BORROWED, not copied. `Client.open` keeps this slice and the strings it
+    /// points at, and re-reads them on every `initialize`, so both must stay
+    /// valid until `Client.close`. A slice of a stack array in the scope that
+    /// calls `open` is the usual way to get this wrong.
     skills: ?[]const []const u8 = null,
     /// In-process MCP servers. Tools live in this process and are reached
     /// over the control protocol, so no subprocess is involved.
+    ///
+    /// BORROWED, not copied. `Client.open` keeps this slice, and every tool
+    /// call for the life of the session resolves its handler, context pointer,
+    /// and schema through it, so it must stay valid until `Client.close`.
+    /// Unlike most fields here, this outlives the `open` call by the whole
+    /// session.
     sdk_mcp_servers: []const McpServer = &.{},
     /// Resume an existing session by id.
     resume_session_id: ?[]const u8 = null,
@@ -92,7 +103,15 @@ pub const Options = struct {
 
     stdout_buffer_size: usize = 64 * 1024,
     stdin_buffer_size: usize = 16 * 1024,
-    /// Refuse to buffer a single protocol line larger than this.
+    /// Refuse to buffer a single protocol line larger than this. The boundary
+    /// is inclusive: a line of exactly this many bytes is accepted, and one
+    /// byte more is rejected with `error.ProtocolTooLong`, which costs that
+    /// one line rather than the stream.
+    ///
+    /// Must not be zero. Every line, the empty one included, is larger than a
+    /// zero-byte budget, so no line could ever be read; `Client.open` rejects
+    /// it with `error.InvalidMaxLineBytes` rather than letting the read loop
+    /// fail forever.
     max_line_bytes: usize = 32 * 1024 * 1024,
 
     /// Whether the session needs an `initialize` control request before the

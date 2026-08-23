@@ -39,8 +39,15 @@ fmt:
 fmt-check:
     zig fmt --check build.zig src examples tests
 
-# fmt-check, test, then build — the pre-commit gate.
-ci: fmt-check test build
+# Doc-vs-code drift is this repo's dominant defect class, and fmt/test/build
+# are all blind to it. Checks the README Layout table against the real tree and
+# recompiles the README's usage example against the current API.
+# Fail if README.md has drifted from the code.
+docs-check:
+    @bash scripts/docs-check.sh
+
+# fmt-check, docs-check, test, then build — the pre-commit gate.
+ci: fmt-check docs-check test build
 
 # Remove build outputs and the local Zig cache.
 clean:
@@ -86,7 +93,12 @@ canary:
                 --setting-sources --add-dir --plugin-dir --agents \
                 --disable-slash-commands --strict-mcp-config --mcp-config \
                 --resume; do
-        if printf '%s' "$help" | grep -q -- "$flag"; then
+        # Anchored on both sides. An unanchored substring match reports
+        # `ok --add-dir` when the CLI has actually renamed the flag to
+        # --add-dirs, which is exactly the drift this canary exists to catch.
+        # A real occurrence is preceded by start-of-line or whitespace and
+        # followed by whitespace, a comma, '<', '=', or end-of-line.
+        if printf '%s' "$help" | grep -qE -- "(^|[[:space:]])${flag}([[:space:],<=]|$)"; then
             echo "  ok      $flag"
         else
             echo "  MISSING $flag"
@@ -105,9 +117,26 @@ canary:
         echo "  ok      --max-turns (undocumented in --help; accepted by the parser)"
     fi
 
-    # Permission-mode values emitted by src/options.zig cliName().
+    # Permission-mode values emitted by src/options.zig cliName(). Derived from
+    # the source rather than hardcoded here: a hardcoded list silently drifts
+    # when a mode is added, and the mode that went missing last time was
+    # bypassPermissions — the one that disables every permission check.
+    # cliName() is a flat `.tag => "wireName",` switch, so the wire names are
+    # exactly the quoted strings on its `=>` arms.
+    modes="$(awk '
+        /pub fn cliName/ { in_fn = 1; next }
+        in_fn && /^[[:space:]]*}[[:space:]]*$/ { in_fn = 0 }
+        in_fn && /=>/ { if (match($0, /"[^"]+"/)) print substr($0, RSTART + 1, RLENGTH - 2) }
+    ' src/options.zig)"
+    if [ -z "$modes" ]; then
+        echo "  MISSING permission modes — could not parse cliName() out of src/options.zig."
+        echo "          The canary refuses to pass on an empty mode list."
+        fail=1
+    fi
+    echo "  modes emitted by src/options.zig cliName(): $(printf '%s' "$modes" | tr '\n' ' ')"
+
     choices="$(printf '%s' "$help" | grep -A6 -- '--permission-mode')"
-    for mode in manual auto dontAsk acceptEdits plan; do
+    for mode in $modes; do
         if printf '%s' "$choices" | grep -q -- "\"$mode\""; then
             echo "  ok      --permission-mode $mode"
         else

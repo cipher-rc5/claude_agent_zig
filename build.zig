@@ -1,4 +1,5 @@
 // build.zig
+// Build graph: the `agent` module, the demo executable, and the three test roots.
 
 const std = @import("std");
 

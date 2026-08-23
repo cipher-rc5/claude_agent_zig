@@ -92,15 +92,17 @@ stdin/stdout pipe, so no subprocess and no socket is involved:
 
 ```zig
 fn addNumbers(_: ?*anyopaque, arena: Allocator, args: std.json.Value) !agent.ToolResult {
-    // ...
+    // ... parse `a` and `b` out of `args`, reporting bad input as
+    // `.{ .text = "...", .is_error = true }` rather than failing the turn.
     return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{a + b}) };
 }
 
 const tools = [_]agent.Tool{.{
     .name = "add",
-    .description = "Add two numbers.",
+    .description = "Add two numbers. Send each as a decimal string so " ++
+        "large integers stay exact.",
     .input_schema =
-    \\{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}
+    \\{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"]}
     ,
     .handler = addNumbers,
     .context = @ptrCast(&my_state),
@@ -109,10 +111,29 @@ const tools = [_]agent.Tool{.{
 const servers = [_]agent.McpServer{.{ .name = "host", .tools = &tools }};
 ```
 
+The operands are declared as strings rather than numbers on purpose. A JSON
+`number` is an IEEE 754 double by the time it reaches the wire, so an argument
+above 2^53 arrives already rounded no matter how exact the handler is —
+measured against the CLI, `{"type":"integer"}` rounds exactly the same way. A
+decimal string is the only shape that survives the round trip, so a tool that
+cares about exactness asks for one and parses it itself. `examples/demo_tools.zig`
+carries the worked version, including what it rejects.
+
 Claude sees these as `mcp__host__add`, so the allow rule is `mcp__host__*`.
 Handlers run on the caller's thread, inside `next()`, between two conversation
 events. Because tool calls come back over stdin, **stdin must stay open for the
 whole turn**: call `closeStdin` after the `result` event, not before.
+
+A handler's text is capped at `agent.max_tool_result_bytes` (16 KiB). Return
+more and the model gets an `is_error` result saying the output was too long,
+rather than the payload. The cap is not arbitrary: the reply is written to the
+child's stdin from inside `next()`, so a reply larger than the pipe buffer
+blocks there while the child blocks writing stdout that nothing is draining —
+both processes wedge, and `kill` is unreachable because the caller's thread is
+inside `next()`. Zig 0.16 has no non-blocking or readiness primitive for a
+child pipe, so a ceiling below the smallest plausible pipe buffer is the fix.
+A tool with more to say should return a summary, or write the payload
+somewhere the agent can read with its own file tools.
 
 ## Layout
 
@@ -134,6 +155,7 @@ Three directories, by role: `src/` is the library, `examples/` is the demo,
 | `tests/all.zig` | Test root for the suite below; lists each file with `_ =`. |
 | `tests/client_test.zig` | The public shape of `Client` and the re-export surface. |
 | `tests/event_test.zig` | `Event` accessors, over fixed protocol lines. |
+| `tests/integration_test.zig` | The real client against scripted stub CLIs: lifecycle, tool calls, framing. |
 | `tests/options_test.zig` | `Options` and `PermissionMode` on the public surface. |
 | `tests/tool_test.zig` | `Tool`, `ToolResult`, `McpServer` defaults and lookup. |
 

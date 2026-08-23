@@ -9,6 +9,7 @@
 test {
     _ = @import("client_test.zig");
     _ = @import("event_test.zig");
+    _ = @import("integration_test.zig");
     _ = @import("options_test.zig");
     _ = @import("tool_test.zig");
 }

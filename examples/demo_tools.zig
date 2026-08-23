@@ -33,48 +33,146 @@ fn hostEnv(context: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.V
 ///
 /// Accepting JSON numbers as well keeps ordinary calls ergonomic; they simply
 /// carry the usual double precision.
+///
+/// Every operand is classified once, and a value the schema does not promise
+/// is reported rather than guessed at. That covers three shapes that used to
+/// slip through as plausible-looking answers: an integer literal too large for
+/// `i64`, a non-decimal spelling such as `"0x10"` or `"1_000"`, and anything
+/// that is or becomes non-finite.
 fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
     const obj = switch (arguments) {
         .object => |o| o,
         else => return .{ .text = "expected an object", .is_error = true },
     };
-    const a = obj.get("a") orelse return .{ .text = "missing a", .is_error = true };
-    const b = obj.get("b") orelse return .{ .text = "missing b", .is_error = true };
+    const a = operandOf(obj.get("a") orelse return .{ .text = "missing a", .is_error = true });
+    const b = operandOf(obj.get("b") orelse return .{ .text = "missing b", .is_error = true });
 
-    // Exact whenever both operands are integers, whichever way they arrived.
-    if (integerOf(a)) |x| {
-        if (integerOf(b)) |y| {
-            const sum = std.math.add(i64, x, y) catch
-                return .{ .text = "sum out of range", .is_error = true };
-            return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{sum}) };
-        }
+    // Report the operand itself before reporting anything about the sum: an
+    // out-of-range integer is a rejected input, not an arithmetic result.
+    switch (a) {
+        .invalid => return .{ .text = "a must be a number in decimal", .is_error = true },
+        .out_of_range => return .{ .text = "a is out of range", .is_error = true },
+        else => {},
+    }
+    switch (b) {
+        .invalid => return .{ .text = "b must be a number in decimal", .is_error = true },
+        .out_of_range => return .{ .text = "b is out of range", .is_error = true },
+        else => {},
     }
 
-    const x = numberOf(a) orelse return .{ .text = "a must be a number", .is_error = true };
-    const y = numberOf(b) orelse return .{ .text = "b must be a number", .is_error = true };
-    return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{x + y}) };
+    // Exact whenever both operands are integers, whichever way they arrived.
+    if (a == .integer and b == .integer) {
+        const sum = std.math.add(i64, a.integer, b.integer) catch
+            return .{ .text = "sum out of range", .is_error = true };
+        return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{sum}) };
+    }
+
+    // Mixed and fractional operands add in f128, which holds any `i64` and any
+    // `f64` without rounding either one. Adding in f64 instead would discard
+    // an integer operand's exactness the moment the other side was fractional:
+    // 0.5 + 9007199254740993 answered ...992 rather than ...993.5.
+    const sum = a.wide() + b.wide();
+    if (!inF64Range(sum)) return .{ .text = "sum out of range", .is_error = true };
+    return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{sum}) };
 }
 
-/// The operand as an exact integer, whether it arrived as a JSON integer or as
-/// a decimal string. A string that is not an integer (`"1.5"`, `"abc"`) is not
-/// one, so it falls through to the float path.
-fn integerOf(value: std.json.Value) ?i64 {
+/// One classified operand. `out_of_range` is kept distinct from `invalid`
+/// because the two call for different answers: a well-formed integer that no
+/// longer fits is a range error worth naming, while `"abc"` is not a number at
+/// all. Folding the first into the second is what let `"9223372036854775808"`
+/// fall through to the float path and come back as a wrong number.
+const Operand = union(enum) {
+    integer: i64,
+    float: f128,
+    out_of_range,
+    invalid,
+
+    /// The operand in the width the mixed path adds in.
+    fn wide(self: Operand) f128 {
+        return switch (self) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => unreachable,
+        };
+    }
+};
+
+/// Classifies one argument, whether it arrived as a JSON number or as the
+/// decimal string the schema asks for.
+fn operandOf(value: std.json.Value) Operand {
     return switch (value) {
-        .integer => |i| i,
-        .string => |s| std.fmt.parseInt(i64, s, 10) catch null,
-        else => null,
+        .integer => |i| .{ .integer = i },
+        .float => |f| if (std.math.isFinite(f)) .{ .float = f } else .out_of_range,
+        .string => |s| parseDecimal(s),
+        else => .invalid,
     };
 }
 
-/// The operand as a float, for the cases integer arithmetic cannot cover.
-/// Strings are accepted here too, so `"1.5"` behaves like `1.5`.
-fn numberOf(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |i| @floatFromInt(i),
-        .float => |f| f,
-        .string => |s| std.fmt.parseFloat(f64, s) catch null,
-        else => null,
-    };
+/// Parses a decimal operand. The schema promises "a number in decimal", so
+/// this validates the spelling first rather than inheriting whatever
+/// `parseFloat` happens to accept — it also takes hex, binary, octal, Zig's
+/// `_` digit separators, and the words `inf` and `nan`, none of which the
+/// schema offers and none of which a JSON number could have carried.
+fn parseDecimal(s: []const u8) Operand {
+    if (!isDecimal(s)) return .invalid;
+    if (std.fmt.parseInt(i64, s, 10)) |i| {
+        return .{ .integer = i };
+    } else |err| switch (err) {
+        // Well-formed digits that do not fit. Reported, never retried as a
+        // float: an f64 answer here would be silently wrong.
+        error.Overflow => return .out_of_range,
+        error.InvalidCharacter => {},
+    }
+    const f = std.fmt.parseFloat(f128, s) catch return .invalid;
+    // `"1e400"` is spelled in decimal but names no value this tool can carry.
+    return if (inF64Range(f)) .{ .float = f } else .out_of_range;
+}
+
+/// Whether an `f128` names a value the tool's own domain covers.
+///
+/// f128 is the width the mixed path adds in, not the range it promises: the
+/// operands are `number`s, and a JSON number is an f64. Bounding by f64
+/// instead of by f128's own limits keeps that promise in both directions —
+/// `"1e400"` is rejected rather than answered, and `1e308 + 1e308` is reported
+/// as out of range rather than returning a 309-digit value f64 cannot hold.
+/// The extra mantissa is still used, so 0.5 + 9007199254740993 stays exact.
+fn inF64Range(f: f128) bool {
+    return std.math.isFinite(f) and @abs(f) <= std.math.floatMax(f64);
+}
+
+/// True for the decimal grammar the schema describes: an optional sign, digits
+/// with an optional fractional part (either side may be empty, but not both),
+/// and an optional decimal exponent. Deliberately narrower than `parseFloat`.
+fn isDecimal(s: []const u8) bool {
+    var rest = s;
+    if (rest.len > 0 and (rest[0] == '+' or rest[0] == '-')) rest = rest[1..];
+
+    const int_digits = digitRun(rest);
+    rest = rest[int_digits..];
+
+    var frac_digits: usize = 0;
+    if (rest.len > 0 and rest[0] == '.') {
+        rest = rest[1..];
+        frac_digits = digitRun(rest);
+        rest = rest[frac_digits..];
+    }
+    if (int_digits == 0 and frac_digits == 0) return false;
+
+    if (rest.len > 0 and (rest[0] == 'e' or rest[0] == 'E')) {
+        rest = rest[1..];
+        if (rest.len > 0 and (rest[0] == '+' or rest[0] == '-')) rest = rest[1..];
+        const exp_digits = digitRun(rest);
+        if (exp_digits == 0) return false;
+        rest = rest[exp_digits..];
+    }
+    return rest.len == 0;
+}
+
+/// The length of the leading run of ASCII digits.
+fn digitRun(s: []const u8) usize {
+    var n: usize = 0;
+    while (n < s.len and std.ascii.isDigit(s[n])) n += 1;
+    return n;
 }
 
 pub fn build(environ: *const std.process.Environ.Map) [2]agent.Tool {
@@ -173,6 +271,101 @@ test "decimal strings are the shape that survives the wire" {
         .{},
     );
     try std.testing.expect((try addNumbers(null, a, overflow.value)).is_error);
+}
+
+test "an integer too large for i64 is reported, not answered as a float" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // i64::MAX + 1. One past the value the test above covers, and the point
+    // where treating a failed `parseInt` as "not an integer" used to hand the
+    // operand to the float path: the answer came back 9223372036854776000
+    // with is_error false, which is a wrong number reported as a good one.
+    for ([_][]const u8{
+        "{\"a\":\"9223372036854775808\",\"b\":\"1\"}",
+        "{\"a\":\"99999999999999999999999999\",\"b\":\"1\"}",
+        "{\"a\":\"1\",\"b\":\"-9223372036854775809\"}",
+    }) |input| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{});
+        const result = try addNumbers(null, a, parsed.value);
+        try std.testing.expect(result.is_error);
+    }
+}
+
+test "each operand keeps its own exactness" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // b is exact past 2^53 and a is fractional. Adding in f64 would round the
+    // pair to 9007199254740992 — b's exactness discarded because a's was not
+    // available. The mixed path adds in f128, which holds both.
+    const mixed = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        "{\"a\":\"0.5\",\"b\":\"9007199254740993\"}",
+        .{},
+    );
+    const result = try addNumbers(null, a, mixed.value);
+    try std.testing.expectEqualStrings("9007199254740993.5", result.text);
+    try std.testing.expect(!result.is_error);
+
+    // The same either way round.
+    const swapped = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        "{\"a\":\"9007199254740993\",\"b\":\"0.5\"}",
+        .{},
+    );
+    try std.testing.expectEqualStrings("9007199254740993.5", (try addNumbers(null, a, swapped.value)).text);
+}
+
+test "the handler honours its own schema" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The schema says "a number in decimal". None of these are one, and each
+    // used to produce a confident answer: inf, nan, a silent overflow to inf,
+    // 32 from hex, and 1000 from Zig's digit separators.
+    for ([_][]const u8{
+        "{\"a\":\"inf\",\"b\":\"1\"}",
+        "{\"a\":\"-inf\",\"b\":\"1\"}",
+        "{\"a\":\"nan\",\"b\":\"1\"}",
+        "{\"a\":\"1e400\",\"b\":\"1\"}",
+        "{\"a\":1e308,\"b\":1e308}",
+        "{\"a\":\"0x10\",\"b\":\"0x10\"}",
+        "{\"a\":\"1_000\",\"b\":\"0\"}",
+        "{\"a\":\"0b101\",\"b\":\"1\"}",
+        "{\"a\":\"0o17\",\"b\":\"1\"}",
+        "{\"a\":\"\",\"b\":\"1\"}",
+        "{\"a\":\" 5\",\"b\":\"1\"}",
+        "{\"a\":\"5 \",\"b\":\"1\"}",
+        "{\"a\":\".\",\"b\":\"1\"}",
+        "{\"a\":\"1e\",\"b\":\"1\"}",
+        "{\"a\":true,\"b\":1}",
+        "{\"a\":null,\"b\":1}",
+    }) |input| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{});
+        const result = try addNumbers(null, a, parsed.value);
+        try std.testing.expect(result.is_error);
+    }
+
+    // The spellings the grammar does promise keep working.
+    for ([_][2][]const u8{
+        .{ "{\"a\":\"1e10\",\"b\":\"0\"}", "10000000000" },
+        .{ "{\"a\":\"+5\",\"b\":\"1\"}", "6" },
+        .{ "{\"a\":\".5\",\"b\":\"0\"}", "0.5" },
+        .{ "{\"a\":\"5.\",\"b\":\"0\"}", "5" },
+        .{ "{\"a\":\"1.5e2\",\"b\":\"0\"}", "150" },
+        .{ "{\"a\":\"-2.5E1\",\"b\":\"0\"}", "-25" },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, case[0], .{});
+        const result = try addNumbers(null, a, parsed.value);
+        try std.testing.expect(!result.is_error);
+        try std.testing.expectEqualStrings(case[1], result.text);
+    }
 }
 
 test "integer addition stays exact past the f64 mantissa" {

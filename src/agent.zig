@@ -36,6 +36,17 @@ pub const OpenError = client.OpenError;
 pub const ReadError = client.ReadError;
 pub const WriteError = client.WriteError;
 
+/// Re-exported from `std.process.Child`: both appear in the signatures of
+/// `Client.wait` and `Client.close`, so a caller that names either type would
+/// otherwise need its own `@import("std")` purely to spell a return value.
+pub const Term = @import("std").process.Child.Term;
+pub const WaitError = @import("std").process.Child.WaitError;
+
+/// The ceiling on a tool handler's result text. A handler returning more gets
+/// an `is_error` result in its place; see `Client.max_tool_result_bytes` for
+/// why the bound exists.
+pub const max_tool_result_bytes = client.max_tool_result_bytes;
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = options;

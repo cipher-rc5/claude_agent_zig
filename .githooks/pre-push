@@ -17,6 +17,37 @@ blocked() {
     exit 1
 }
 
+# The gate below validates the WORKING TREE, but git is pushing specific
+# commits, named on stdin as `<local-ref> <local-sha> <remote-ref> <remote-sha>`.
+# Those two coincide only when HEAD is what is being pushed and the tree is
+# clean. Read stdin and warn when they diverge, so a green gate is not mistaken
+# for a verdict on the commits actually leaving the machine.
+#
+# Warn, not fail: pushing an older commit or a side branch is legitimate, and
+# this is a solo local gate. Failing closed here would block valid pushes with
+# no override short of --no-verify, which also skips the CI run that matters.
+head_sha=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+zero=$(printf '0%.0s' $(seq 1 40))
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    # A delete (`git push :branch`) pushes nothing; there is no tree to check.
+    if [ "$local_sha" = "$zero" ]; then
+        echo "pre-push: NOTE — $remote_ref is being deleted; nothing to verify."
+        continue
+    fi
+    if [ "$local_sha" != "$head_sha" ]; then
+        echo "pre-push: WARNING — pushing $local_ref ($(git rev-parse --short "$local_sha" 2>/dev/null || echo "$local_sha"))"
+        echo "          but the gate below runs against HEAD ($(git rev-parse --short HEAD 2>/dev/null || echo unknown))."
+        echo "          A pass does NOT certify the commit being pushed."
+    fi
+done
+
+if ! git diff --quiet HEAD 2>/dev/null; then
+    echo "pre-push: WARNING — the working tree has uncommitted changes."
+    echo "          The gate below tests the tree on disk, not the commits being"
+    echo "          pushed. A pass does NOT certify what leaves the machine."
+fi
+
 if command -v just >/dev/null 2>&1; then
     just ci || blocked
 else
@@ -29,6 +60,13 @@ else
         blocked
     fi
     zig fmt --check build.zig src examples tests || blocked
+    # Same docs drift gate `just ci` runs. Plain bash + zig, no `just` needed.
+    if [ -x scripts/docs-check.sh ]; then
+        bash scripts/docs-check.sh || blocked
+    else
+        echo "pre-push: scripts/docs-check.sh missing; cannot verify doc drift."
+        blocked
+    fi
     zig build test || blocked
     zig build || blocked
 fi
