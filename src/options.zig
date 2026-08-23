@@ -35,12 +35,20 @@ pub const Options = struct {
     claude_path: []const u8 = "claude",
     /// Working directory for the agent.
     cwd: std.process.Child.Cwd = .inherit,
-    /// Skip auto-discovery of hooks, plugins, MCP servers, auto memory and
-    /// CLAUDE.md. Also narrows the built-in tool set to the shell and file
-    /// tools, so WebSearch, WebFetch, Agent, Skill and the rest are not
-    /// registered. Off by default; turn it on only for locked-down CI runs
-    /// that want a fixed tool set, and note it requires ANTHROPIC_API_KEY
-    /// rather than subscription auth.
+    /// Skip discovery: hooks, LSP, plugin sync, attribution, auto memory,
+    /// background prefetches, keychain reads, and CLAUDE.md auto-discovery.
+    /// Authentication is forced through ANTHROPIC_API_KEY rather than an
+    /// existing `claude` login, so that variable must be set in the child's
+    /// environment.
+    ///
+    /// NOT a tool boundary. It does not deregister WebSearch, WebFetch, Agent,
+    /// or anything else built in, and skills still resolve via `/skill-name`.
+    /// An earlier version of this doc claimed otherwise, which is the kind of
+    /// mistake that gets read at the call site and believed: what constrains
+    /// the agent is `allowed_tools`, `tools`, and `permission_mode`.
+    ///
+    /// Off by default, so a session inherits project configuration and an
+    /// existing login.
     bare: bool = false,
     /// Emit `stream_event` deltas as tokens are produced.
     include_partial_messages: bool = true,

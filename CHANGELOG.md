@@ -27,9 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Everything outside `src/` now reaches the library through a module named
   `agent` rather than by relative path, since a Zig file belongs to exactly one
   module and a root outside `src/` cannot import upward.
-- The reported test count fell from 62 to 39 without losing coverage: the demo
-  root used to import the library by relative path, so the library suite
-  compiled into two roots and ran twice.
+- The reported test count stopped double-counting. The demo root used to import
+  the library by relative path, so the library suite compiled into two roots and
+  ran twice; the count `zig build test` printed was inflated rather than the
+  coverage being larger. Each test now runs exactly once, summed across the
+  three roots — `src/agent.zig`, `tests/all.zig`, and `examples/demo.zig`. No
+  count is quoted here because it moves with every test added; run
+  `zig build test --summary all` for the current figure and its per-root split.
 - Hardening across the client: an explicit `WriteError` on the write path
   instead of one inferred through `std.json.Stringify`, `StdinClosed` returned
   for a send after `closeStdin` rather than an assert that vanishes in
@@ -135,7 +139,11 @@ Initial implementation.
 - Permission callbacks are not implemented; pre-authorize with `allowed_tools`
   or a permission mode.
 
-<!-- Both links resolve once `v0.1.0` is tagged and pushed. -->
+<!--
+Version links are deliberately absent. No tag exists yet (`git tag -l` is
+empty), so a compare or release URL for `v0.1.0` would 404. Add them here once
+the tag is pushed:
 
-[Unreleased]: https://github.com/cipher-rc5/claude_agent_zig/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/cipher-rc5/claude_agent_zig/releases/tag/v0.1.0
+    [Unreleased]: .../compare/v0.1.0...HEAD
+    [0.1.0]:      .../releases/tag/v0.1.0
+-->

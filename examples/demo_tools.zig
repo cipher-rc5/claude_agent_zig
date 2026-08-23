@@ -88,11 +88,19 @@ const Operand = union(enum) {
     invalid,
 
     /// The operand in the width the mixed path adds in.
+    ///
+    /// The rejected variants are named rather than folded into an `else`. Both
+    /// are unreachable here — `addNumbers` answers an `is_error` result for
+    /// each before the mixed path runs — but an `else` would also swallow a
+    /// variant added later, turning a rejected input into a panic that takes
+    /// the host process down. `arguments` is model-influenced data, so that is
+    /// the one failure mode this must not have; naming the arms makes a new
+    /// variant a compile error here instead.
     fn wide(self: Operand) f128 {
         return switch (self) {
             .integer => |i| @floatFromInt(i),
             .float => |f| f,
-            else => unreachable,
+            .out_of_range, .invalid => unreachable,
         };
     }
 };

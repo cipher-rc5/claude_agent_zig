@@ -284,6 +284,89 @@ const no_read_stub =
     "sleep 0.2\n" ++
     "exit 0\n";
 
+/// Runs `body` under a deadline, failing the test if it outlives one.
+///
+/// The whole point of `max_tool_result_bytes` is that a regression there
+/// DEADLOCKS rather than fails: `next` blocks in `writev` on a stdin pipe
+/// nobody is draining while the child blocks writing the stdout whose only
+/// reader is that same `next` frame. The caller's thread is inside `next`, so
+/// nothing in this process can break the cycle. A test asserting the bound
+/// therefore has to bound its own runtime, or the regression it exists to
+/// catch hangs `just ci` forever instead of failing it.
+///
+/// How this is possible in Zig 0.16 at all: `std.testing.io` is an
+/// `Io.Threaded` built with default options, so `Io.Select` really can run two
+/// tasks concurrently, and `Io.Threaded` implements cancelation by
+/// `pthread_kill`-ing the blocked thread with `SIGIO` — which returns `EINTR`
+/// out of a blocking syscall. So `cancelDiscard` genuinely unblocks a `writev`
+/// stuck on a full pipe; it is not merely abandoning the task. Verified
+/// against a real spawned child that never reads its stdin.
+///
+/// `body` returns a bool rather than `!void` because its result crosses a task
+/// boundary into the select's union: an error union would have to be stored
+/// and re-raised, and the only thing this needs to know is pass or fail.
+///
+/// Deliberately NOT a general-purpose harness. Every other test in this file
+/// is bounded by its stub terminating on its own, which is cheaper and needs
+/// no concurrency. This exists for the one test whose failure mode is a hang.
+fn underDeadline(comptime body: fn () bool, millis: i64) !void {
+    const Race = union(enum) { body: bool, deadline: void };
+
+    const tasks = struct {
+        fn run() bool {
+            return body();
+        }
+        fn timer(ms: i64) void {
+            // A cancel arrives here as `error.Canceled` once `body` wins the
+            // race, which is the normal path and not a failure.
+            io.sleep(.fromMilliseconds(ms), .awake) catch {};
+        }
+    };
+
+    var buf: [2]Race = undefined;
+    var race: std.Io.Select(Race) = .init(io, &buf);
+    try race.concurrent(.body, tasks.run, .{});
+    try race.concurrent(.deadline, tasks.timer, .{millis});
+
+    const first = try race.await();
+    // Cancels whichever task lost. When that is `body`, this is the call that
+    // interrupts its blocked syscall, so the test process still exits.
+    race.cancelDiscard();
+
+    switch (first) {
+        .body => |ok| try std.testing.expect(ok),
+        // The deadline won: `body` was still inside `next`, which is the
+        // deadlock this bound exists to prevent.
+        .deadline => return error.DeadlineExceeded,
+    }
+}
+
+/// The body of the test below, lifted out so `underDeadline` can run it as a
+/// task. Returns false instead of raising, per that function's contract.
+fn oversizedToolResultFitsPipe() bool {
+    var size: usize = 4 * 1024 * 1024;
+    const servers = [_]agent.McpServer{.{
+        .name = "s",
+        .tools = &.{.{
+            .name = "t",
+            .description = "d",
+            .handler = fillerHandler,
+            .context = &size,
+        }},
+    }};
+
+    var stub = Stub.init(no_read_stub) catch return false;
+    defer stub.deinit();
+
+    const client = stub.open(.{ .sdk_mcp_servers = &servers }) catch return false;
+    defer _ = client.close();
+
+    // Reaching this at all is the assertion: the dispatch inside `next`
+    // wrote the reply without blocking, so the drain ran to end of stream.
+    const count = drain(client) catch return false;
+    return count == 1;
+}
+
 test "an oversized tool result fits the pipe even when the child never reads" {
     // THE REGRESSION, in the configuration that makes it bite. `next` is the
     // only reader of the child's stdout, so a reply larger than the stdin pipe
@@ -301,26 +384,13 @@ test "an oversized tool result fits the pipe even when the child never reads" {
     // past the bound still fits a 64 KiB pipe and would pass either way, which
     // would make this test decorative. `tool result one byte over the cap`
     // below covers the boundary itself.
-    var size: usize = 4 * 1024 * 1024;
-    const servers = [_]agent.McpServer{.{
-        .name = "s",
-        .tools = &.{.{
-            .name = "t",
-            .description = "d",
-            .handler = fillerHandler,
-            .context = &size,
-        }},
-    }};
-
-    var stub = try Stub.init(no_read_stub);
-    defer stub.deinit();
-
-    const client = try stub.open(.{ .sdk_mcp_servers = &servers });
-    defer _ = client.close();
-
-    // Reaching this at all is the assertion: the dispatch inside `next`
-    // wrote the reply without blocking, so the drain ran to end of stream.
-    try std.testing.expectEqual(@as(usize, 1), try drain(client));
+    //
+    // Run under a deadline because this is the one test here whose failure
+    // mode is a hang rather than a wrong answer: if the bound regressed, both
+    // processes would block forever and `just ci` would never return. The
+    // budget is ~15x the stub's own 0.2s lifetime, so only a genuine deadlock
+    // can reach it — a slow CI machine cannot.
+    try underDeadline(oversizedToolResultFitsPipe, 3_000);
 }
 
 /// Like `tool_call_stub`, but prints the reply straight back out as the
@@ -664,4 +734,209 @@ test "open refuses a zero max_line_bytes before spawning anything" {
         error.InvalidMaxLineBytes,
         stub.open(.{ .max_line_bytes = 0 }),
     );
+}
+
+// --- the write side, read back off a real pipe ---
+
+/// Reads one line of the client's stdin and echoes it straight back out as the
+/// `sent` field of a `system` event, then exits.
+///
+/// The counterpart to `echo_reply_stub`, for the three public write methods
+/// instead of the tool-reply path. Without it the write side is unobserved:
+/// `send`, `sendCommand` and `interrupt` are all `void` on success, so a method
+/// that emitted malformed JSON — or nothing at all — would pass every test that
+/// only checks it did not return an error.
+///
+/// Same two rules as `read_reply`. `|| exit 0` bounds the read: the client
+/// closes stdin on the way into `wait`, so a line that never comes ends as EOF
+/// rather than a block. And the echoed line is nested raw (`%s`, unquoted)
+/// because it is itself JSON, keeping the envelope parseable in one pass.
+///
+/// One read, not two: none of these tests set `sdk_mcp_servers`, so
+/// `Options.needsInitialize` is false and `open` writes nothing ahead of the
+/// test's own line. The first line read here is the one under test.
+const echo_stdin_stub =
+    "#!/bin/sh\n" ++
+    "IFS= read -r sent || exit 0\n" ++
+    "printf '{\"type\":\"system\",\"subtype\":\"echo\",\"sent\":%s}\\n' \"$sent\"\n" ++
+    "exit 0\n";
+
+/// Runs `write` against a child that echoes its stdin, and hands back the line
+/// the child received, parsed. Caller owns the returned tree.
+///
+/// The write happens before any `next` call, so the line is already in the pipe
+/// when the stub reads it — and the stub only prints after its `read` returns,
+/// so an event arriving at all means the line was written, flushed and
+/// newline-terminated on a real pipe.
+fn echoedStdin(write: *const fn (*agent.Client) agent.WriteError!void) !std.json.Parsed(std.json.Value) {
+    var stub = try Stub.init(echo_stdin_stub);
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    try write(client);
+
+    var echoed: ?std.json.Parsed(std.json.Value) = null;
+    errdefer if (echoed) |*p| p.deinit();
+    while (try client.next()) |event| {
+        var e = event;
+        defer e.deinit();
+        if (e.kind != .system) continue;
+        const sent = e.parsed.value.object.get("sent") orelse continue;
+        // Re-parse into a tree the caller owns; `e.parsed` dies with the event.
+        var buf: std.Io.Writer.Allocating = .init(gpa);
+        defer buf.deinit();
+        var js: std.json.Stringify = .{ .writer = &buf.writer };
+        try js.write(sent);
+        // `.alloc_always` for the same reason as in `echoedReply`: without it
+        // the tree borrows `buf`, which this iteration's defer frees.
+        echoed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            buf.written(),
+            .{ .allocate = .alloc_always },
+        );
+    }
+    return echoed orelse error.NoLineEchoed;
+}
+
+/// The single text block of a user turn, walked field by field so a turn that
+/// came back with the wrong envelope fails here rather than passing a
+/// substring check against text that happens to contain the right bytes.
+fn userTurnText(root: std.json.Value) ![]const u8 {
+    try std.testing.expectEqualStrings("user", root.object.get("type").?.string);
+    const message = root.object.get("message").?;
+    try std.testing.expectEqualStrings("user", message.object.get("role").?.string);
+    const content = message.object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    return content[0].object.get("text").?.string;
+}
+
+fn sendHello(client: *agent.Client) agent.WriteError!void {
+    // Characters that must survive JSON escaping intact. A turn assembled by
+    // concatenation rather than encoded would arrive with a bare quote and
+    // fail to parse at all, which the walk above would catch as a hard error.
+    return client.send("hello \"world\"\n\t done");
+}
+
+test "send writes a well-formed user turn the child can read back" {
+    // The success path of `send` was never observed. It is called once
+    // elsewhere in this suite and no stub reads what it wrote, so a `send`
+    // emitting malformed JSON — or nothing — passed every test in the file.
+    var parsed = try echoedStdin(sendHello);
+    defer parsed.deinit();
+
+    // The child parsed it: `printf '%s'` spliced the line into an envelope
+    // that had to survive a second parse on the way back here.
+    try std.testing.expectEqualStrings(
+        "hello \"world\"\n\t done",
+        try userTurnText(parsed.value),
+    );
+}
+
+fn sendReview(client: *agent.Client) agent.WriteError!void {
+    return client.sendCommand("code-review", "src/");
+}
+
+fn sendBareCommand(client: *agent.Client) agent.WriteError!void {
+    return client.sendCommand("compact", "");
+}
+
+test "sendCommand writes the slash form as a user turn" {
+    // `sendCommand` was covered only for `error.StdinClosed`, so its actual
+    // output was never checked against a child. The text is assembled by
+    // `writeCommandMessage` through `beginWriteRaw`, escaping the name and
+    // arguments in pieces straight into the writer — a path with no unit test
+    // downstream of a real pipe.
+    var with_args = try echoedStdin(sendReview);
+    defer with_args.deinit();
+    try std.testing.expectEqualStrings("/code-review src/", try userTurnText(with_args.value));
+
+    // Empty arguments write no separator, so the text is the bare command
+    // rather than a name with a trailing space.
+    var bare = try echoedStdin(sendBareCommand);
+    defer bare.deinit();
+    try std.testing.expectEqualStrings("/compact", try userTurnText(bare.value));
+}
+
+fn sendInterrupt(client: *agent.Client) agent.WriteError!void {
+    return client.interrupt();
+}
+
+test "interrupt writes a control_request the child can read back" {
+    // Also covered only for `error.StdinClosed` until now. Unlike the two
+    // above this is a control_request, not a user turn, and it carries a
+    // request_id the CLI matches its response to — a wrong shape here stalls
+    // the CLI until its own timeout rather than failing visibly.
+    var parsed = try echoedStdin(sendInterrupt);
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    try std.testing.expectEqualStrings("control_request", root.object.get("type").?.string);
+    const request = root.object.get("request").?;
+    try std.testing.expectEqualStrings("interrupt", request.object.get("subtype").?.string);
+    // The id is generated per client, so only its presence and shape are
+    // fixed. `zig_1` because nothing else on this client wrote a line first.
+    try std.testing.expectEqualStrings("zig_1", request.object.get("request_id").?.string);
+}
+
+// --- kill on a child that has not exited ---
+
+/// A stub that stays alive without ever exiting on its own within the test's
+/// window, so `kill` has a live child to signal.
+///
+/// Every other stub in this file races to its own `exit`, which means `kill`
+/// has only ever been tested against a child that had already reaped itself —
+/// the branch that returns early. This one prints its line and then sleeps, so
+/// the `Child.kill` call underneath actually signals a running process.
+///
+/// The sleep is a bounded lifetime, not a synchronization primitive, exactly
+/// as in `no_read_stub`: if `kill` never arrives the stub exits by itself and
+/// the test fails on a stale assertion rather than hanging `just ci`. 3s is far
+/// longer than the microseconds the kill actually takes, so the signal always
+/// wins the race in practice, and the cost is paid only if it does not.
+///
+/// `trap '' PIPE` for the same reason as `two_line_stub`: `kill` closes stdin
+/// first, and the stub must not die of a signal this test did not send.
+const sleeping_stub =
+    \\#!/bin/sh
+    \\trap '' PIPE
+    \\printf '{"type":"system","subtype":"init","session_id":"L1"}\n'
+    \\sleep 3
+    \\exit 0
+    \\
+;
+
+test "kill terminates a child that has not exited on its own" {
+    // The recovery path, against the only child in this suite that does not
+    // reap itself first. `kill` here does real work: it signals a live process
+    // and reaps it, rather than returning early because `term` was already set.
+    var stub = try Stub.init(sleeping_stub);
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    // Read the one line the stub prints before it sleeps, so the child is
+    // provably running — not merely spawned — when the kill lands.
+    var e = (try client.next()).?;
+    try std.testing.expectEqual(agent.Kind.system, e.kind);
+    e.deinit();
+
+    client.kill();
+
+    // Synthesized, not observed: `Child.kill` reaps internally and returns
+    // void, so SIGTERM is an assumption. `killed` is what marks it as one.
+    try std.testing.expect(client.killed);
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .signal = std.posix.SIG.TERM },
+        try client.wait(),
+    );
+
+    // Reaching here at all is half the assertion: `wait` after `kill` answers
+    // from the cache instead of reaping a second time, which would block on a
+    // pid that no longer exists.
+    try std.testing.expect(try client.next() == null);
 }

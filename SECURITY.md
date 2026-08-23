@@ -84,6 +84,25 @@ ultimately **model-influenced data**: a handler must validate its arguments and
 must not assume they are well-typed or benign. A handler that panics takes down
 the host process.
 
+### Control replies are written to the child's stdin
+
+Tool results and other control-protocol replies are not queued or handed to a
+writer task: they are written directly to the child's stdin from inside
+`Client.next()`, on the caller's own thread, while a turn is in flight. That
+makes stdin a resource shared between the caller's `send`/`closeStdin` calls
+and the client's own reply path, and the two are only separated by the
+single-threaded discipline `Client` already requires.
+
+The constraint that follows is that stdin must stay open for the whole turn: a
+reply issued after `closeStdin` has no valid descriptor to write to. Because
+the stdlib closes the descriptor rather than holding it open, the number can be
+reused by anything else the host opens afterwards, so an unguarded write of
+this kind targets a closed or recycled descriptor rather than failing cleanly —
+which means a protocol reply, whose contents are model-influenced, can land in
+an unrelated file. Call `closeStdin` only after the `result` event, and treat
+the client's single-thread rule as load-bearing for this reason and not only
+for framing.
+
 ### Error names reach the model
 
 When a tool handler returns an error, `src/client.zig` stringifies it with

@@ -193,6 +193,25 @@ switch (try client.wait()) {
 }
 ```
 
+**`close()` can block forever on a child that never exits.** Both `close` and
+`wait` reap the child with an unbounded blocking wait, so the `defer _ =
+client.close()` above returns only when the CLI actually exits. A CLI that is
+hung but alive never returns an error from that wait — it simply does not
+return — so nothing on this path times out and the host thread stays parked in
+`close` indefinitely. This is a real constraint rather than an oversight: Zig
+0.16's `Io` vtable exposes no timed or non-blocking child wait, and cancelling
+a wait under `Io.Select` clears `child.id`, discarding the handle needed to
+escalate afterwards.
+
+The remedy is `kill()`, and the deadline is the caller's to set, since only the
+host knows what "too long" means for its workload. Arm a timer or a watchdog
+thread before entering the read loop and have it call `kill` when the deadline
+passes; `kill` signals the child and reaps it, which releases the thread parked
+in `close`. Note that `kill` synthesizes `.signal = TERM` rather than observing
+a status, so read `killed` before branching on `term`. A host that cannot
+tolerate a wedged child must arrange this itself — the plain `defer _ =
+client.close()` idiom does not.
+
 Multi-turn conversations skip `closeStdin` entirely, read events until a
 `result` arrives, then call `send` again on the same client. Calling `send`
 while a turn is still in flight is also valid; the CLI treats it as mid-turn

@@ -28,6 +28,12 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const out = &stdout.interface;
 
+    // Skipped lines are reported here rather than on stdout so that piping
+    // stdout still yields only the agent's output.
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
+    const log = &stderr.interface;
+
     const tools = demo_tools.build(init.environ_map);
     const servers = [_]agent.McpServer{.{ .name = "host", .tools = &tools }};
 
@@ -64,7 +70,24 @@ pub fn main(init: std.process.Init) !void {
     try client.send(prompt);
     // stdin stays open for the turn: it is the return path for tool calls.
 
-    while (try client.next()) |event| {
+    while (true) {
+        // Two of the four `ReadError`s cost one line and no more, so aborting
+        // on them throws away a stream the library went out of its way to keep:
+        // on an overlong line `readLine` discards through the next newline to
+        // resync to a clean line boundary (src/client.zig), and a line that is
+        // not JSON never reaches the reader's state at all. Either way the
+        // following line parses normally, so the loop reports the gap and reads
+        // on. The rest are not per-line faults — the pipe is gone or the
+        // allocator is empty — and there is no next line to advance to.
+        const event = client.next() catch |err| switch (err) {
+            error.ProtocolTooLong, error.InvalidJson => {
+                try log.print("[skipped] unreadable line: {t}\n", .{err});
+                try log.flush();
+                continue;
+            },
+            else => |fatal| return fatal,
+        } orelse break;
+
         var e = event;
         defer e.deinit();
 
@@ -97,16 +120,24 @@ pub fn main(init: std.process.Init) !void {
 
     // A CLI that failed to start streams nothing, so the loop above ends
     // normally and the exit status is what distinguishes that from success.
+    // Returning an error here would collapse every failure into one name and
+    // drop the status itself, which is the only detail a shell caller can act
+    // on. Exiting with the child's own code forwards it instead. `process.exit`
+    // does not unwind, so stdout is flushed first and the `defer`s above are
+    // deliberately given up: the child is already reaped by `wait`, and the
+    // remaining allocations die with the process.
     switch (try client.wait()) {
         .exited => |code| if (code != 0) {
             try out.print("[exit] the CLI exited with status {d}\n", .{code});
             try out.flush();
-            return error.ClaudeCliFailed;
+            std.process.exit(code);
         },
+        // Signalled or stopped: there is no exit code to forward, and 1 is the
+        // conventional stand-in.
         else => |term| {
             try out.print("[exit] the CLI ended abnormally: {any}\n", .{term});
             try out.flush();
-            return error.ClaudeCliFailed;
+            std.process.exit(1);
         },
     }
 }

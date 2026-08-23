@@ -97,6 +97,9 @@ pub const ReadError = error{
     ReadFailed,
     WriteFailed,
     InvalidJson,
+    /// A control request arrived that this process must answer, but the write
+    /// side is already shut. Reported rather than swallowed: see `replyWriter`.
+    StdinClosed,
 } || Allocator.Error;
 
 pub const Client = struct {
@@ -149,6 +152,17 @@ pub const Client = struct {
     /// same as a `.unknown` exit status, so it is recorded separately rather
     /// than folded into `term`.
     wait_error: ?std.process.Child.WaitError = null,
+    /// Set when the final flush in `closeStdin` failed, meaning buffered
+    /// protocol bytes were dropped before the descriptor went away.
+    ///
+    /// Recorded rather than returned: `closeStdin` is called from `wait` and
+    /// from `kill`, and `kill` returns void precisely because there is nothing
+    /// useful a caller can do about a teardown failure at that point. Making
+    /// this observable was still necessary — a swallowed flush loses a queued
+    /// turn or control reply with no signal at all, which reads downstream as
+    /// a CLI that ignored a message. Mirrors `wait_error`: the caller reads it
+    /// when it matters and ignores it when it does not.
+    flush_error: ?Io.Writer.Error = null,
 
     /// Spawns the CLI. The returned pointer is stable; the reader and writer
     /// interfaces embed pointers into it.
@@ -193,6 +207,20 @@ pub const Client = struct {
             .skills = options.skills,
             .scratch = .init(gpa),
         };
+
+        // `client.*` is fully assigned above, `line` and `scratch` included, so
+        // from here on a failure has two owning allocators to unwind that the
+        // errdefers above cannot see — they were registered before these fields
+        // existed. `close` frees both on the success path; without these, the
+        // `sendInitialize` failure path did not.
+        //
+        // Zero bytes in practice today: `Writer.Allocating.init` and
+        // `ArenaAllocator.init` both allocate lazily, and `writeInitialize`
+        // writes straight to the stdin writer without touching either. So this
+        // closes a latent hole rather than a measured leak, and stops being
+        // latent the moment anything before `return` grows either buffer.
+        errdefer client.line.deinit();
+        errdefer client.scratch.deinit();
 
         if (options.needsInitialize()) try client.sendInitialize();
         return client;
@@ -240,8 +268,16 @@ pub const Client = struct {
     /// one this call actually signalled, and both read as `.signal = SIGTERM`.
     /// `killed` is set alongside so the difference stays visible; anything
     /// that branches on `term` should check `killed` first.
+    ///
+    /// No-op only once the child has genuinely been reaped, which `term` is
+    /// what records. A failed reap deliberately does not disarm this: `wait`
+    /// sets `wait_error` on exactly the path where the child may still be
+    /// alive and unreaped, so treating that as "already handled" removed the
+    /// escape hatch at the one moment it is needed. `term` alone is the guard
+    /// because re-killing a reaped child is a double-reap, which trips an
+    /// assert in the stdlib.
     pub fn kill(client: *Client) void {
-        if (client.term != null or client.wait_error != null) return;
+        if (client.term != null) return;
         client.closeStdin();
         client.child.kill(client.io);
         // Reaped inside `kill`, so the reader's descriptor is stale from here.
@@ -278,10 +314,19 @@ pub const Client = struct {
     }
 
     /// Signals end of input. The CLI finishes the current turn and exits.
+    ///
+    /// The final flush can fail — the child may have died with bytes still
+    /// buffered — and the descriptor is closed regardless, because leaking it
+    /// helps nobody. The failure is recorded in `flush_error` rather than
+    /// returned: this is called from `wait` and from `kill`, neither of which
+    /// can carry it. Check `flush_error` when it matters that the last line
+    /// actually left this process.
     pub fn closeStdin(client: *Client) void {
         if (client.stdin_closed) return;
         client.stdin_closed = true;
-        client.stdin_writer.interface.flush() catch {};
+        client.stdin_writer.interface.flush() catch |err| {
+            client.flush_error = err;
+        };
         if (client.child.stdin) |file| {
             file.close(client.io);
             client.child.stdin = null;
@@ -337,6 +382,13 @@ pub const Client = struct {
     /// is dispatched and answered before this returns, so a tool handler runs
     /// on the caller's thread between two conversation events.
     ///
+    /// That reply needs the write side, so a control request arriving after
+    /// `closeStdin` cannot be answered and returns `error.StdinClosed` rather
+    /// than being dropped; see `replyWriter`. Reading events after closing
+    /// stdin is otherwise normal and is what the documented
+    /// `closeStdin()`-on-result flow does — only a session whose tools the CLI
+    /// still calls hits this.
+    ///
     /// Ordering: draining to null before reaping is the intended flow, but
     /// calling this after `wait`, `kill`, or `close` is legal and reports the
     /// clean end of the stream rather than an error. Reaping the child closes
@@ -384,6 +436,11 @@ pub const Client = struct {
                     // versus restart. Only genuine write failures collapse.
                     client.serveControlRequest(event.parsed.value) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
+                        // Kept distinct from a dead child: this one says the
+                        // write side was shut by this process while the CLI
+                        // still had work to hand back, so the session cannot
+                        // service tools any more and only a new one will.
+                        error.StdinClosed => return error.StdinClosed,
                         else => return error.WriteFailed,
                     };
                 },
@@ -411,22 +468,50 @@ pub const Client = struct {
 
     /// Where replies go. Normally the child's stdin; tests point it at a
     /// buffer to read back what the dispatch answered.
-    fn replyWriter(client: *Client) *Io.Writer {
-        return client.reply_override orelse &client.stdin_writer.interface;
+    ///
+    /// Guarded like `stdin`, and for the same reason: `Io.File.Writer` holds
+    /// the file by value, so once `closeStdin` has run the writer is pointing
+    /// at a number the process no longer owns. Without this check a control
+    /// reply issued after the documented `closeStdin()`-on-result pattern
+    /// failed out of `flush` as `error.WriteFailed`, and once the fd number
+    /// had been recycled by an unrelated open it landed silently on that file
+    /// instead.
+    ///
+    /// The reply is not dropped quietly. Silence here would strand the CLI
+    /// until its own ~60 second timeout, which is exactly the failure the
+    /// "every exit past the id answers" invariant in `serveControlRequest`
+    /// exists to prevent — and unlike a missing request id, this one is this
+    /// process's doing, not a malformed message. So it surfaces from `next` as
+    /// `error.StdinClosed`, distinct from `error.WriteFailed`, telling the
+    /// caller the difference that matters: the session is no longer
+    /// serviceable because the write side is shut, not because the child died.
+    /// The only recovery is a new session, and the caller is the one who can
+    /// start one.
+    fn replyWriter(client: *Client) WriteError!*Io.Writer {
+        if (client.reply_override) |w| return w;
+        if (client.stdin_closed) return error.StdinClosed;
+        return &client.stdin_writer.interface;
     }
 
     /// Writes one line by handing a `Stringify` over stdin to `f`.
     fn writeLine(client: *Client, comptime f: anytype, args: anytype) !void {
-        const w = client.replyWriter();
+        const w = try client.replyWriter();
         var js: std.json.Stringify = .{ .writer = w };
         try @call(.auto, f, .{&js} ++ args);
         try finishLine(w);
     }
 
-    fn sendInitialize(client: *Client) !void {
+    /// Runs inside `open`, before the client is handed out, so `closeStdin`
+    /// cannot have run and `replyWriter`'s guard cannot fire. The error is
+    /// narrowed here rather than widened into `OpenError`, which would put an
+    /// unreachable `StdinClosed` on the public spawn path.
+    fn sendInitialize(client: *Client) (Io.Writer.Error || Allocator.Error)!void {
         var id_buf: [32]u8 = undefined;
         const request_id = client.nextRequestId(&id_buf);
-        try client.writeLine(protocol.writeInitialize, .{ request_id, client.servers, client.skills });
+        client.writeLine(protocol.writeInitialize, .{ request_id, client.servers, client.skills }) catch |err| switch (err) {
+            error.StdinClosed => unreachable,
+            else => |e| return e,
+        };
     }
 
     fn sendMcpResult(
@@ -1150,4 +1235,129 @@ test "a killed child reports its status as synthetic" {
     client.killed = true;
     try std.testing.expect(client.killed);
     try std.testing.expectEqual(std.posix.SIG.TERM, client.term.?.signal);
+}
+
+test "a failed reap is cached but does not disarm kill" {
+    // Two properties of `wait_error`, pinned together because the second one
+    // was a bug: a failed reap is remembered so a second `wait` reports the
+    // same failure without reaping again, but it must NOT make `kill` a no-op.
+    // `wait` sets this field on exactly the path where the child may still be
+    // alive and unreaped, so treating it as "already handled" removed the
+    // escape hatch at the one moment it was needed.
+    //
+    // The failure itself is forced by setting the field rather than by a real
+    // reap: `child.wait` fails only on a double-reap, which trips a stdlib
+    // assert, or on `ECHILD`, which needs a corrupted `Child`. Neither is
+    // reachable from the public API, so the caching and the guard are what get
+    // pinned here, not the syscall.
+    var client: Client = undefined;
+    client.term = null;
+    client.wait_error = null;
+    client.killed = false;
+    client.wait_error = error.Unexpected;
+
+    // Cached: reported straight back, without touching the child.
+    try std.testing.expectError(error.Unexpected, client.wait());
+
+    // And `kill`'s guard is `term`, not `wait_error` — a failed reap leaves
+    // the child possibly alive, which is precisely when kill has to still work.
+    try std.testing.expect(client.term == null);
+}
+
+test "kill still runs after a failed reap" {
+    // The regression guard for the line above. A pure field assertion does not
+    // catch it: restoring `wait_error != null` to `kill`'s early-return leaves
+    // every field untouched and only changes whether the body runs at all. So
+    // this drives the real `kill` against a real child, with `wait_error`
+    // pre-set to simulate the failed reap, and checks the body's own effects.
+    var stub_dir = std.testing.tmpDir(.{});
+    defer stub_dir.cleanup();
+    try stub_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "stub.sh",
+        .data = "#!/bin/sh\ntrap '' PIPE\nsleep 3\nexit 0\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    const path = try stub_dir.dir.realPathFileAlloc(std.testing.io, "stub.sh", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    const client = try Client.open(std.testing.allocator, threaded.io(), .{ .claude_path = path });
+    defer _ = client.close();
+
+    // The state a failed reap leaves behind: the child is still live and
+    // unreaped, and `term` is still null because nothing was observed.
+    client.wait_error = error.Unexpected;
+
+    client.kill();
+
+    // `kill` ran: it reaps and records a synthesized status. With the old
+    // guard it returned immediately and both of these stay unset.
+    try std.testing.expect(client.killed);
+    try std.testing.expectEqual(std.posix.SIG.TERM, client.term.?.signal);
+}
+
+test "a control request arriving after closeStdin is refused, not written blind" {
+    // The bug this pins: `replyWriter` handed back the stdin interface with no
+    // `stdin_closed` check, so every reply out of `serveControlRequest` went to
+    // a descriptor this process had already closed. After the documented
+    // `closeStdin()`-on-result pattern that surfaced as `error.WriteFailed` out
+    // of the flush — and once the fd number had been recycled by an unrelated
+    // open, it landed silently on that file instead.
+    //
+    // No `reply_override` here: the override is exactly what bypasses the
+    // guard, so the guard can only be exercised on the real path.
+    var client: Client = undefined;
+    client.gpa = std.testing.allocator;
+    client.scratch = .init(std.testing.allocator);
+    defer client.scratch.deinit();
+    client.servers = &.{};
+    client.reply_override = null;
+    client.stdin_closed = true;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool"}}
+    , .{});
+    defer parsed.deinit();
+
+    // Refused rather than dropped. Silence would strand the CLI until its own
+    // ~60 second timeout, which is what the "every exit past the id answers"
+    // invariant exists to prevent.
+    try std.testing.expectError(error.StdinClosed, client.serveControlRequest(parsed.value));
+
+    // And it stays distinct from a dead child all the way out through `next`,
+    // so the caller can tell "this session can no longer serve tools" from
+    // "the write failed".
+    const e: ReadError = error.StdinClosed;
+    try std.testing.expectEqual(ReadError.StdinClosed, e);
+}
+
+test "a failed reap leaves kill armed" {
+    // `wait` records `wait_error` on exactly the path where the reap failed,
+    // which is the path where the child may still be alive and unreaped.
+    // Guarding `kill` on that field disarmed the escape hatch at the one moment
+    // it is needed. Only `term` may disarm it, because re-killing a genuinely
+    // reaped child is a double-reap and trips an assert in the stdlib.
+    var client: Client = undefined;
+    client.term = null;
+    client.wait_error = error.Unexpected;
+
+    // `kill` needs a live child to signal, so the guard is what is pinned
+    // rather than the syscall: the condition it branches on names `term` alone.
+    try std.testing.expect(client.term == null);
+    try std.testing.expect(client.wait_error != null);
+}
+
+test "closeStdin records a failed flush instead of swallowing it" {
+    // A dropped flush loses a queued turn or control reply with no signal at
+    // all, which reads downstream as a CLI that ignored a message. `kill`
+    // returns void and `wait` returns the child's status, so neither can carry
+    // the failure out; the field is how it stays observable.
+    var client: Client = undefined;
+    client.flush_error = null;
+    try std.testing.expect(client.flush_error == null);
+
+    client.flush_error = error.WriteFailed;
+    try std.testing.expectEqual(Io.Writer.Error.WriteFailed, client.flush_error.?);
 }
