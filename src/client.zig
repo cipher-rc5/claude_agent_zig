@@ -19,44 +19,18 @@ const Options = options_mod.Options;
 const McpServer = tool_mod.McpServer;
 const ToolResult = tool_mod.ToolResult;
 
-/// Ceiling on the text a tool handler may return, and the fix for a deadlock
-/// that would otherwise hang both processes permanently.
+/// Ceiling on the text a tool handler may return, and the fix for a deadlock.
 ///
-/// The hazard: `next` is single-threaded and is the only reader of the child's
-/// stdout. When it writes a tool reply into the child's stdin, a reply larger
-/// than the stdin pipe's capacity blocks in `writev` until the child drains
-/// it. If the child is meanwhile blocked writing its own stdout — whose only
-/// reader is the `next` frame now stuck in `writev` — neither side can move.
-/// The caller's thread is inside `next`, so `kill` is unreachable and nothing
-/// breaks the cycle. Reproduced with a 4 MiB handler result.
+/// `next` is the only reader of the child's stdout. A tool reply larger than
+/// the stdin pipe blocks in `writev` until the child drains it, while the child
+/// blocks writing the stdout only that same `next` frame reads. Neither side
+/// can move, and the caller's thread is inside `next`, so `kill` is
+/// unreachable. Keeping the reply under one pipe-load is what rules this out;
+/// Zig 0.16 has no readiness primitive to interleave the two with.
 ///
-/// Why a bound rather than interleaving: draining stdout while the stdin write
-/// blocks needs a readiness primitive, and Zig 0.16 exposes none. `Io`'s vtable
-/// has no poll or select over descriptors — `operate` covers only blocking
-/// `file_read_streaming` / `file_write_streaming` — and `std.process.spawn`
-/// leaves the stdio pipes blocking (only the progress pipe gets `O_NONBLOCK`).
-/// Chunking the write does not help either: without readiness, a read between
-/// chunks blocks whenever the child has nothing to say. A concurrent drain task
-/// via `Io.concurrent` would need `Io.File.Reader`, which is not threadsafe and
-/// which `next` is concurrently parsing from. So the reply is kept small enough
-/// that the pipe always accepts it whole and the write never blocks.
-///
-/// The value: POSIX guarantees a pipe holds at least 4 KiB (`PIPE_BUF` is the
-/// atomicity floor; capacity is at least that). Linux gives 64 KiB by default
-/// but can shrink to one page under `pipe-user-pages-soft`, and macOS measured
-/// 64 KiB here. 16 KiB stays under every floor above 4 KiB while leaving room
-/// for real results, and the JSON envelope around the text is accounted for
-/// separately below.
-///
-/// Residual risk, stated precisely: this bounds the tool-reply path, which is
-/// the only place this client writes an unbounded caller-supplied payload.
-/// `send` and `sendCommand` write caller text on the caller's own thread and
-/// can still exceed the pipe if the caller passes a multi-megabyte prompt while
-/// the child is mid-spew; that is a caller-visible blocking write, not a
-/// reentrant one, and the caller's thread is not inside `next`, so `kill` from
-/// another thread still breaks it. On a system with a 4 KiB pipe, a reply near
-/// this bound could still block — but only until the child reads, which it will,
-/// because nothing here is holding its stdout hostage.
+/// 16 KiB because POSIX guarantees a pipe holds at least 4 KiB, and Linux and
+/// macOS give 64 KiB in practice. The JSON envelope is bounded separately by
+/// `tool_result_envelope_bytes`.
 pub const max_tool_result_bytes: usize = 16 * 1024;
 
 /// Headroom for the JSON envelope `protocol.results.toolCall` wraps the text
@@ -73,11 +47,9 @@ const tool_result_too_long_message =
     "Return less data, or a reference to it.";
 
 pub const OpenError = error{
-    /// `Options.max_line_bytes` was zero. Every line, including the empty one,
-    /// is larger than a zero-byte budget, so the read loop would return
-    /// `error.ProtocolTooLong` forever with no line able to clear it. Refused
-    /// here rather than at the first read, where it looks like a protocol
-    /// fault from the child instead of a configuration mistake.
+    /// `Options.max_line_bytes` was zero, which no line can ever satisfy, so
+    /// the read loop would fail forever. Refused here rather than at the first
+    /// read, where it would look like a protocol fault from the child.
     InvalidMaxLineBytes,
 } || std.process.SpawnError || Allocator.Error || Io.Writer.Error;
 
@@ -85,9 +57,8 @@ pub const OpenError = error{
 /// than inferred: an inferred set resolves through `std.json.Stringify`, so a
 /// stdlib change would silently widen the public surface.
 pub const WriteError = error{
-    /// The write side is shut: `closeStdin` already ran. The writer holds the
-    /// descriptor by value, so it cannot be nulled out from under it; refusing
-    /// here is what keeps a post-close send off a recycled fd.
+    /// `closeStdin` already ran. The writer holds the descriptor by value, so
+    /// refusing here keeps a post-close send off a recycled fd.
     StdinClosed,
     WriteFailed,
 } || Allocator.Error;
@@ -133,12 +104,8 @@ pub const Client = struct {
     /// `defer _ = client.close()` idiom can still tell a clean exit from a
     /// crash by reading it before the pointer goes away.
     ///
-    /// Observed, except after `kill`, which cannot observe anything: Zig
-    /// 0.16's `Child.kill` returns void and reaps as it goes, so the real
-    /// status is gone by the time it returns. `kill` therefore stores an
-    /// assumed `.signal = SIGTERM` here and sets `killed`. Check `killed`
-    /// before drawing any conclusion from this field: a child that had already
-    /// exited cleanly with code 0 still reads as signal-terminated.
+    /// Observed, except after `kill`, which stores an assumed
+    /// `.signal = SIGTERM` and sets `killed`. Check `killed` first.
     term: ?std.process.Child.Term = null,
     /// Whether `kill` produced the value in `term`. When true, `term` is an
     /// assumption rather than an observation and says nothing about how the
@@ -155,13 +122,10 @@ pub const Client = struct {
     /// Set when the final flush in `closeStdin` failed, meaning buffered
     /// protocol bytes were dropped before the descriptor went away.
     ///
-    /// Recorded rather than returned: `closeStdin` is called from `wait` and
-    /// from `kill`, and `kill` returns void precisely because there is nothing
-    /// useful a caller can do about a teardown failure at that point. Making
-    /// this observable was still necessary — a swallowed flush loses a queued
-    /// turn or control reply with no signal at all, which reads downstream as
-    /// a CLI that ignored a message. Mirrors `wait_error`: the caller reads it
-    /// when it matters and ignores it when it does not.
+    /// Recorded rather than returned, since `closeStdin` is called from `wait`
+    /// and `kill`, neither of which can carry it. A swallowed flush loses a
+    /// queued turn with no signal, which reads downstream as a CLI that ignored
+    /// a message.
     flush_error: ?Io.Writer.Error = null,
 
     /// Spawns the CLI. The returned pointer is stable; the reader and writer
@@ -208,17 +172,10 @@ pub const Client = struct {
             .scratch = .init(gpa),
         };
 
-        // `client.*` is fully assigned above, `line` and `scratch` included, so
-        // from here on a failure has two owning allocators to unwind that the
-        // errdefers above cannot see — they were registered before these fields
-        // existed. `close` frees both on the success path; without these, the
-        // `sendInitialize` failure path did not.
-        //
-        // Zero bytes in practice today: `Writer.Allocating.init` and
-        // `ArenaAllocator.init` both allocate lazily, and `writeInitialize`
-        // writes straight to the stdin writer without touching either. So this
-        // closes a latent hole rather than a measured leak, and stops being
-        // latent the moment anything before `return` grows either buffer.
+        // The errdefers above were registered before `line` and `scratch`
+        // existed, so they cannot unwind them. Both allocate lazily and hold
+        // nothing yet, but that stops being true the moment anything before
+        // `return` grows either one.
         errdefer client.line.deinit();
         errdefer client.scratch.deinit();
 
@@ -253,39 +210,19 @@ pub const Client = struct {
     /// Terminates the child without waiting for it to finish on its own, then
     /// reaps it. Use this when a wedged CLI must not hold up the host.
     ///
-    /// This is the escape hatch for a child that never exits. `close` cannot
-    /// bound its own wait: Zig 0.16's `Io` vtable has no timed or non-blocking
-    /// child wait (`childWait` is a plain blocking `wait4`), and racing a
-    /// `kill` against an in-flight `wait` on the same child is a double-reap
-    /// that trips an assert in the stdlib. Running the wait under an
-    /// `Io.Select` timeout does not help either: cancelling the wait clears
-    /// `child.id`, which discards the very handle needed to escalate. So the
-    /// deadline belongs to the caller, who alone knows what "too long" means.
-    /// The status left in `term` afterwards is SYNTHESIZED, not observed.
-    /// `Child.kill` returns void in Zig 0.16 and reaps the child itself, so
-    /// the real status is consumed inside it and never surfaces. A child that
-    /// had already exited cleanly with code 0 is indistinguishable here from
-    /// one this call actually signalled, and both read as `.signal = SIGTERM`.
-    /// `killed` is set alongside so the difference stays visible; anything
-    /// that branches on `term` should check `killed` first.
+    /// The status left in `term` is SYNTHESIZED, not observed: `Child.kill`
+    /// reaps the child itself and returns void, so a child that had already
+    /// exited cleanly reads the same as one this call signalled. Check `killed`
+    /// before drawing any conclusion from `term`.
     ///
-    /// No-op only once the child has genuinely been reaped, which `term` is
-    /// what records. A failed reap deliberately does not disarm this: `wait`
-    /// sets `wait_error` on exactly the path where the child may still be
-    /// alive and unreaped, so treating that as "already handled" removed the
-    /// escape hatch at the one moment it is needed. `term` alone is the guard
-    /// because re-killing a reaped child is a double-reap, which trips an
-    /// assert in the stdlib.
+    /// A no-op only once `term` records a genuine reap. A failed reap does not
+    /// disarm it — that is the path where the child may still be alive — but
+    /// re-killing a reaped child trips a stdlib assert, so `term` alone guards.
     ///
-    /// Same thread as every other method. The `term` guard is a plain field
-    /// read with nothing synchronizing it, so calling this from a watchdog
-    /// thread while another sits in `close` or `wait` is that double-reap
-    /// rather than a way around it. Which rules out the tempting use —
-    /// bounding a blocked `close` — and no reordering here recovers it: Zig
-    /// 0.16 exposes no timed or cancellable child wait, so a deadline has to
-    /// come from outside the process. This is for a host that is between turns
-    /// and has decided the child has had long enough, not one already parked
-    /// in a reap.
+    /// Not thread-safe, like every other method here: the `term` guard is an
+    /// unsynchronized field read, so calling this from a watchdog thread while
+    /// another sits in `wait` is a double-reap, not a way to bound one. The
+    /// deadline has to come from outside the process.
     pub fn kill(client: *Client) void {
         if (client.term != null) return;
         client.closeStdin();
@@ -393,17 +330,13 @@ pub const Client = struct {
     /// on the caller's thread between two conversation events.
     ///
     /// That reply needs the write side, so a control request arriving after
-    /// `closeStdin` cannot be answered and returns `error.StdinClosed` rather
-    /// than being dropped; see `replyWriter`. Reading events after closing
-    /// stdin is otherwise normal and is what the documented
-    /// `closeStdin()`-on-result flow does — only a session whose tools the CLI
-    /// still calls hits this.
+    /// `closeStdin` returns `error.StdinClosed` rather than being dropped.
+    /// Reading after closing stdin is otherwise normal.
     ///
-    /// Ordering: draining to null before reaping is the intended flow, but
-    /// calling this after `wait`, `kill`, or `close` is legal and reports the
-    /// clean end of the stream rather than an error. Reaping the child closes
-    /// its stdout, and anything still buffered goes with it, so events not yet
-    /// read at that point are lost — the status is what remains meaningful.
+    /// Draining to null before reaping is the intended flow, but calling this
+    /// after `wait`, `kill`, or `close` is legal and reports a clean end of
+    /// stream. Reaping closes the child's stdout, so anything still buffered is
+    /// lost and only the exit status remains meaningful.
     pub fn next(client: *Client) ReadError!?Event {
         // The child has been reaped, so `stdout_reader` holds a descriptor the
         // stdlib already closed. End of stream is the honest answer: there is
@@ -479,24 +412,13 @@ pub const Client = struct {
     /// Where replies go. Normally the child's stdin; tests point it at a
     /// buffer to read back what the dispatch answered.
     ///
-    /// Guarded like `stdin`, and for the same reason: `Io.File.Writer` holds
-    /// the file by value, so once `closeStdin` has run the writer is pointing
-    /// at a number the process no longer owns. Without this check a control
-    /// reply issued after the documented `closeStdin()`-on-result pattern
-    /// failed out of `flush` as `error.WriteFailed`, and once the fd number
-    /// had been recycled by an unrelated open it landed silently on that file
-    /// instead.
+    /// Guarded like `stdin`: `Io.File.Writer` holds the file by value, so after
+    /// `closeStdin` the writer points at a descriptor this process no longer
+    /// owns, and a recycled fd number would take the write silently.
     ///
-    /// The reply is not dropped quietly. Silence here would strand the CLI
-    /// until its own ~60 second timeout, which is exactly the failure the
-    /// "every exit past the id answers" invariant in `serveControlRequest`
-    /// exists to prevent — and unlike a missing request id, this one is this
-    /// process's doing, not a malformed message. So it surfaces from `next` as
-    /// `error.StdinClosed`, distinct from `error.WriteFailed`, telling the
-    /// caller the difference that matters: the session is no longer
-    /// serviceable because the write side is shut, not because the child died.
-    /// The only recovery is a new session, and the caller is the one who can
-    /// start one.
+    /// Surfaces from `next` as `error.StdinClosed` rather than being dropped,
+    /// which tells the caller the session can no longer serve tools — distinct
+    /// from `error.WriteFailed`, meaning the child died.
     fn replyWriter(client: *Client) WriteError!*Io.Writer {
         if (client.reply_override) |w| return w;
         if (client.stdin_closed) return error.StdinClosed;
@@ -835,11 +757,10 @@ fn readLine(
 
 // --- tests ---
 
-// Everything below stays in this file. Each test drives one of `readLine`,
-// `writeCommandMessage`, or `serveControlRequest`, all of which are private,
-// and the fixtures reach `reply_override`, a private field. Moving them would
-// mean making internals public purely for test layout. The public shape of
-// `Client` is covered from tests/client_test.zig instead.
+// Each test below drives one of `readLine`, `writeCommandMessage`, or
+// `serveControlRequest` — all private — and the fixtures reach the private
+// `reply_override` field, so moving them would mean making internals public.
+// The public shape of `Client` is covered from tests/client_test.zig.
 
 /// What one `readLine` call should produce: a line, the clean end of the
 /// stream, or an error.
@@ -1132,10 +1053,8 @@ fn dispatchToolCall(out: *Io.Writer.Allocating, size: *const usize) !void {
 }
 
 test "an oversized tool result is replaced rather than written to the pipe" {
-    // The deadlock this prevents: a reply larger than the stdin pipe blocks
-    // `next` in writev while the child blocks writing the stdout only `next`
-    // reads. Neither side can move, and the caller's thread is inside `next`,
-    // so `kill` is unreachable. See `max_tool_result_bytes`.
+    // See `max_tool_result_bytes`: an oversized reply deadlocks both processes
+    // rather than failing.
     var size: usize = max_tool_result_bytes + 1;
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -1161,13 +1080,8 @@ test "a tool result of exactly the cap is still delivered" {
 
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "tool result too long") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"isError\":false") != null);
-    // Delivered whole: every filler byte survived the round trip.
-    // Delivered whole: the filler survives the round trip as one unbroken run.
-    // Counted as a run rather than as a total, since `x` also occurs in the
-    // surrounding envelope.
-    // The longest run, not the first: `x` also occurs in the surrounding
-    // envelope, so an unbroken run of exactly the cap is what shows the filler
-    // arrived whole and untruncated.
+    // Delivered whole. Measured as the longest unbroken run of filler rather
+    // than a total, since `x` also occurs in the surrounding envelope.
     var longest: usize = 0;
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, out.written(), i, 'x')) |start| {
@@ -1186,9 +1100,8 @@ fn oomHandler(_: ?*anyopaque, _: Allocator, _: std.json.Value) anyerror!ToolResu
 }
 
 test "a handler that runs out of memory still answers the CLI" {
-    // OutOfMemory propagates to the caller, but the CLI has to be told too:
-    // returning without a reply strands it until its own ~60 second timeout
-    // and breaks the invariant that every exit past the id answers.
+    // OutOfMemory reaches the caller, but the CLI still has to be answered or
+    // it stalls until its own timeout.
     const server: McpServer = .{
         .name = "s",
         .tools = &.{.{ .name = "t", .description = "d", .handler = oomHandler }},
@@ -1212,10 +1125,8 @@ test "a handler that runs out of memory still answers the CLI" {
 }
 
 test "open rejects a zero max_line_bytes instead of failing forever" {
-    // Zero is a permanent-error trap: every line, the empty one included, is
-    // larger than a zero-byte budget, so `nextLine` would return
-    // ProtocolTooLong forever with no line able to clear it. Refused up front,
-    // before anything is allocated or spawned.
+    // Zero is a permanent-error trap: no line can ever satisfy it, so the read
+    // loop would fail forever. Refused before anything is allocated or spawned.
     var threaded: Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     try std.testing.expectError(error.InvalidMaxLineBytes, Client.open(
@@ -1229,10 +1140,8 @@ test "open rejects a zero max_line_bytes instead of failing forever" {
 }
 
 test "a killed child reports its status as synthetic" {
-    // `Child.kill` returns void in Zig 0.16 and reaps as it goes, so the real
-    // status is genuinely unavailable and `term` has to be assumed. `killed`
-    // is what keeps the assumption from passing as an observation: a child
-    // that had already exited cleanly with code 0 still reads as SIGTERM here.
+    // `term` after a kill is assumed, not observed. `killed` is what keeps the
+    // assumption from passing as one: a clean exit also reads as SIGTERM.
     var client: Client = undefined;
     client.term = null;
     client.wait_error = null;
@@ -1248,18 +1157,10 @@ test "a killed child reports its status as synthetic" {
 }
 
 test "a failed reap is cached but does not disarm kill" {
-    // Two properties of `wait_error`, pinned together because the second one
-    // was a bug: a failed reap is remembered so a second `wait` reports the
-    // same failure without reaping again, but it must NOT make `kill` a no-op.
-    // `wait` sets this field on exactly the path where the child may still be
-    // alive and unreaped, so treating it as "already handled" removed the
-    // escape hatch at the one moment it was needed.
-    //
-    // The failure itself is forced by setting the field rather than by a real
-    // reap: `child.wait` fails only on a double-reap, which trips a stdlib
-    // assert, or on `ECHILD`, which needs a corrupted `Child`. Neither is
-    // reachable from the public API, so the caching and the guard are what get
-    // pinned here, not the syscall.
+    // A failed reap is remembered, so a second `wait` reports it without
+    // reaping again — but it must not make `kill` a no-op. The failure is
+    // forced by setting the field, since a real `child.wait` failure is not
+    // reachable from the public API.
     var client: Client = undefined;
     client.term = null;
     client.wait_error = null;
@@ -1275,11 +1176,9 @@ test "a failed reap is cached but does not disarm kill" {
 }
 
 test "kill still runs after a failed reap" {
-    // The regression guard for the line above. A pure field assertion does not
-    // catch it: restoring `wait_error != null` to `kill`'s early-return leaves
-    // every field untouched and only changes whether the body runs at all. So
-    // this drives the real `kill` against a real child, with `wait_error`
-    // pre-set to simulate the failed reap, and checks the body's own effects.
+    // A real `kill` against a live child, with `wait_error` pre-set. A field
+    // assertion would not cover this: guarding `kill` on `wait_error` changes
+    // only whether the body runs, so its effects are what must be observed.
     var stub_dir = std.testing.tmpDir(.{});
     defer stub_dir.cleanup();
     try stub_dir.dir.writeFile(std.testing.io, .{
@@ -1302,22 +1201,16 @@ test "kill still runs after a failed reap" {
 
     client.kill();
 
-    // `kill` ran: it reaps and records a synthesized status. With the old
-    // guard it returned immediately and both of these stay unset.
+    // `kill` ran: it reaps and records a synthesized status. A `kill` that
+    // returned early on `wait_error` leaves both of these unset.
     try std.testing.expect(client.killed);
     try std.testing.expectEqual(std.posix.SIG.TERM, client.term.?.signal);
 }
 
 test "a control request arriving after closeStdin is refused, not written blind" {
-    // The bug this pins: `replyWriter` handed back the stdin interface with no
-    // `stdin_closed` check, so every reply out of `serveControlRequest` went to
-    // a descriptor this process had already closed. After the documented
-    // `closeStdin()`-on-result pattern that surfaced as `error.WriteFailed` out
-    // of the flush — and once the fd number had been recycled by an unrelated
-    // open, it landed silently on that file instead.
-    //
-    // No `reply_override` here: the override is exactly what bypasses the
-    // guard, so the guard can only be exercised on the real path.
+    // Without `replyWriter`'s `stdin_closed` check the reply goes to a closed
+    // descriptor, and lands silently on an unrelated file once the fd number is
+    // recycled. No `reply_override` here: it bypasses the very guard under test.
     var client: Client = undefined;
     client.gpa = std.testing.allocator;
     client.scratch = .init(std.testing.allocator);
@@ -1341,20 +1234,4 @@ test "a control request arriving after closeStdin is refused, not written blind"
     // "the write failed".
     const e: ReadError = error.StdinClosed;
     try std.testing.expectEqual(ReadError.StdinClosed, e);
-}
-
-test "a failed reap leaves kill armed" {
-    // `wait` records `wait_error` on exactly the path where the reap failed,
-    // which is the path where the child may still be alive and unreaped.
-    // Guarding `kill` on that field disarmed the escape hatch at the one moment
-    // it is needed. Only `term` may disarm it, because re-killing a genuinely
-    // reaped child is a double-reap and trips an assert in the stdlib.
-    var client: Client = undefined;
-    client.term = null;
-    client.wait_error = error.Unexpected;
-
-    // `kill` needs a live child to signal, so the guard is what is pinned
-    // rather than the syscall: the condition it branches on names `term` alone.
-    try std.testing.expect(client.term == null);
-    try std.testing.expect(client.wait_error != null);
 }

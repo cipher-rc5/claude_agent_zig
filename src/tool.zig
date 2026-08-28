@@ -58,11 +58,9 @@ pub fn findServer(servers: []const McpServer, name: []const u8) ?*const McpServe
 
 // --- tests ---
 
-// Stays here: exercises `findServer`, which is `pub` so client.zig can call
-// it but is not re-exported by agent.zig, so it is not public API. Moving it
-// would mean widening the public surface purely for test layout. The
-// `findTool` half of this coverage lives in tests/tool_test.zig, which
-// reaches it through `McpServer`.
+// Exercises `findServer`, which is `pub` for client.zig but not re-exported by
+// agent.zig, so moving this would widen the public surface. The `findTool` half
+// of the coverage lives in tests/tool_test.zig, reached through `McpServer`.
 test "lookup by name" {
     const tools = [_]Tool{
         .{ .name = "add", .description = "", .handler = undefined },

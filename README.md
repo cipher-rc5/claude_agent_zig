@@ -1,6 +1,6 @@
 # claude_agent_zig
 
-A Claude Agent SDK client for Zig 0.16, built on the Claude Code CLI
+Claude Agent SDK client for Zig 0.16, built on the Claude Code CLI
 `stream-json` protocol.
 
 ## Why this shape

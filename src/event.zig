@@ -33,12 +33,7 @@ pub const Event = struct {
     /// than this struct names, notably the nested `message` object on
     /// `assistant` and `user` lines and the cost and usage fields on `result`,
     /// and adding a named accessor for each would track a wire format this
-    /// module does not control.
-    ///
-    /// Kept despite having no call site in the repository: `parsed` is a
-    /// public field, so this reads it rather than widening anything, and it is
-    /// the name that says which of the two fields a caller wants. Pair it with
-    /// `objectField` and `stringField`, which are public for exactly this.
+    /// module does not control. Pair it with `objectField` and `stringField`.
     pub fn root(event: Event) std.json.Value {
         return event.parsed.value;
     }

@@ -1,27 +1,14 @@
 // tests/integration_test.zig
 // End-to-end tests that drive the real `Client` against scripted stub CLIs.
 //
-// Everything else in the suite stops at the module boundary: `readLine` is
-// fed a fixed buffer, `serveControlRequest` writes into `reply_override`, and
-// no test anywhere spawns a process. That leaves the whole of `open`, `next`,
-// `wait`, `kill`, and `close` — the process lifecycle and the read loop over a
-// real pipe — covered only by inspection. These tests close that gap.
+// Every other test in the suite stops at the module boundary, leaving `open`,
+// `next`, `wait`, `kill`, and `close` — the process lifecycle over a real pipe
+// — covered only by inspection. These tests close that gap.
 //
-// The stub is a `#!/bin/sh` script written to a temp dir at runtime and
-// pointed at by `Options.claude_path`. Three properties make that work:
-//
-//   * `buildArgv` prepends the real CLI flags before anything the test
-//     controls, and a shell script that only prints ignores its arguments, so
-//     the flags are harmless. (Passing `/bin/sh -c '...'` via `extra_args`
-//     does NOT work for the same reason inverted: `extra_args` lands last, so
-//     `sh` would see `--print --input-format ...` first and reject them.)
-//   * Writing the script at runtime rather than committing it under tests/
-//     means no assumption about the cwd `zig build test` runs in, and no
-//     executable checked into the repository.
-//   * Every stub terminates on its own — each one is a fixed number of
-//     `printf` calls and an `exit`. Nothing here can block forever waiting on
-//     a child that never finishes, which matters because this suite runs in
-//     `just ci` on every push.
+// Each stub is a `#!/bin/sh` script written to a temp dir at runtime and
+// pointed at by `Options.claude_path`. Writing it at runtime avoids assuming a
+// cwd and keeps an executable out of the repository. Every stub terminates on
+// its own, so nothing here can hang `just ci`.
 
 const std = @import("std");
 const agent = @import("agent");
@@ -188,18 +175,12 @@ const tool_call_line =
 /// Reads the `initialize` line `open` sends before anything else, then the
 /// tool reply, leaving the reply in `$reply`.
 ///
-/// Both reads are mandatory and in this order. `Options.needsInitialize` is
-/// true whenever `sdk_mcp_servers` is set, so `open` writes an `initialize`
-/// control request into the child's stdin before the test has read a single
-/// event. A stub that reads once gets *that* line, then exits and closes the
-/// pipe while this client is still writing the tool reply — which surfaces as
-/// `error.WriteFailed` from EPIPE, not as the property under test.
+/// Both reads are mandatory and in this order: `open` writes `initialize`
+/// before the test reads anything, so a stub that reads once consumes that
+/// line and then EPIPEs the real reply.
 ///
-/// `|| exit 0` on each read is the bounded-lifetime guard. If a reply never
-/// comes the client has closed stdin, so `read` hits end of file and returns
-/// non-zero rather than blocking; the stub exits and the test fails on a
-/// missing event instead of hanging. Nothing here can wait forever, which is
-/// what makes this suite safe to run in `just ci`.
+/// `|| exit 0` bounds each read — a reply that never comes ends as EOF rather
+/// than a block, so the test fails on a missing event instead of hanging.
 const read_reply =
     \\IFS= read -r init_line || exit 0
     \\IFS= read -r reply || exit 0
@@ -258,25 +239,14 @@ test "a tools/call from the child runs the handler and the reply reaches the chi
 
 /// A stub that issues one `tools/call` and then never reads its stdin at all.
 ///
-/// This is the shape the bound actually exists for. `next` is the only reader
-/// of the child's stdout, so while it is writing a tool reply nobody is
-/// draining the child's stdin — and here the child never drains it either.
-/// The whole reply, `initialize` request included, has to fit in the pipe's
-/// buffer unread, or the write blocks forever with no one left to unblock it.
+/// The shape `max_tool_result_bytes` exists for: nobody drains the child's
+/// stdin, so the whole reply has to fit in the pipe buffer unread or the write
+/// blocks forever.
 ///
-/// It emits its remaining output first so the events are already queued, then
-/// sleeps to stay alive across the write, then exits.
-///
-/// The sleep is load-bearing but is NOT a synchronization primitive. It is a
-/// bounded lifetime: whether or not the write has landed when it expires, the
-/// stub exits and the test terminates, so this can never hang `just ci`.
-/// Without it the stub exits immediately and the reply write fails with EPIPE
-/// before the bound is ever exercised — verified by deleting it, which fails
-/// this test on every run.
-///
-/// 0.2s rather than the ~0.05s that measurably suffices here: the margin is
-/// for a loaded CI machine, and it is spent only in this one test. It bounds
-/// the wait; it does not bound the suite, which finishes well before it.
+/// It queues its output first, then sleeps to stay alive across the write. The
+/// sleep is a bounded lifetime, not a synchronization primitive: the stub exits
+/// when it expires either way, so this cannot hang `just ci`. Without it the
+/// stub exits immediately and the write EPIPEs before the bound is exercised.
 const no_read_stub =
     "#!/bin/sh\n" ++
     tool_call_line ++ "\n" ++
@@ -286,29 +256,17 @@ const no_read_stub =
 
 /// Runs `body` under a deadline, failing the test if it outlives one.
 ///
-/// The whole point of `max_tool_result_bytes` is that a regression there
-/// DEADLOCKS rather than fails: `next` blocks in `writev` on a stdin pipe
-/// nobody is draining while the child blocks writing the stdout whose only
-/// reader is that same `next` frame. The caller's thread is inside `next`, so
-/// nothing in this process can break the cycle. A test asserting the bound
-/// therefore has to bound its own runtime, or the regression it exists to
-/// catch hangs `just ci` forever instead of failing it.
+/// A regression in `max_tool_result_bytes` deadlocks rather than fails, so the
+/// test asserting that bound has to bound its own runtime or it hangs `just ci`
+/// instead of failing it.
 ///
-/// How this is possible in Zig 0.16 at all: `std.testing.io` is an
-/// `Io.Threaded` built with default options, so `Io.Select` really can run two
-/// tasks concurrently, and `Io.Threaded` implements cancelation by
-/// `pthread_kill`-ing the blocked thread with `SIGIO` — which returns `EINTR`
-/// out of a blocking syscall. So `cancelDiscard` genuinely unblocks a `writev`
-/// stuck on a full pipe; it is not merely abandoning the task. Verified
-/// against a real spawned child that never reads its stdin.
+/// `Io.Threaded` cancels by `pthread_kill`-ing the blocked thread with `SIGIO`,
+/// which returns `EINTR` out of the syscall, so `cancelDiscard` genuinely
+/// unblocks a `writev` stuck on a full pipe rather than just abandoning it.
 ///
-/// `body` returns a bool rather than `!void` because its result crosses a task
-/// boundary into the select's union: an error union would have to be stored
-/// and re-raised, and the only thing this needs to know is pass or fail.
-///
-/// Deliberately NOT a general-purpose harness. Every other test in this file
-/// is bounded by its stub terminating on its own, which is cheaper and needs
-/// no concurrency. This exists for the one test whose failure mode is a hang.
+/// `body` returns a bool because its result crosses a task boundary into the
+/// select's union. Not a general-purpose harness: every other test here is
+/// bounded by its stub exiting on its own.
 fn underDeadline(comptime body: fn () bool, millis: i64) !void {
     const Race = union(enum) { body: bool, deadline: void };
 
@@ -368,28 +326,17 @@ fn oversizedToolResultFitsPipe() bool {
 }
 
 test "an oversized tool result fits the pipe even when the child never reads" {
-    // THE REGRESSION, in the configuration that makes it bite. `next` is the
-    // only reader of the child's stdout, so a reply larger than the stdin pipe
-    // blocks it in `writev` while the child blocks writing the stdout nobody is
-    // left to read. Neither side moves again, the caller's thread is inside
-    // `next`, and `kill` is unreachable — a permanent hang.
+    // The stub never reads its stdin, so the bound is the only thing keeping
+    // the write non-blocking. A 4 MiB result is replaced by a short `is_error`
+    // payload that fits one pipe load, so `next` completes.
     //
-    // The stub above never reads its stdin, so nothing drains the reply on the
-    // far side and the bound is the only thing keeping the write non-blocking.
-    // A 4 MiB handler result — the size the original deadlock was reproduced
-    // with — is replaced by a short `is_error` payload that fits in one pipe
-    // load, so `next` completes and the session finishes.
+    // 4 MiB rather than one byte over the cap: a payload just past the bound
+    // still fits a 64 KiB pipe and would pass either way. The boundary itself
+    // is covered by `tool result one byte over the cap` below.
     //
-    // Deliberately far above the cap rather than one byte over: a payload just
-    // past the bound still fits a 64 KiB pipe and would pass either way, which
-    // would make this test decorative. `tool result one byte over the cap`
-    // below covers the boundary itself.
-    //
-    // Run under a deadline because this is the one test here whose failure
-    // mode is a hang rather than a wrong answer: if the bound regressed, both
-    // processes would block forever and `just ci` would never return. The
-    // budget is ~15x the stub's own 0.2s lifetime, so only a genuine deadlock
-    // can reach it — a slow CI machine cannot.
+    // Under a deadline because a regression here hangs rather than fails. The
+    // budget is ~15x the stub's own lifetime, so only a real deadlock reaches
+    // it.
     try underDeadline(oversizedToolResultFitsPipe, 3_000);
 }
 
@@ -741,20 +688,12 @@ test "open refuses a zero max_line_bytes before spawning anything" {
 /// Reads one line of the client's stdin and echoes it straight back out as the
 /// `sent` field of a `system` event, then exits.
 ///
-/// The counterpart to `echo_reply_stub`, for the three public write methods
-/// instead of the tool-reply path. Without it the write side is unobserved:
-/// `send`, `sendCommand` and `interrupt` are all `void` on success, so a method
-/// that emitted malformed JSON — or nothing at all — would pass every test that
-/// only checks it did not return an error.
+/// Covers the three public write methods, which are all `void` on success — so
+/// a method emitting malformed JSON, or nothing, would otherwise pass.
 ///
-/// Same two rules as `read_reply`. `|| exit 0` bounds the read: the client
-/// closes stdin on the way into `wait`, so a line that never comes ends as EOF
-/// rather than a block. And the echoed line is nested raw (`%s`, unquoted)
-/// because it is itself JSON, keeping the envelope parseable in one pass.
-///
-/// One read, not two: none of these tests set `sdk_mcp_servers`, so
-/// `Options.needsInitialize` is false and `open` writes nothing ahead of the
-/// test's own line. The first line read here is the one under test.
+/// `|| exit 0` bounds the read, as in `read_reply`. The echoed line is nested
+/// raw (`%s`) because it is itself JSON. One read, not two: these tests set no
+/// `sdk_mcp_servers`, so `open` writes nothing ahead of the line under test.
 const echo_stdin_stub =
     "#!/bin/sh\n" ++
     "IFS= read -r sent || exit 0\n" ++
@@ -887,19 +826,13 @@ test "interrupt writes a control_request the child can read back" {
 /// A stub that stays alive without ever exiting on its own within the test's
 /// window, so `kill` has a live child to signal.
 ///
-/// Every other stub in this file races to its own `exit`, which means `kill`
-/// has only ever been tested against a child that had already reaped itself —
-/// the branch that returns early. This one prints its line and then sleeps, so
-/// the `Child.kill` call underneath actually signals a running process.
+/// Every other stub races to its own `exit`, exercising only the branch where
+/// `kill` finds an already-reaped child. This one sleeps so `Child.kill`
+/// signals a running process.
 ///
-/// The sleep is a bounded lifetime, not a synchronization primitive, exactly
-/// as in `no_read_stub`: if `kill` never arrives the stub exits by itself and
-/// the test fails on a stale assertion rather than hanging `just ci`. 3s is far
-/// longer than the microseconds the kill actually takes, so the signal always
-/// wins the race in practice, and the cost is paid only if it does not.
-///
-/// `trap '' PIPE` for the same reason as `two_line_stub`: `kill` closes stdin
-/// first, and the stub must not die of a signal this test did not send.
+/// The sleep is a bounded lifetime, as in `no_read_stub`. `trap '' PIPE`
+/// because `kill` closes stdin first, and the stub must not die of a signal
+/// this test did not send.
 const sleeping_stub =
     \\#!/bin/sh
     \\trap '' PIPE

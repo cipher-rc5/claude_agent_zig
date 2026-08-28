@@ -7,15 +7,10 @@ const agent = @import("agent");
 /// Names `host_env` will answer for. The allowlist is the point of the tool
 /// rather than a detail of it.
 ///
-/// A handler's arguments are model-influenced: they arrive over the wire from a
-/// turn the host does not control, so a tool that reads whatever name it is
-/// handed reads whatever name an injected instruction asks for. This process
-/// inherits its parent's environment, which on a developer machine routinely
-/// holds cloud and API credentials, and the demo pre-authorizes `mcp__host__*`
-/// — so an unrestricted version of this tool hands those secrets to the model
-/// on request. Enumerating what may be read is what keeps that from being true,
-/// and it is the pattern to copy: name what a tool may reach, rather than
-/// filtering what it may not.
+/// A handler's arguments are model-influenced, and this process inherits its
+/// parent's environment — which on a developer machine holds credentials. An
+/// unrestricted version of this tool would hand those to the model on request.
+/// The pattern to copy: name what a tool may reach, not what it may not.
 const readable_env = [_][]const u8{
     "HOME",
     "LANG",
@@ -56,23 +51,15 @@ fn isReadable(name: []const u8) bool {
 
 /// Adds two operands, keeping integer arithmetic exact.
 ///
-/// Exactness here is a property of the whole path, not just this function, and
-/// the schema is the part that decides it. A JSON `number` is an IEEE 754
-/// double on the way in, so an argument above 2^53 is already rounded before
-/// any handler runs: asking for 9007199254740993 delivers ...992. Measured
-/// against the CLI, `{"type":"integer"}` rounds identically — the loss happens
-/// when the value is serialized, not when it is parsed. Only a decimal string
-/// survives the round trip intact, which is why `a` and `b` are declared as
-/// strings and parsed here.
+/// A JSON `number` arrives as an IEEE 754 double, so an argument above 2^53 is
+/// already rounded before any handler runs — and `{"type":"integer"}` rounds
+/// identically, since the loss happens on serialization. Only a decimal string
+/// survives intact, which is why `a` and `b` are declared as strings. JSON
+/// numbers are still accepted, at the usual double precision.
 ///
-/// Accepting JSON numbers as well keeps ordinary calls ergonomic; they simply
-/// carry the usual double precision.
-///
-/// Every operand is classified once, and a value the schema does not promise
-/// is reported rather than guessed at. That covers three shapes that used to
-/// slip through as plausible-looking answers: an integer literal too large for
-/// `i64`, a non-decimal spelling such as `"0x10"` or `"1_000"`, and anything
-/// that is or becomes non-finite.
+/// Operands the schema does not promise are reported rather than guessed at:
+/// an integer too large for `i64`, a non-decimal spelling like `"0x10"`, and
+/// anything non-finite.
 fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
     const obj = switch (arguments) {
         .object => |o| o,
@@ -110,11 +97,10 @@ fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Valu
     return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{sum}) };
 }
 
-/// One classified operand. `out_of_range` is kept distinct from `invalid`
-/// because the two call for different answers: a well-formed integer that no
-/// longer fits is a range error worth naming, while `"abc"` is not a number at
-/// all. Folding the first into the second is what let `"9223372036854775808"`
-/// fall through to the float path and come back as a wrong number.
+/// One classified operand. `out_of_range` stays distinct from `invalid`: a
+/// well-formed integer that no longer fits is a range error worth naming, while
+/// `"abc"` is not a number at all. Folding them lets `"9223372036854775808"`
+/// reach the float path and come back as a wrong number.
 const Operand = union(enum) {
     integer: i64,
     float: f128,
@@ -123,13 +109,10 @@ const Operand = union(enum) {
 
     /// The operand in the width the mixed path adds in.
     ///
-    /// The rejected variants are named rather than folded into an `else`. Both
-    /// are unreachable here — `addNumbers` answers an `is_error` result for
-    /// each before the mixed path runs — but an `else` would also swallow a
-    /// variant added later, turning a rejected input into a panic that takes
-    /// the host process down. `arguments` is model-influenced data, so that is
-    /// the one failure mode this must not have; naming the arms makes a new
-    /// variant a compile error here instead.
+    /// The rejected variants are named rather than folded into an `else`: both
+    /// are unreachable today, but an `else` would silently swallow a variant
+    /// added later and turn a rejected input into a panic. Naming them makes
+    /// that a compile error instead.
     fn wide(self: Operand) f128 {
         return switch (self) {
             .integer => |i| @floatFromInt(i),
@@ -327,9 +310,9 @@ test "an integer too large for i64 is reported, not answered as a float" {
     const a = arena.allocator();
 
     // i64::MAX + 1. One past the value the test above covers, and the point
-    // where treating a failed `parseInt` as "not an integer" used to hand the
-    // operand to the float path: the answer came back 9223372036854776000
-    // with is_error false, which is a wrong number reported as a good one.
+    // where treating a failed `parseInt` as "not an integer" would hand the
+    // operand to the float path: that answers 9223372036854776000 with
+    // is_error false, a wrong number reported as a good one.
     for ([_][]const u8{
         "{\"a\":\"9223372036854775808\",\"b\":\"1\"}",
         "{\"a\":\"99999999999999999999999999\",\"b\":\"1\"}",
@@ -375,8 +358,8 @@ test "the handler honours its own schema" {
     const a = arena.allocator();
 
     // The schema says "a number in decimal". None of these are one, and each
-    // used to produce a confident answer: inf, nan, a silent overflow to inf,
-    // 32 from hex, and 1000 from Zig's digit separators.
+    // would otherwise produce a confident answer: inf, nan, a silent overflow
+    // to inf, 32 from hex, and 1000 from Zig's digit separators.
     for ([_][]const u8{
         "{\"a\":\"inf\",\"b\":\"1\"}",
         "{\"a\":\"-inf\",\"b\":\"1\"}",

@@ -259,12 +259,12 @@ pub const results = struct {
 
 // --- tests ---
 
-// These stay here. The functions under test are `pub` so client.zig can call
-// them, but agent.zig deliberately does not re-export the wire format, so
-// none of it is public API — a tests/ file could only reach it by widening
-// the public surface, or by making protocol.zig its own module, which Zig
-// forbids while agent.zig also imports it (a file belongs to one module).
-// The `render` and `expectContains` helpers are private for the same reason.
+// The functions under test are `pub` for client.zig, but agent.zig
+// deliberately does not re-export the wire format. A tests/ file could reach
+// them only by widening the public surface, or by making protocol.zig its own
+// module — which Zig forbids while agent.zig also imports it, since a file
+// belongs to exactly one module. `render` and `expectContains` stay private
+// for the same reason.
 
 const Rendered = struct {
     out: Io.Writer.Allocating,

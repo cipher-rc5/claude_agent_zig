@@ -43,9 +43,8 @@ pub const Options = struct {
     ///
     /// NOT a tool boundary. It does not deregister WebSearch, WebFetch, Agent,
     /// or anything else built in, and skills still resolve via `/skill-name`.
-    /// An earlier version of this doc claimed otherwise, which is the kind of
-    /// mistake that gets read at the call site and believed: what constrains
-    /// the agent is `allowed_tools`, `tools`, and `permission_mode`.
+    /// What constrains the agent is `allowed_tools`, `tools`, and
+    /// `permission_mode`.
     ///
     /// Off by default, so a session inherits project configuration and an
     /// existing login.
@@ -171,11 +170,9 @@ pub fn buildArgv(arena: Allocator, options: Options) Allocator.Error![]const []c
 
 // --- tests ---
 
-// These stay here: they exercise `buildArgv`, which is `pub` so client.zig
-// can call it but is not re-exported by agent.zig, so it is not public API.
-// Moving them would mean widening the public surface purely for test layout.
-// `containsPair` is a test helper, so tests/options_test.zig keeps its own
-// copy rather than this one being made public.
+// These exercise `buildArgv`, which is `pub` for client.zig but not re-exported
+// by agent.zig, so moving them would widen the public surface. `containsPair`
+// stays private for the same reason; tests/options_test.zig keeps its own copy.
 
 fn containsPair(argv: []const []const u8, flag: []const u8, value: []const u8) bool {
     for (argv, 0..) |arg, i| {
