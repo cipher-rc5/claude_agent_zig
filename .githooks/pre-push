@@ -1,5 +1,6 @@
 #!/bin/sh
-# Local CI gate. Blocks a push whose tree does not pass `just ci`.
+# Local CI gate. Blocks a push unless every commit being pushed passes
+# `just ci`, each checked out on its own in a temporary worktree.
 # Enabled with `just hooks-install` (sets core.hooksPath=.githooks).
 set -e
 
@@ -17,17 +18,62 @@ blocked() {
     exit 1
 }
 
-# The gate below validates the WORKING TREE, but git is pushing specific
-# commits, named on stdin as `<local-ref> <local-sha> <remote-ref> <remote-sha>`.
-# Those two coincide only when HEAD is what is being pushed and the tree is
-# clean. Read stdin and warn when they diverge, so a green gate is not mistaken
-# for a verdict on the commits actually leaving the machine.
+repo=$(git rev-parse --show-toplevel) || blocked
+cd "$repo" || blocked
+
+# The gate runs on the COMMIT being pushed, not on the working tree. Git names
+# each ref on stdin as `<local-ref> <local-sha> <remote-ref> <remote-sha>`;
+# each non-zero local sha is checked out detached into a temporary worktree
+# and the gate runs there, so a dirty tree or a pushed side branch cannot make
+# a green result mean something other than "this commit passes".
 #
-# Warn, not fail: pushing an older commit or a side branch is legitimate, and
-# this is a solo local gate. Failing closed here would block valid pushes with
-# no override short of --no-verify, which also skips the CI run that matters.
-head_sha=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+# Every exit path removes the worktree. `git worktree remove --force` is used
+# because the gate leaves build output in it; `prune` afterwards drops the
+# bookkeeping if the directory is already gone.
+wt=""
+cleanup() {
+    if [ -n "$wt" ]; then
+        git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+        git worktree prune >/dev/null 2>&1 || true
+        wt=""
+    fi
+}
+trap cleanup EXIT INT TERM HUP
+
+# The worktree gets a cold cache otherwise, which turns a few seconds of
+# incremental work into a full rebuild in both optimize modes. Zig's cache is
+# content-addressed, so sharing the main tree's is safe.
+ZIG_LOCAL_CACHE_DIR="$repo/.zig-cache"
+export ZIG_LOCAL_CACHE_DIR
+
+# Runs the gate in the current directory: `just ci` when just is installed,
+# otherwise the same steps by hand. A gate that green-lights because a tool
+# is absent is worse than no gate at all.
+run_gate() {
+    if command -v just >/dev/null 2>&1; then
+        just ci || return 1
+        return 0
+    fi
+    echo "pre-push: 'just' not found; running the raw zig gate instead."
+    if ! command -v zig >/dev/null 2>&1; then
+        echo "pre-push: neither 'just' nor 'zig' is on PATH; cannot verify this push."
+        return 1
+    fi
+    zig fmt --check build.zig src examples tests bench || return 1
+    if [ -f scripts/docs-check.sh ]; then
+        bash scripts/docs-check.sh || return 1
+    else
+        echo "pre-push: scripts/docs-check.sh missing in this commit; cannot verify doc drift."
+        return 1
+    fi
+    zig build test || return 1
+    zig build test -Doptimize=ReleaseSafe || return 1
+    zig build || return 1
+}
+
 zero=$(printf '0%.0s' $(seq 1 40))
+checked=""
+gated=0
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ -z "$local_sha" ] && continue
     # A delete (`git push :branch`) pushes nothing; there is no tree to check.
@@ -35,41 +81,33 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         echo "pre-push: NOTE — $remote_ref is being deleted; nothing to verify."
         continue
     fi
-    if [ "$local_sha" != "$head_sha" ]; then
-        echo "pre-push: WARNING — pushing $local_ref ($(git rev-parse --short "$local_sha" 2>/dev/null || echo "$local_sha"))"
-        echo "          but the gate below runs against HEAD ($(git rev-parse --short HEAD 2>/dev/null || echo unknown))."
-        echo "          A pass does NOT certify the commit being pushed."
+    # Two refs at the same commit need one verdict.
+    case " $checked " in
+        *" $local_sha "*) continue ;;
+    esac
+    checked="$checked $local_sha"
+
+    short=$(git rev-parse --short "$local_sha" 2>/dev/null || echo "$local_sha")
+    echo ""
+    echo "pre-push: gating $local_ref at $short"
+
+    wt=$(mktemp -d "${TMPDIR:-/tmp}/claude_agent_zig-prepush.XXXXXX") || blocked
+    git worktree add --detach "$wt" "$local_sha" >/dev/null 2>&1 || {
+        echo "pre-push: could not check out $short into a temporary worktree."
+        blocked
+    }
+    if (cd "$wt" && run_gate); then
+        echo "pre-push: $short passed."
+    else
+        echo "pre-push: $short FAILED the gate."
+        blocked
     fi
+    cleanup
+    gated=$((gated + 1))
 done
 
-if ! git diff --quiet HEAD 2>/dev/null; then
-    echo "pre-push: WARNING — the working tree has uncommitted changes."
-    echo "          The gate below tests the tree on disk, not the commits being"
-    echo "          pushed. A pass does NOT certify what leaves the machine."
+if [ "$gated" -eq 0 ]; then
+    echo "pre-push: no commits to gate."
 fi
-
-if command -v just >/dev/null 2>&1; then
-    just ci || blocked
-else
-    # `just` is missing. Run the same steps directly rather than passing
-    # silently — a gate that green-lights because a tool is absent is worse
-    # than no gate at all.
-    echo "pre-push: 'just' not found; running the raw zig gate instead."
-    if ! command -v zig >/dev/null 2>&1; then
-        echo "pre-push: neither 'just' nor 'zig' is on PATH; cannot verify this push."
-        blocked
-    fi
-    zig fmt --check build.zig src examples tests || blocked
-    # Same docs drift gate `just ci` runs. Plain bash + zig, no `just` needed.
-    if [ -x scripts/docs-check.sh ]; then
-        bash scripts/docs-check.sh || blocked
-    else
-        echo "pre-push: scripts/docs-check.sh missing; cannot verify doc drift."
-        blocked
-    fi
-    zig build test || blocked
-    zig build || blocked
-fi
-
 echo ""
 echo "pre-push: local CI gate passed. Pushing."

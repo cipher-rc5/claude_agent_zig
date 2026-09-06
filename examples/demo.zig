@@ -50,6 +50,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // AGENT_PERMISSIONS=host routes the CLI's permission prompts to this
+    // process, where `demo_tools.logAndAllow` logs each one on stderr and
+    // allows it. Only calls outside `allowed_tools` prompt, so with the
+    // allowlist above this is reached by a Bash or Edit call, say. Unset
+    // leaves the CLI's own handling, which refuses what nothing authorized.
+    const host_permissions = if (init.environ_map.get("AGENT_PERMISSIONS")) |v|
+        std.mem.eql(u8, v, "host")
+    else
+        false;
+
     const client = try agent.Client.open(gpa, io, .{
         .claude_path = init.environ_map.get("CLAUDE_BIN") orelse "claude",
         .sdk_mcp_servers = &servers,
@@ -59,6 +69,8 @@ pub fn main(init: std.process.Init) !void {
             skill_names.items
         else
             null,
+        .permission_handler = if (host_permissions) demo_tools.logAndAllow else null,
+        .permission_context = @ptrCast(log),
     });
     // `close` reaps the child; the status it returns is the only signal when
     // the CLI dies on startup, since that produces no events at all and the

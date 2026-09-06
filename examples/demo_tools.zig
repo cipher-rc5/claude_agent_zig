@@ -200,6 +200,28 @@ fn digitRun(s: []const u8) usize {
     return n;
 }
 
+/// The demo's permission handler, installed when `AGENT_PERMISSIONS=host`.
+/// It allows everything: the point is to show a prompt arriving and being
+/// answered from this process, not to make a policy. `context` is the stderr
+/// writer, so the log line lands beside the other diagnostics rather than in
+/// the agent's output on stdout.
+///
+/// A real handler would branch on `tool_name` and `input` here, and deny with
+/// a message telling the model what to do instead.
+pub fn logAndAllow(
+    context: ?*anyopaque,
+    _: std.mem.Allocator,
+    tool_name: []const u8,
+    input: std.json.Value,
+) !agent.PermissionDecision {
+    const log: *std.Io.Writer = @ptrCast(@alignCast(context.?));
+    try log.print("[permission] {s} ", .{tool_name});
+    try std.json.Stringify.value(input, .{}, log);
+    try log.writeByte('\n');
+    try log.flush();
+    return .allow;
+}
+
 pub fn build(environ: *const std.process.Environ.Map) [2]agent.Tool {
     return .{
         .{
@@ -469,4 +491,20 @@ test "host_env answers only for the allowlisted names" {
         "not a readable variable",
         (try hostEnv(ctx, a, absent.value)).text,
     );
+}
+
+test "the permission hook logs the call and allows it" {
+    // `AGENT_PERMISSIONS=host` is a demonstration, so the line it prints is
+    // the whole behaviour: the tool name, then the input as JSON, on stderr.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var log: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer log.deinit();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"command\":\"ls\"}", .{});
+    const decision = try logAndAllow(@ptrCast(&log.writer), a, "Bash", parsed.value);
+    try std.testing.expect(decision == .allow);
+    try std.testing.expectEqualStrings("[permission] Bash {\"command\":\"ls\"}\n", log.written());
 }

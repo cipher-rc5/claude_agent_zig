@@ -11,13 +11,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Project documentation: `LICENSE`, `SECURITY.md`, `CONTRIBUTING.md`, and this
   changelog.
+- Fuzz harnesses (`src/client.zig`, under `// --- fuzz ---`): `readLine` over
+  arbitrary bytes with an arbitrary `max_line_bytes`, bounded so a resync
+  regression fails instead of hanging, and `serveControlRequest` over
+  arbitrary JSON, pinning that it answers with exactly one terminated line or
+  stays silent only when there is no id. A plain `zig build test` runs the
+  corpus and the empty input; `zig build test --fuzz` runs them for real.
 - `tests/`, a black-box suite that reaches the library only through its public
   surface: `tests/all.zig` as the root, with `client_test.zig`, `event_test.zig`,
-  `options_test.zig`, and `tool_test.zig` beside it. Tests that drive private
+  `integration_test.zig`, `options_test.zig`, and `tool_test.zig` beside it.
+  `integration_test.zig` drives the real client over actual pipes against
+  `#!/bin/sh` stub CLIs written at runtime: lifecycle, tool calls, framing,
+  and the deadlock regression under a deadline. Tests that drive private
   internals stay in their own module, each noting the symbol that keeps it
   there.
-- A pre-push hook in `.githooks/`, and a `justfile` task runner covering build,
-  test, format, and CI.
+- Permission prompts (`src/tool.zig`, `src/options.zig`, `src/protocol.zig`,
+  `src/client.zig`). `Options.permission_handler` and `permission_context`
+  install a `PermissionHandler`, a function of `(context, arena, tool_name,
+  input)` returning a `PermissionDecision` of `.allow`,
+  `.allow_with_input = "<json object>"`, or `.deny = "<message>"`. When a
+  handler is set `buildArgv` appends `--permission-prompt-tool stdio`, which
+  is what makes the CLI emit prompts as control requests (measured against
+  2.1.261: `--permission-prompts host` on its own emits none and the call is
+  blocked), plus `--permission-prompts host`, which the CLI's help names as the
+  SDK-host route; a handler also makes `needsInitialize` true, since the CLI
+  routes prompts to a host that opened with the handshake. Each prompt arrives as a
+  `can_use_tool` control request that `next()` answers on the caller's thread:
+  `{"behavior":"allow","updatedInput":<input>}` for an allow (the proposed
+  input echoed, or the handler's object spliced raw after validation — a
+  non-object becomes a deny rather than a corrupted frame), or
+  `{"behavior":"deny","message":"..."}`. A handler error is answered as a deny
+  carrying its name; `OutOfMemory` is answered as a deny and then propagated;
+  a request without `tool_name` gets a control error; absent input reaches the
+  handler as JSON `null`. The reply is bounded like a tool result because it
+  carries the CLI-sized input back, so an allow whose line exceeds 16 896
+  bytes is turned into a deny naming the size and the bound. Without a
+  handler, `can_use_tool` gets the `unsupported control request` reply it
+  always did. Exercised against scripted stub CLIs over real pipes, and once
+  end to end against CLI 2.1.261: with `permission_mode = .manual` and
+  `tools = "Bash"`, a `mkdir` the model was asked to run arrived as one
+  `can_use_tool` request, the handler's allow was honoured, and the directory
+  existed afterwards. A bare `echo` never prompts (the CLI treats it as
+  read-only) and a settings source with `permissions.defaultMode: auto`
+  settles the call first, so neither exercises the handler. The demo installs
+  a log-and-allow handler (`examples/demo_tools.zig`) when
+  `AGENT_PERMISSIONS=host` is set.
+- `Client.lastLine()` (`src/client.zig`): the raw bytes of the most recent
+  protocol line, whether it became an event, failed to parse behind
+  `error.InvalidJson`, or was the prefix that fit before
+  `error.ProtocolTooLong`. A host can now log what the CLI actually sent.
+  Valid until the next call to `next()`.
+- `Client.lastControlError()` and `ReadError.ControlRequestRejected`
+  (`src/client.zig`). `control_response` lines used to be discarded unread,
+  so the CLI refusing this client's own `initialize` — an `sdkMcpServers`
+  entry it would not take — was indistinguishable from success, and the first
+  symptom was the model reporting it could not find a tool. The ids this
+  client mints are now kept in a fixed 16-slot pending list and matched on the
+  way back; an `error` subtype for one of them is returned from `next()` with
+  the CLI's text in `lastControlError()`. The stream stays readable.
+- `OpenError.InvalidToolSchema` (`src/client.zig`, `src/tool.zig`). Every
+  `Tool.input_schema` is spliced into the `tools/list` reply verbatim, so
+  `open` now checks that each parses as JSON and is an object before it
+  allocates or spawns anything, rather than letting a malformed one corrupt the
+  frame mid-session.
+- `agent.min_cli_version` (`src/options.zig`), `"2.1.228"`: the oldest CLI
+  this protocol has been exercised against. Not probed at `open`, since that
+  would cost a spawn per session; `just canary` parses it out of the source
+  and fails when the installed CLI is below it, or when the declaration cannot
+  be found.
+- Dispatch-level tests for the MCP handshake in `src/client.zig`: `initialize`
+  echoing the offered `protocolVersion` and falling back to the default,
+  `notifications/initialized` answered under id 0, and a successful
+  `tools/list`; plus `buildArgv` tests pinning the default argv exactly, every
+  flag-emitting field, and that `extra_args` is exactly the tail of the argv.
+- A `pre-commit` hook in `.githooks/` running `fmt-check` and `docs-check` on
+  the working tree, beside the existing `pre-push`; both installed by
+  `just hooks-install`.
+- `just test-release` (`zig build test -Doptimize=ReleaseSafe`), now part of
+  `ci`: the client reasons about release modes explicitly — asserts that
+  vanish under `ReleaseFast`, safety checks that stay under `ReleaseSafe` —
+  so the gate runs the suite under one of them rather than Debug alone.
+- A local release pipeline: `just release <version>` (`scripts/release.sh`)
+  refuses a dirty tree, a version that differs from `build.zig.zon`, or one
+  this file has no heading for; runs `just ci-full`; and writes `dist/` with a
+  `git archive` tarball, a minimal CycloneDX 1.5 SBOM, `SHA256SUMS` over both,
+  and an `ssh-keygen` signature of the sums when `RELEASE_SIGNING_KEY` is
+  set. It prints the `git tag` command and never tags, commits, or pushes.
+  `just release-verify <version>` (`scripts/release-verify.sh`) checks the
+  sums, the archive prefix, the SBOM, and — only when
+  `RELEASE_ALLOWED_SIGNERS` is set — the signature, reporting it as not
+  checked otherwise. `dist/` is git-ignored.
+- `just canary-schedule-install` and `canary-schedule-uninstall`: a launchd
+  agent on macOS that runs the canary every Monday at 09:00 and logs to
+  `~/Library/Logs/claude_agent_zig-canary.log`; on other systems the recipe
+  prints the crontab line to add. The canary only catches drift if something
+  runs it.
+- `zig build bench` / `just bench [lines]` (`bench/next_bench.zig`): streams
+  a synthetic `stream_event` transcript through `next()` over a real pipe and
+  reports events/s, bytes and allocator calls per event, and peak live bytes,
+  so the per-event `alloc_always` tree parse has a measured cost and a
+  baseline. Measured on Apple Silicon with zig 0.16.0: 20 000 deltas under
+  ReleaseFast run at 98k–134k events/s (7.5–10.3 µs/event, a figure that
+  includes stub start-up), and 100 000 deltas at 357k events/s (2.8 µs/event),
+  at 5 601 bytes and 6.0 allocator calls per event with about 89 KB peak
+  live; ReleaseSafe is 107k events/s at the same bytes and calls.
+- `zig build docs` / `just docs`: autodocs for the `agent` module into
+  `zig-out/docs/`.
+- `build.zig` refuses any Zig version other than the one `build.zig.zon`
+  names, at comptime with a message naming both. The manifest's
+  `minimum_zig_version` is a floor, so a later toolchain was accepted there and
+  failed inside `std` instead.
 
 ### Changed
 
@@ -41,6 +144,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text or `WriteFailed`, and an oversized protocol line resynced to the next
   newline rather than wedging the stream. Control dispatch answers every
   malformed request it can address.
+- `WriteError` is now exactly `error{ StdinClosed, WriteFailed }`
+  (`src/client.zig`). It carried `Allocator.Error` although no write path
+  allocates — `send` and `interrupt` render straight into the stdin writer's
+  buffer and `sendCommand` streams its text in escaped pieces — so the public
+  set was wider than the behaviour.
+- The pipe-safety bound is measured on the whole rendered `control_response`
+  line, envelope, ids and newline included, since that is what lands in the
+  pipe; the headroom over `max_tool_result_bytes` went from 256 to 512 bytes
+  to cover CLI-sized request ids, so the enforced line bound is 16 896 bytes
+  (`src/client.zig`). `max_tool_result_bytes` is unchanged at 16 384 and its
+  doc comment, which said the envelope was bounded separately, now says what
+  is measured.
+- `Client.reply_override`, the test seam that redirects protocol replies, is
+  `void` outside test builds (`if (builtin.is_test)`), so it no longer exists
+  as a settable field on the public struct (`src/client.zig`).
+- The argv arena is freed as soon as `spawn` returns instead of living for the
+  client's lifetime; the child retains no reference to it (`src/client.zig`).
+- The line buffer and the scratch arena keep their capacity up to 1 MiB and
+  release it past that, so one event near `max_line_bytes` no longer pins its
+  size for the session; the usual small line still costs no allocation
+  (`src/client.zig`).
+- `Kind` stays exhaustive, now with the reason documented: `unknown` already
+  absorbs every wire type the enum does not name, so a non-exhaustive `_` tag
+  would never be produced. Adding a variant is a source-breaking change for a
+  `switch (e.kind)` that names every arm; write an `else` arm
+  (`src/event.zig`).
 - Added `wait()`, `sessionId()`, and a `kill()` escape hatch; `close()` keeps
   its signature and delegates. A CLI that dies on startup is now reported
   through its exit status rather than read as an empty but successful run.
@@ -55,9 +184,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confident wrong answer.
 - The README's in-process tool example shows the string schema the reasoning
   above calls for, with a note on why.
+- `just ci` is now `fmt-check`, `docs-check`, `test`, `test-release`, `build`,
+  and `fmt`/`fmt-check` cover `bench/` alongside `build.zig`, `src`,
+  `examples`, and `tests`. The `pre-push` hook no longer validates the working
+  tree with a warning when it diverges from the pushed commit: it checks each
+  pushed commit out into a temporary detached worktree, runs `just ci` there
+  with that commit's own `justfile` (sharing the main tree's `.zig-cache` so
+  the two optimize modes are incremental), and removes the worktree on every
+  exit path. A sha that cannot be checked out blocks the push; a ref delete is
+  skipped with a note. `just canary` now probes `--permission-prompts`,
+  probes `--permission-prompt-tool` by rejection (it is absent from `--help`,
+  like `--max-turns`), and enforces the CLI version floor.
 
 ### Fixed
 
+- The demo's `host_env` tool handed the model any inherited environment
+  variable it asked for. Its argument is model-influenced, the process
+  inherits its parent's environment — which on a developer machine routinely
+  holds cloud and API credentials — and the demo pre-authorizes
+  `mcp__host__*`, so an injected turn could read a secret straight out of it.
+  It now answers only for a fixed non-secret allowlist (`HOME`, `LANG`,
+  `PATH`, `PWD`, `SHELL`, `TERM`, `USER`), enumerated in both the schema and
+  the handler, with the refusal issued before the lookup so the reply cannot
+  distinguish a set secret from an unset one (`examples/demo_tools.zig`).
+- The `justfile` exported `AGENT_SKILLS` through `env_var_or_default(..., "")`,
+  which set it to the empty string on every run. The demo reads an empty
+  `AGENT_SKILLS` as a deliberate empty allowlist, so `just dev` silently
+  disabled every skill — the documented default inverted. The export is gone
+  and the caller's environment passes straight through.
+- An oversized `initialize` or `tools/list` reply was replaced with a
+  `toolCall`-shaped body, which is malformed for those methods: past roughly
+  seventeen tools with 1 KiB schemas the CLI received `{"content":[...],
+  "isError":true}` where it expected `{"tools":[...]}`, the server's tools
+  silently failed to register, and the model reported it could not find them.
+  Those methods now get a JSON-RPC `-32603` error naming the line size and the
+  bound; `tools/call` keeps the `is_error` replacement (`src/client.zig`).
 - A tool result larger than the stdin pipe buffer used to wedge the client and
   the CLI permanently: the reply is written from inside `next()`, so it blocked
   there while the child blocked writing stdout that nothing was draining, with
@@ -83,6 +244,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `open()` with `error.InvalidMaxLineBytes` rather than failing every read.
 - `kill()` records `killed` alongside `term`, so the synthesized
   `.signal = TERM` is distinguishable from an observed exit status.
+- The test "a failed reap is cached but does not disarm kill" only read back a
+  field it had set itself; it is dropped in favour of the live-child variant,
+  which observes `kill` running after a failed reap against a real child.
 
 ### Notes
 

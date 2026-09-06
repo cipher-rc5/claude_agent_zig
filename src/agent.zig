@@ -22,6 +22,9 @@ const client = @import("client.zig");
 
 pub const Options = options.Options;
 pub const PermissionMode = options.PermissionMode;
+/// The oldest CLI this protocol has been exercised against. Not probed at
+/// `open`; `just canary` checks it. See `options.min_cli_version`.
+pub const min_cli_version = options.min_cli_version;
 
 pub const Event = event.Event;
 pub const Kind = event.Kind;
@@ -30,6 +33,8 @@ pub const Tool = tool.Tool;
 pub const ToolHandler = tool.ToolHandler;
 pub const ToolResult = tool.ToolResult;
 pub const McpServer = tool.McpServer;
+pub const PermissionHandler = tool.PermissionHandler;
+pub const PermissionDecision = tool.PermissionDecision;
 
 pub const Client = client.Client;
 pub const OpenError = client.OpenError;

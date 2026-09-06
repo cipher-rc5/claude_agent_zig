@@ -21,7 +21,10 @@ the real agent loop, tool use, subagents, MCP, hooks, skills, and sessions,
 without reimplementing any of them.
 
 The tradeoff is that `claude` must be installed and on PATH (or named
-explicitly).
+explicitly). The oldest CLI this protocol has been exercised against is
+`agent.min_cli_version` (`2.1.228`); nothing probes the installed binary at
+`open`, since that would cost a second spawn per session, so `just canary`
+checks the floor instead, once, against the CLI actually on PATH.
 
 ## Tools
 
@@ -119,6 +122,13 @@ decimal string is the only shape that survives the round trip, so a tool that
 cares about exactness asks for one and parses it itself. `examples/demo_tools.zig`
 carries the worked version, including what it rejects.
 
+`input_schema` is spliced into the `tools/list` reply verbatim rather than
+re-encoded, so `open` checks that every schema parses as JSON and is an object
+before it allocates or spawns anything, and returns `error.InvalidToolSchema`
+otherwise. A schema assembled at runtime therefore fails at `open`, where the
+caller can see it, rather than as a corrupted protocol frame the CLI stalls on
+mid-session.
+
 Claude sees these as `mcp__host__add`, so the allow rule is `mcp__host__*`.
 Handlers run on the caller's thread, inside `next()`, between two conversation
 events. Because tool calls come back over stdin, **stdin must stay open for the
@@ -135,6 +145,88 @@ child pipe, so a ceiling below the smallest plausible pipe buffer is the fix.
 A tool with more to say should return a summary, or write the payload
 somewhere the agent can read with its own file tools.
 
+The bound that is actually enforced is on the whole rendered reply line —
+envelope, request ids and newline included — at `max_tool_result_bytes` plus
+512 bytes of headroom, 16 896 bytes in all, because that is what lands in the
+pipe. It applies to every reply that carries caller- or CLI-sized data, not
+only tool results: an `initialize` or `tools/list` reply that does not fit
+(roughly seventeen tools with 1 KiB schemas) is answered with a JSON-RPC
+`-32603` error naming the size and the bound, rather than a body of the wrong
+shape that would register nothing and say nothing.
+
+**Permission prompts.** The CLI asks before running a tool that nothing
+pre-authorized: one outside `allowed_tools`, under a permission mode that
+prompts rather than refuses. Set `Options.permission_handler` and the client
+passes `--permission-prompt-tool stdio`, which is what makes the CLI emit each
+prompt as a `can_use_tool` control request on this pipe, together with
+`--permission-prompts host`, which the CLI's `--help` documents as naming the
+SDK host as the answerer. Both are sent because the second alone does nothing
+observable: measured against CLI 2.1.261, a session carrying only
+`--permission-prompts host` blocks the call and emits no request. A handler
+also makes the client open with the `initialize` handshake, as the official
+SDK does. Each prompt then arrives carrying `tool_name` and `input`, and `next()`
+calls the handler on the caller's thread, under the same contract as a tool
+handler: the arena is reset before each dispatch, `permission_context` is
+passed through untouched, and `input` is the proposed tool input as a
+`std.json.Value`, or JSON `null` when the request carried none.
+
+```zig
+fn decide(_: ?*anyopaque, _: Allocator, tool_name: []const u8, input: std.json.Value) !agent.PermissionDecision {
+    _ = input;
+    if (std.mem.eql(u8, tool_name, "Bash")) {
+        return .{ .deny = "The shell is off in this session; use Read and Grep instead." };
+    }
+    return .allow;
+}
+```
+
+The handler returns one of three decisions, each answered as a `success`
+control response:
+
+- `.allow` runs the tool with the input it was proposed with. The reply is
+  `{"behavior":"allow","updatedInput":<input>}`; the input is echoed because
+  that is the shape the official SDKs send and the CLI reads `updatedInput` as
+  the input to run with.
+- `.allow_with_input = "<json object>"` runs it with that input instead. The
+  string is spliced into the reply raw, so it is validated first: a value that
+  is not a JSON object becomes a deny rather than a corrupted frame. Build it
+  with a serializer.
+- `.deny = "<message>"` refuses the call; the reply is
+  `{"behavior":"deny","message":"..."}` and the text is shown to the model, so
+  say what to do instead, not only that the call was refused.
+
+A handler that returns an error is answered as a deny carrying the error's
+name; `error.OutOfMemory` is answered as a deny and then propagated from
+`next()`, since that is a host condition rather than a decision. A request
+without `tool_name` gets a control error, and without a handler installed a
+`can_use_tool` request still gets the `unsupported control request` error
+reply it always did, so the CLI does not hang either way.
+
+The reply is bounded like a tool result, because it carries the tool input
+back and that is as large as the CLI made it: an allow whose rendered line
+exceeds 16 896 bytes is turned into a deny naming the size and the bound. In
+practice that means a `Write` of more than about 16 KiB of content through a
+prompting session is denied with an explanatory message the model can act on;
+pre-authorize such tools with `allowed_tools` if that matters.
+
+`allowed_tools` and `permission_mode` compose with the handler rather than
+compete with it: only calls the two do not already settle reach the handler,
+so the routine can be pre-authorized and the rest decided in code. The demo
+installs a log-and-allow handler when `AGENT_PERMISSIONS=host` is set.
+
+The handler path is verified against scripted stub CLIs over real pipes and,
+once, end to end against CLI 2.1.261: a session opened with
+`permission_mode = .manual`, `tools = "Bash"`, and a log-and-allow handler was
+asked to run `mkdir -p` and a redirect, the CLI raised one `can_use_tool`
+request for it, the handler's allow was honoured, and the directory and file
+existed afterwards. Two things about that run matter when reproducing it. A
+command Claude Code treats as read-only, such as a bare `echo`, never prompts
+at all, so it cannot exercise the handler; and a settings source that sets
+`permissions.defaultMode` to `auto` settles the call before any prompt, so
+the demo's `--setting-sources user,project` picks that up from a user file
+that has it. Pass `permission_mode` explicitly, or a narrower
+`setting_sources`, when the handler has to see the prompt.
+
 ## Layout
 
 No dependencies beyond the standard library.
@@ -145,13 +237,13 @@ Three directories, by role: `src/` is the library, `examples/` is the demo,
 | File | |
 |---|---|
 | `src/agent.zig` | Public surface. Re-exports the types below; import just this. |
-| `src/options.zig` | `Options`, `PermissionMode`, and the CLI flags they become. |
+| `src/options.zig` | `Options`, `PermissionMode`, `min_cli_version`, and the CLI flags they become. |
 | `src/event.zig` | `Event` and `Kind`: one protocol line, and how to read it. |
-| `src/tool.zig` | `Tool`, `ToolResult`, `McpServer`: in-process tools. |
+| `src/tool.zig` | `Tool`, `ToolResult`, `McpServer`, and the permission handler types. |
 | `src/protocol.zig` | The wire format — every line this process writes to the CLI. |
 | `src/client.zig` | `Client`: process lifecycle, the read loop, control dispatch. |
 | `examples/demo.zig` | Demo that streams one turn to stdout. |
-| `examples/demo_tools.zig` | The two example tools that demo exposes. |
+| `examples/demo_tools.zig` | The two example tools that demo exposes, and its permission handler. |
 | `tests/all.zig` | Test root for the suite below; lists each file with `_ =`. |
 | `tests/client_test.zig` | The public shape of `Client` and the re-export surface. |
 | `tests/event_test.zig` | `Event` accessors, over fixed protocol lines. |
@@ -159,9 +251,15 @@ Three directories, by role: `src/` is the library, `examples/` is the demo,
 | `tests/options_test.zig` | `Options` and `PermissionMode` on the public surface. |
 | `tests/tool_test.zig` | `Tool`, `ToolResult`, `McpServer` defaults and lookup. |
 
+The table is exact by construction: `just docs-check` fails when it and the
+tree under those three directories disagree, so it can only list them. The
+read-loop benchmark lives outside them, in `bench/`, and is listed with the
+rest of the tooling under Build below.
+
 `build.zig` exposes `src/agent.zig` as a module named `agent`, which is how
-`examples/` and `tests/` reach the library — a Zig file belongs to exactly one
-module, so a root outside `src/` cannot import upward by relative path.
+`examples/`, `tests/` and `bench/` reach the library — a Zig file belongs to
+exactly one module, so a root outside `src/` cannot import upward by relative
+path.
 
 ## Usage
 
@@ -191,6 +289,20 @@ switch (try client.wait()) {
     .exited => |code| if (code != 0) return error.AgentFailed,
     else => return error.AgentFailed,
 }
+```
+
+`try client.next()` is the short form. Two of its errors cost one line, not
+the stream, and a host that wants to keep reading can, with something to log:
+
+```zig
+const event = client.next() catch |err| switch (err) {
+    // The line is still in the buffer until the next call, so log it now.
+    error.InvalidJson => { try log.print("bad line: {s}\n", .{client.lastLine()}); continue; },
+    // The CLI refused this client's own `initialize` or `interrupt`; the
+    // stream is intact, but a refused `initialize` means no SDK tools.
+    error.ControlRequestRejected => { try log.print("refused: {s}\n", .{client.lastControlError().?}); continue; },
+    else => return err,
+};
 ```
 
 **`close()` can block forever on a child that never exits.** Both `close` and
@@ -242,9 +354,31 @@ guidance.
   so a single event larger than the read buffer is handled without a fixed cap.
   End of stream is detected by an empty reader buffer, since
   `streamDelimiterLimit` leaves the delimiter buffered on a successful line.
+- `lastLine()` returns the raw bytes of the most recent protocol line, whatever
+  became of it: the line behind the event `next()` returned, the line that
+  failed to parse behind `error.InvalidJson`, or the prefix that fit before
+  `error.ProtocolTooLong` cut the rest off. It is empty before the first read
+  and after end of stream, and valid only until the next call to `next()`,
+  which reuses the buffer.
+- The line buffer and the scratch arena behind tool dispatch keep their
+  capacity up to 1 MiB, so the usual small line costs no allocation, and are
+  released past it. One event near `max_line_bytes` (32 MiB by default) no
+  longer pins that much memory for the rest of the session.
 - Events are parsed to `std.json.Value` rather than to fixed structs. The event
   schema gains fields regularly, and a strict struct would break on the next
-  CLI release. Typed accessors sit on top.
+  CLI release. Typed accessors sit on top. `Kind` is exhaustive on purpose:
+  `unknown` already absorbs every wire type it does not name, so a non-
+  exhaustive `_` tag would never be produced; the cost is that a new named
+  variant is a source-breaking change for a `switch (e.kind)` that names every
+  arm, so write an `else` arm.
+- `control_response` lines — the CLI answering this client's own `initialize`
+  and `interrupt` requests — are matched by id rather than discarded. A
+  success carries nothing the caller needs; an error is returned from `next()`
+  as `error.ControlRequestRejected` with the CLI's text in
+  `lastControlError()`. The stream stays readable, but a refused `initialize`
+  means the session has no SDK tools and no skill allowlist, whatever
+  `Options` asked for, and the first symptom otherwise would be the model
+  reporting it cannot find a tool.
 - `--bare` defaults to off, so a session picks up project configuration and
   works with an existing `claude` login. Turning it on skips hooks, LSP, plugin
   sync, auto memory, and `CLAUDE.md` auto-discovery, and in that mode
@@ -253,8 +387,14 @@ guidance.
 - `--verbose` is always passed. The streaming protocol requires it, and
   `extra_args` is appended after the generated flags, so it cannot be removed.
   Combined with inherited stderr, CLI diagnostics reach the host's terminal.
+  The argv is built in an arena that is freed as soon as `spawn` returns; the
+  child retains no reference to it.
 - stderr is inherited so CLI startup warnings stay visible. Change to `.pipe`
   if the host needs to capture them.
+- `WriteError` is exactly `error{ StdinClosed, WriteFailed }`. No write path
+  allocates: `send` and `interrupt` render straight into the stdin writer's
+  buffer and `sendCommand` streams its text in escaped pieces, so an
+  allocation error would be a lie about the behaviour.
 - The control channel is pumped only while the caller is inside `next()`. That
   is fine for a turn-driven loop, since the caller is always there while the
   agent is working, but a host that wants to service tool calls from another
@@ -275,15 +415,23 @@ guidance.
 - The `mcp_response` wrapper on tool replies is load-bearing and undocumented.
   Omit it and the CLI never matches the reply to its request; it stalls until
   its own timeout.
-- Permission callbacks are not implemented. A permission prompt would arrive as
-  a control request with a subtype other than `mcp_message`, so it would slot
-  into `serveControlRequest` the same way `mcp_message` does. (Earlier notes
-  here cited a `--permission-prompt-tool` flag as the way to route them; no
-  such flag exists in the CLI as of 2.1.228, so the exact mechanism is unknown
-  and would need to be rediscovered against a version that supports it.) Until
-  then, pre-authorize with `allowed_tools` or a permission mode; an unsupported
-  control request gets an error response rather than silence, so the CLI does
-  not hang.
+- Permission prompts are routed to this process only when
+  `Options.permission_handler` is set; see Tools. Without one the CLI keeps
+  its own handling, where a call nothing pre-authorized is refused, and a
+  `can_use_tool` request that arrives anyway gets an error response rather
+  than silence, so the CLI does not hang.
+
+## Platforms
+
+macOS and Linux are the supported platforms, and both are verified: the suite
+runs on macOS (Apple Silicon) and the tree cross-compiles cleanly with
+`zig build -Dtarget=x86_64-linux`. The library itself is plain `std`, but two
+things around it are POSIX-shaped: the demo reads its arguments with
+`init.minimal.args.iterate()` (`examples/demo.zig`), which Zig rejects on
+Windows in favour of `initAllocator`, so `zig build -Dtarget=x86_64-windows`
+fails there; and the black-box suite and the benchmark drive the client
+through `#!/bin/sh` stub CLIs written at runtime, so they need a Bourne shell
+at `/bin/sh`. Windows is therefore not supported.
 
 ## Build
 
@@ -291,7 +439,14 @@ guidance.
 zig build
 zig build test
 CLAUDE_BIN=claude zig build run -- "explain this repo"
+zig build bench -- 100000    # read-loop benchmark, ReleaseFast via `just bench`
+zig build docs               # autodocs for the agent module into zig-out/docs/
 ```
+
+`build.zig` refuses any Zig other than the one `build.zig.zon` names
+(`0.16.0`): the manifest's `minimum_zig_version` is only a floor, and a later
+toolchain would otherwise be accepted there and fail somewhere inside `std`
+instead of at the first line of the build.
 
 A `justfile` wraps the same commands and is the usual entry point. `just`
 alone lists every recipe:
@@ -299,20 +454,80 @@ alone lists every recipe:
 ```
 just build                        # zig build
 just test                         # zig build test
+just test-release                 # zig build test -Doptimize=ReleaseSafe
 just dev "explain this repo"      # build and run one turn
-just ci                           # fmt-check + test + build, the gate
-just canary                       # check the CLI still accepts what we emit
+just ci                           # fmt-check + docs-check + test + test-release + build, the gate
+just canary                       # check the CLI meets the version floor and accepts what we emit
 just ci-full                      # ci plus the canary
+just bench [lines]                # Client.next() over a synthetic stream, ReleaseFast
+just docs                         # autodocs into zig-out/docs/
+just release <version>            # dist/: tarball, SHA256SUMS, SBOM, optional signature
+just release-verify <version>     # check dist/ sums, and the signature when configured
+just canary-schedule-install      # run the canary weekly (launchd on macOS)
+just canary-schedule-uninstall    # remove that schedule
 ```
 
-CI is local. A git pre-push hook runs `just ci` and blocks a push whose tree
-does not pass; install it once per clone with `just hooks-install`. The hook
-lives in `.githooks/` rather than `.git/hooks/`, so it is version-controlled.
-`just canary` is deliberately not part of `ci`: it needs the `claude` binary
-and tests the installed CLI rather than the commit, so it belongs in
-`ci-full`, before a release or after a CLI upgrade.
+The tooling files, none of which are part of the package:
 
-Two environment variables are read by the demo: `CLAUDE_BIN` selects the CLI
-binary, and `AGENT_SKILLS` is a comma list restricting which skills the agent
-may invoke on its own. Leaving `AGENT_SKILLS` unset allows every discovered
-skill; setting it to the empty string allows none.
+| File | |
+|---|---|
+| `build.zig` | The build graph: the `agent` module, the demo, three test roots, `bench`, `docs`, and the exact-Zig-version guard. |
+| `justfile` | Every recipe above. |
+| `bench/next_bench.zig` | Streams a synthetic `stream_event` transcript through `next()` over a real pipe and reports events/s, bytes and allocations per event. |
+| `scripts/docs-check.sh` | The README-vs-tree gate: the Layout table must match `src/`, `examples/`, `tests/` exactly, and the Usage block must compile. |
+| `scripts/release.sh` | Cuts `dist/` for a version; never tags, commits, or pushes. |
+| `scripts/release-verify.sh` | Checks what `release.sh` left in `dist/`. |
+| `.githooks/pre-commit` | `fmt-check` and `docs-check` on the working tree. |
+| `.githooks/pre-push` | `just ci` on each commit being pushed, in a temporary worktree. |
+
+**CI is strictly local, by design: there is no hosted CI and no workflow file.**
+The gate is two git hooks under `.githooks/`, version-controlled rather than
+hidden in `.git/hooks/`, and installed once per clone with `just hooks-install`
+(which points `core.hooksPath` at the directory). `pre-commit` runs the fast
+checks, formatting and the README drift check, on the working tree.
+`pre-push` gates the commits actually leaving the machine: it checks each
+pushed commit out into a temporary detached worktree, runs `just ci` there
+with that commit's own `justfile`, and removes the worktree on every exit
+path, so a dirty tree or a pushed side branch cannot make a green result mean
+anything other than "this commit passes". Both hooks fail closed when `zig`
+is missing, and both can be bypassed with `--no-verify`, which is the whole
+CI this repository has. `just canary` is deliberately not part of `ci`: it
+needs the `claude` binary and tests the installed CLI rather than the commit,
+so it belongs in `ci-full`, before a release or after a CLI upgrade, and
+`just canary-schedule-install` runs it weekly so drift is caught without
+anyone remembering to.
+
+Releases are cut locally too. `just release <version>` refuses a dirty tree, a
+version that does not match `build.zig.zon`, or a version `CHANGELOG.md` has no
+heading for; runs `just ci-full`; and writes `dist/`: a `git archive` tarball,
+a minimal CycloneDX 1.5 SBOM, `SHA256SUMS` over both, and an `ssh-keygen`
+signature of the sums when `RELEASE_SIGNING_KEY` names a key. It prints the
+`git tag` command and stops; tagging and pushing the tag stay the owner's
+decision. `just release-verify <version>` checks the sums and, when
+`RELEASE_ALLOWED_SIGNERS` is set, the signature; without that variable it says
+the signature was not checked rather than implying it was.
+
+Depending on this package from another Zig project needs a tag to point at,
+and no tag exists yet: `just release <version>` prints the `git tag` command
+once the release artefacts are cut. Once one is pushed, the consumer side is:
+
+```
+zig fetch --save git+https://github.com/cipher-rc5/claude_agent_zig#v0.1.0
+```
+
+which records the URL and content hash in the consumer's `build.zig.zon`
+(the package name is `claude_agent`, its `.fingerprint` is in this repository's
+manifest), and in the consumer's `build.zig`:
+
+```
+const agent = b.dependency("claude_agent", .{ .target = target, .optimize = optimize }).module("agent");
+exe.root_module.addImport("agent", agent);
+```
+
+Environment variables read by the demo: `CLAUDE_BIN` selects the CLI binary;
+`AGENT_SKILLS` is a comma list restricting which skills the agent may invoke
+on its own, where unset allows every discovered skill and the empty string
+allows none; and `AGENT_PERMISSIONS=host` routes the CLI's permission prompts
+to the demo's log-and-allow handler. The release scripts read
+`RELEASE_SIGNING_KEY`, `RELEASE_ALLOWED_SIGNERS`, and the optional
+`RELEASE_SIGNER_IDENTITY`.

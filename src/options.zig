@@ -4,7 +4,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const McpServer = @import("tool.zig").McpServer;
+const tool_mod = @import("tool.zig");
+const McpServer = tool_mod.McpServer;
+const PermissionHandler = tool_mod.PermissionHandler;
+
+/// The oldest `claude` CLI this protocol has been exercised against. Nothing
+/// here probes the installed binary: `--version` would cost a spawn on every
+/// `open`, doubling the process cost of a session to learn something that
+/// does not change between sessions. `just canary` checks it instead, once,
+/// against the CLI actually on PATH, alongside every flag `buildArgv` emits.
+pub const min_cli_version = "2.1.228";
 
 pub const PermissionMode = enum {
     manual,
@@ -105,6 +114,22 @@ pub const Options = struct {
     sdk_mcp_servers: []const McpServer = &.{},
     /// Resume an existing session by id.
     resume_session_id: ?[]const u8 = null,
+    /// Answers the CLI's permission prompts. When set, the client passes
+    /// `--permission-prompt-tool stdio`, which is what makes the CLI emit each
+    /// prompt as a `can_use_tool` control request on this pipe, and
+    /// `--permission-prompts host`, which names this process as the answerer;
+    /// `Client.next` dispatches the request here. Measured against CLI
+    /// 2.1.261, `--permission-prompts host` alone emits nothing and the tool
+    /// call is simply blocked, so both flags are sent, as the official SDK
+    /// does. Leave null to keep the CLI's own behaviour, where a call nothing
+    /// pre-authorized is refused.
+    ///
+    /// Only calls that `allowed_tools` and `permission_mode` do not already
+    /// settle reach the handler, so the two compose: pre-authorize the
+    /// routine, and decide the rest here.
+    permission_handler: ?PermissionHandler = null,
+    /// Passed through to `permission_handler` untouched.
+    permission_context: ?*anyopaque = null,
     /// Appended verbatim after the flags this module generates.
     extra_args: []const []const u8 = &.{},
 
@@ -123,9 +148,13 @@ pub const Options = struct {
 
     /// Whether the session needs an `initialize` control request before the
     /// first turn. Skills being set at all counts, since an empty allowlist
-    /// still has to be declared.
+    /// still has to be declared. A permission handler counts too: the
+    /// official SDK always opens with `initialize` when it can answer
+    /// prompts, and the handshake is what tells the CLI a host is listening.
     pub fn needsInitialize(options: Options) bool {
-        return options.sdk_mcp_servers.len > 0 or options.skills != null;
+        return options.sdk_mcp_servers.len > 0 or
+            options.skills != null or
+            options.permission_handler != null;
     }
 };
 
@@ -163,6 +192,9 @@ pub fn buildArgv(arena: Allocator, options: Options) Allocator.Error![]const []c
     }
     if (options.mcp_config) |v| try argv.appendSlice(arena, &.{ "--mcp-config", v });
     if (options.resume_session_id) |v| try argv.appendSlice(arena, &.{ "--resume", v });
+    if (options.permission_handler != null) {
+        try argv.appendSlice(arena, &.{ "--permission-prompt-tool", "stdio", "--permission-prompts", "host" });
+    }
     try argv.appendSlice(arena, options.extra_args);
 
     return argv.toOwnedSlice(arena);
@@ -218,4 +250,141 @@ test "argv carries skill discovery flags" {
     try std.testing.expect(containsPair(argv, "--max-turns", "12"));
     // --bare would defeat all of the above.
     for (argv) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--bare"));
+}
+
+fn contains(argv: []const []const u8, flag: []const u8) bool {
+    for (argv) |arg| if (std.mem.eql(u8, arg, flag)) return true;
+    return false;
+}
+
+test "the default argv is the bare protocol and nothing else" {
+    // Every optional flag is off by default except partial messages, so a
+    // default session must not reach for a model, a permission mode, or a
+    // config file the caller never named.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const argv = try buildArgv(arena.allocator(), .{});
+    const expected = [_][]const u8{
+        "claude",
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+    };
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "every flag-emitting field emits its flag" {
+    // One case per field, so a field that silently stops reaching the argv
+    // fails here by name rather than as a CLI that ignores a setting.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const argv = try buildArgv(arena.allocator(), .{
+        .claude_path = "/opt/bin/claude",
+        .bare = true,
+        .include_partial_messages = false,
+        .model = "claude-sonnet-4-6",
+        .allowed_tools = "Read",
+        .permission_mode = .bypass_permissions,
+        .append_system_prompt = "Be brief.",
+        .mcp_config = "{\"mcpServers\":{}}",
+        .tools = "Read,Skill",
+        .setting_sources = "user",
+        .add_dirs = &.{"../a"},
+        .plugin_dirs = &.{"/p"},
+        .agents_json = "{\"reviewer\":{}}",
+        .disable_slash_commands = true,
+        .strict_mcp_config = true,
+        .max_turns = 3,
+        .resume_session_id = "sess-1",
+        .permission_handler = stubPermissionHandler,
+    });
+
+    try std.testing.expectEqualStrings("/opt/bin/claude", argv[0]);
+    try std.testing.expect(contains(argv, "--bare"));
+    try std.testing.expect(!contains(argv, "--include-partial-messages"));
+    try std.testing.expect(containsPair(argv, "--model", "claude-sonnet-4-6"));
+    try std.testing.expect(containsPair(argv, "--allowedTools", "Read"));
+    try std.testing.expect(containsPair(argv, "--permission-mode", "bypassPermissions"));
+    try std.testing.expect(containsPair(argv, "--append-system-prompt", "Be brief."));
+    try std.testing.expect(containsPair(argv, "--mcp-config", "{\"mcpServers\":{}}"));
+    try std.testing.expect(containsPair(argv, "--tools", "Read,Skill"));
+    try std.testing.expect(containsPair(argv, "--setting-sources", "user"));
+    try std.testing.expect(containsPair(argv, "--add-dir", "../a"));
+    try std.testing.expect(containsPair(argv, "--plugin-dir", "/p"));
+    try std.testing.expect(containsPair(argv, "--agents", "{\"reviewer\":{}}"));
+    try std.testing.expect(contains(argv, "--disable-slash-commands"));
+    try std.testing.expect(contains(argv, "--strict-mcp-config"));
+    try std.testing.expect(containsPair(argv, "--max-turns", "3"));
+    try std.testing.expect(containsPair(argv, "--resume", "sess-1"));
+    try std.testing.expect(containsPair(argv, "--permission-prompt-tool", "stdio"));
+    try std.testing.expect(containsPair(argv, "--permission-prompts", "host"));
+}
+
+test "the permission-prompt flags follow the handler, not the mode" {
+    // Routing prompts to a host that has nothing to answer them with would
+    // leave every prompt unanswered, so the flag is tied to the handler.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const without = try buildArgv(arena.allocator(), .{ .permission_mode = .manual });
+    try std.testing.expect(!contains(without, "--permission-prompts"));
+    try std.testing.expect(!contains(without, "--permission-prompt-tool"));
+
+    const with = try buildArgv(arena.allocator(), .{ .permission_handler = stubPermissionHandler });
+    // Both, and stdio first: measured against CLI 2.1.261, `--permission-prompts
+    // host` on its own emits no can_use_tool request at all.
+    try std.testing.expect(containsPair(with, "--permission-prompt-tool", "stdio"));
+    try std.testing.expect(containsPair(with, "--permission-prompts", "host"));
+    // And a handler is enough to need the initialize handshake.
+    try std.testing.expect((Options{ .permission_handler = stubPermissionHandler }).needsInitialize());
+}
+
+fn stubPermissionHandler(_: ?*anyopaque, _: Allocator, _: []const u8, _: std.json.Value) anyerror!tool_mod.PermissionDecision {
+    return .allow;
+}
+
+test "extra_args land after every generated flag" {
+    // The README promises `--verbose` cannot be removed because `extra_args`
+    // comes after the generated flags. Every generated flag, not just the
+    // protocol ones: a later flag that slipped behind `extra_args` would let a
+    // caller's `--resume` be overridden by the generated one.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const extra = [_][]const u8{ "--first-extra", "--second-extra", "value" };
+    const argv = try buildArgv(arena.allocator(), .{
+        .bare = true,
+        .model = "m",
+        .allowed_tools = "Read",
+        .permission_mode = .plan,
+        .append_system_prompt = "p",
+        .mcp_config = "c",
+        .tools = "t",
+        .setting_sources = "s",
+        .add_dirs = &.{"d"},
+        .plugin_dirs = &.{"p"},
+        .agents_json = "a",
+        .disable_slash_commands = true,
+        .strict_mcp_config = true,
+        .max_turns = 1,
+        .resume_session_id = "r",
+        .permission_handler = stubPermissionHandler,
+        .extra_args = &extra,
+    });
+
+    // The tail of the argv is exactly `extra_args`, in order, and nothing
+    // generated comes after it.
+    try std.testing.expect(argv.len > extra.len);
+    const tail = argv[argv.len - extra.len ..];
+    for (extra, tail) |want, got| try std.testing.expectEqualStrings(want, got);
+    for (argv[0 .. argv.len - extra.len]) |arg| {
+        try std.testing.expect(!std.mem.startsWith(u8, arg, "--first-extra"));
+    }
 }

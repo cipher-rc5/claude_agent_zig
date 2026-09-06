@@ -1,0 +1,41 @@
+#!/bin/sh
+# Fast local gate. Blocks a commit whose tree is unformatted or whose README
+# has drifted from the code. The full gate (tests, both optimize modes, build)
+# runs at push time, per commit, in .githooks/pre-push.
+# Enabled with `just hooks-install` (sets core.hooksPath=.githooks).
+set -e
+
+echo "pre-commit: fmt-check + docs-check"
+
+blocked() {
+    echo ""
+    echo "──────────────────────────────────────────────"
+    echo " COMMIT BLOCKED — the fast gate failed."
+    echo " Fix the failure above (\`just fmt\` for formatting), or bypass"
+    echo " this one commit with:"
+    echo "     git commit --no-verify"
+    echo " The pre-push gate still runs 'just ci' on the commit."
+    echo "──────────────────────────────────────────────"
+    exit 1
+}
+
+cd "$(git rev-parse --show-toplevel)" || blocked
+
+if ! command -v zig >/dev/null 2>&1; then
+    echo "pre-commit: 'zig' is not on PATH; cannot check formatting."
+    blocked
+fi
+
+# These are the working tree's files, not the index's. That is the right
+# thing for a fast gate: what `zig fmt` and the docs check need on disk is
+# what the editor just saved, and the per-commit verdict comes at push time.
+zig fmt --check build.zig src examples tests bench || blocked
+
+if [ -f scripts/docs-check.sh ]; then
+    bash scripts/docs-check.sh || blocked
+else
+    echo "pre-commit: scripts/docs-check.sh missing; cannot verify doc drift."
+    blocked
+fi
+
+echo "pre-commit: passed."

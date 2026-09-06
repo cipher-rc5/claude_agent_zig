@@ -3,6 +3,14 @@
 
 const std = @import("std");
 
+/// The `type` of a protocol line, as far as this module names them.
+///
+/// Exhaustive on purpose, and that has a cost worth knowing: adding a variant
+/// here is a source-breaking change for every caller whose `switch (e.kind)`
+/// names each arm. Write an `else` arm. `unknown` already absorbs every wire
+/// type this enum does not name, so a non-exhaustive `_` tag would never be
+/// produced and would buy nothing but a mandatory `else` on every switch; the
+/// variant is only ever added when an accessor needs it.
 pub const Kind = enum {
     /// Session lifecycle: `init`, `api_retry`, `plugin_install`.
     system,

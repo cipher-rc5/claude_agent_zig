@@ -243,16 +243,19 @@ test "a tools/call from the child runs the handler and the reply reaches the chi
 /// stdin, so the whole reply has to fit in the pipe buffer unread or the write
 /// blocks forever.
 ///
-/// It queues its output first, then sleeps to stay alive across the write. The
-/// sleep is a bounded lifetime, not a synchronization primitive: the stub exits
-/// when it expires either way, so this cannot hang `just ci`. Without it the
-/// stub exits immediately and the write EPIPEs before the bound is exercised.
+/// It queues its output first, then sleeps so it is still alive when the
+/// reply is written; a stub that had already exited would EPIPE the write
+/// before the bound was exercised. The test kills it as soon as the reply has
+/// landed, so the sleep is a ceiling on the stub's lifetime that nothing
+/// waits out, and long enough that no loaded host reaches it first — a short
+/// one turned the test into a race against spawn plus a 4 MiB allocation.
+/// `exec`, so the signal lands on the sleep itself rather than on a shell
+/// that would leave it orphaned, holding the pipe for the rest of the sleep.
 const no_read_stub =
     "#!/bin/sh\n" ++
     tool_call_line ++ "\n" ++
     "printf '{\"type\":\"result\",\"result\":\"done\"}\\n'\n" ++
-    "sleep 0.2\n" ++
-    "exit 0\n";
+    "exec sleep 5\n";
 
 /// Runs `body` under a deadline, failing the test if it outlives one.
 ///
@@ -319,10 +322,17 @@ fn oversizedToolResultFitsPipe() bool {
     const client = stub.open(.{ .sdk_mcp_servers = &servers }) catch return false;
     defer _ = client.close();
 
-    // Reaching this at all is the assertion: the dispatch inside `next`
-    // wrote the reply without blocking, so the drain ran to end of stream.
-    const count = drain(client) catch return false;
-    return count == 1;
+    // The first `next` services the control request — writing the reply into
+    // a pipe nobody drains — and only then returns the `result` line queued
+    // behind it. Reaching the second statement at all is the assertion.
+    var event = (client.next() catch return false) orelse return false;
+    const ok = event.kind == .result;
+    event.deinit();
+
+    // Not drained to end of stream: that would wait for the stub's sleep to
+    // expire. It is killed instead, which is what the sleep is for.
+    client.kill();
+    return ok;
 }
 
 test "an oversized tool result fits the pipe even when the child never reads" {
@@ -334,9 +344,9 @@ test "an oversized tool result fits the pipe even when the child never reads" {
     // still fits a 64 KiB pipe and would pass either way. The boundary itself
     // is covered by `tool result one byte over the cap` below.
     //
-    // Under a deadline because a regression here hangs rather than fails. The
-    // budget is ~15x the stub's own lifetime, so only a real deadlock reaches
-    // it.
+    // Under a deadline because a regression here hangs rather than fails.
+    // Nothing on the passing path waits — the stub is killed the moment the
+    // result line is read — so only a `next` stuck in `writev` reaches it.
     try underDeadline(oversizedToolResultFitsPipe, 3_000);
 }
 
@@ -373,18 +383,26 @@ fn echoedReply(size: *usize) !std.json.Parsed(std.json.Value) {
     const client = try stub.open(.{ .sdk_mcp_servers = &servers });
     defer _ = client.close();
 
+    return echoedField(client, "reply");
+}
+
+/// Drains `client` to end of stream and hands back the value of `field` on
+/// the first `system` event that carries one, re-parsed into a tree the
+/// caller owns. The drain runs to the end even once the value is found, so
+/// the stub reaches its own `exit` and `close` reaps a clean status.
+fn echoedField(client: *agent.Client, field: []const u8) !std.json.Parsed(std.json.Value) {
     var echoed: ?std.json.Parsed(std.json.Value) = null;
     errdefer if (echoed) |*p| p.deinit();
     while (try client.next()) |event| {
         var e = event;
         defer e.deinit();
-        if (e.kind != .system) continue;
-        const reply = e.parsed.value.object.get("reply") orelse continue;
+        if (echoed != null or e.kind != .system) continue;
+        const value = e.parsed.value.object.get(field) orelse continue;
         // Re-parse into a tree the caller owns; `e.parsed` dies with the event.
         var buf: std.Io.Writer.Allocating = .init(gpa);
         defer buf.deinit();
         var js: std.json.Stringify = .{ .writer = &buf.writer };
-        try js.write(reply);
+        try js.write(value);
         // `.alloc_always`, not the default: without it the tree borrows
         // `buf`, which the defer above frees at the end of this iteration,
         // and the caller would walk freed memory.
@@ -395,7 +413,7 @@ fn echoedReply(size: *usize) !std.json.Parsed(std.json.Value) {
             .{ .allocate = .alloc_always },
         );
     }
-    return echoed orelse error.NoReplyEchoed;
+    return echoed orelse error.NothingEchoed;
 }
 
 /// The tool-call payload the child actually received, dug out of the nested
@@ -643,6 +661,13 @@ test "an oversized line costs one line and the stream resyncs" {
 
     try std.testing.expectError(error.ProtocolTooLong, client.next());
 
+    // What was read before the limit cut in is still there to log: a prefix
+    // of the offending line, no longer than the budget, so a caller can tell
+    // which event was dropped without the buffer having grown past the bound.
+    const prefix = client.lastLine();
+    try std.testing.expect(std.mem.startsWith(u8, prefix, "{\"type\":\"assistant\",\"padding\":\""));
+    try std.testing.expect(prefix.len <= 256 + 1);
+
     // Resynced: the line after the oversized one is delivered normally.
     var e2 = (try client.next()).?;
     defer e2.deinit();
@@ -715,29 +740,7 @@ fn echoedStdin(write: *const fn (*agent.Client) agent.WriteError!void) !std.json
     defer _ = client.close();
 
     try write(client);
-
-    var echoed: ?std.json.Parsed(std.json.Value) = null;
-    errdefer if (echoed) |*p| p.deinit();
-    while (try client.next()) |event| {
-        var e = event;
-        defer e.deinit();
-        if (e.kind != .system) continue;
-        const sent = e.parsed.value.object.get("sent") orelse continue;
-        // Re-parse into a tree the caller owns; `e.parsed` dies with the event.
-        var buf: std.Io.Writer.Allocating = .init(gpa);
-        defer buf.deinit();
-        var js: std.json.Stringify = .{ .writer = &buf.writer };
-        try js.write(sent);
-        // `.alloc_always` for the same reason as in `echoedReply`: without it
-        // the tree borrows `buf`, which this iteration's defer frees.
-        echoed = try std.json.parseFromSlice(
-            std.json.Value,
-            gpa,
-            buf.written(),
-            .{ .allocate = .alloc_always },
-        );
-    }
-    return echoed orelse error.NoLineEchoed;
+    return echoedField(client, "sent");
 }
 
 /// The single text block of a user turn, walked field by field so a turn that
@@ -918,4 +921,366 @@ test "closeStdin records a flush that failed against a dead child" {
     // silent success would mean a queued turn vanished with no signal, which is
     // exactly what this field exists to prevent.
     try std.testing.expect(client.flush_error != null or send_error != null);
+}
+
+// --- diagnostics: what `next` last saw ---
+
+test "lastLine holds the bytes behind whatever next last reported" {
+    // `error.InvalidJson` on its own says a line was bad, not which one, and
+    // the line is gone by the time the caller could ask. `lastLine` is what
+    // makes the error actionable: it holds the raw bytes until the next read,
+    // for every outcome of `next`, not only the failing ones.
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\printf 'not json at all\n'
+        \\printf '{"type":"result","result":"after"}\n'
+        \\exit 0
+        \\
+    );
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    // Nothing has been read, so there is nothing to show.
+    try std.testing.expectEqual(@as(usize, 0), client.lastLine().len);
+
+    try std.testing.expectError(error.InvalidJson, client.next());
+    try std.testing.expectEqualStrings("not json at all", client.lastLine());
+
+    // A delivered event is backed by its line too, newline stripped.
+    var e = (try client.next()).?;
+    defer e.deinit();
+    try std.testing.expectEqualStrings("after", e.resultText().?);
+    try std.testing.expectEqualStrings("{\"type\":\"result\",\"result\":\"after\"}", client.lastLine());
+
+    // End of stream leaves nothing behind, so a stale line cannot be
+    // mistaken for the reason the stream ended.
+    try std.testing.expect(try client.next() == null);
+    try std.testing.expectEqual(@as(usize, 0), client.lastLine().len);
+}
+
+// --- open-time validation ---
+
+test "open refuses a tool schema that is not a JSON object before spawning" {
+    // The schema is spliced into the `tools/list` reply raw, so a malformed
+    // one corrupts the handshake frame rather than failing a call. The path
+    // names a binary that does not exist: spawning it fails with its own
+    // error, so getting `InvalidToolSchema` proves the check ran first and
+    // no child was ever started for a session that could not work.
+    const missing_binary = "/nonexistent/claude";
+    const rejected = [_][]const u8{
+        "not json",
+        "{\"type\":\"object\"",
+        "[]",
+        "\"{}\"",
+        "42",
+        "",
+    };
+    for (rejected) |schema| {
+        const tools = [_]agent.Tool{.{
+            .name = "t",
+            .description = "d",
+            .input_schema = schema,
+            .handler = recordingHandler,
+        }};
+        const servers = [_]agent.McpServer{.{ .name = "s", .tools = &tools }};
+        try std.testing.expectError(error.InvalidToolSchema, agent.Client.open(gpa, io, .{
+            .claude_path = missing_binary,
+            .sdk_mcp_servers = &servers,
+        }));
+    }
+
+    // An object passes, leading whitespace included, and so does the default
+    // schema a `Tool` carries when none is given — each reaches the spawn,
+    // which is where a missing binary is reported.
+    const accepted = [_]agent.Tool{
+        .{ .name = "spaced", .description = "d", .input_schema = "  {\"type\":\"object\"}", .handler = recordingHandler },
+        .{ .name = "default", .description = "d", .handler = recordingHandler },
+    };
+    for (accepted) |tool| {
+        const tools = [_]agent.Tool{tool};
+        const servers = [_]agent.McpServer{.{ .name = "s", .tools = &tools }};
+        try std.testing.expectError(error.FileNotFound, agent.Client.open(gpa, io, .{
+            .claude_path = missing_binary,
+            .sdk_mcp_servers = &servers,
+        }));
+    }
+}
+
+// --- the CLI answering this client's own requests ---
+
+/// A stub that answers the `initialize` request `open` sends as `zig_1`
+/// with an error, then carries on with a normal line. `open` writes the
+/// request before returning, so by the time the stub's first line is read the
+/// request it refuses has already been sent.
+const rejecting_initialize_stub =
+    \\#!/bin/sh
+    \\trap '' PIPE
+    \\printf '{"type":"control_response","response":{"subtype":"error","request_id":"zig_1","error":"sdkMcpServers rejected"}}\n'
+    \\printf '{"type":"result","result":"after"}\n'
+    \\exit 0
+    \\
+;
+
+test "a rejected initialize surfaces from next with the CLI's text" {
+    // Without this the first symptom of a refused handshake is the model
+    // reporting it cannot find a tool, several turns later. The refusal has
+    // to come out of `next` as an error, with the CLI's own text attached,
+    // and the stream has to survive the report.
+    const servers = [_]agent.McpServer{.{ .name = "s" }};
+
+    var stub = try Stub.init(rejecting_initialize_stub);
+    defer stub.deinit();
+
+    const client = try stub.open(.{ .sdk_mcp_servers = &servers });
+    defer _ = client.close();
+
+    try std.testing.expect(client.lastControlError() == null);
+    try std.testing.expectError(error.ControlRequestRejected, client.next());
+    try std.testing.expectEqualStrings("sdkMcpServers rejected", client.lastControlError().?);
+
+    // The stream is intact past the error, and the text stays readable until
+    // `close` rather than dying with the event that carried it.
+    var e = (try client.next()).?;
+    defer e.deinit();
+    try std.testing.expectEqualStrings("after", e.resultText().?);
+    try std.testing.expect(try client.next() == null);
+    try std.testing.expectEqualStrings("sdkMcpServers rejected", client.lastControlError().?);
+}
+
+test "a successful control_response is consumed without surfacing" {
+    // The normal handshake: the CLI accepts `initialize`, and the caller sees
+    // nothing of it. A success that leaked out as an event would be an
+    // `unknown`-kind line every tool-bearing session had to skip.
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\trap '' PIPE
+        \\printf '{"type":"control_response","response":{"subtype":"success","request_id":"zig_1","response":{}}}\n'
+        \\printf '{"type":"result","result":"after"}\n'
+        \\exit 0
+        \\
+    );
+    defer stub.deinit();
+
+    const client = try stub.open(.{ .skills = &.{} });
+    defer _ = client.close();
+
+    try std.testing.expectEqual(@as(usize, 1), try drain(client));
+    try std.testing.expect(client.lastControlError() == null);
+}
+
+// --- permission prompts over a real pipe ---
+
+/// The `can_use_tool` request the CLI sends when a call is not already
+/// pre-authorized, as one line. `p1` is the id the reply must carry back.
+const permission_request_line =
+    \\printf '{"type":"control_request","request_id":"p1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}\n'
+;
+
+/// Issues one permission prompt, reads the decision back, and echoes it as
+/// the `reply` field of a `system` event, like `echo_reply_stub`.
+///
+/// Two reads, in this order: a handler makes `open` send `initialize` before
+/// anything else (the CLI routes prompts to a host that opened with the
+/// handshake), so the first line on stdin is that request and the decision is
+/// the second. A stub that read once would consume the handshake and EPIPE
+/// the decision, which is exactly how this test fails when the rule regresses.
+const echo_permission_stub =
+    "#!/bin/sh\n" ++
+    permission_request_line ++ "\n" ++
+    read_reply ++ "\n" ++
+    "printf '{\"type\":\"system\",\"subtype\":\"echo\",\"reply\":%s}\\n' \"$reply\"\n" ++
+    "exit 0\n";
+
+/// The same prompt against a session with no handler. No handler means no
+/// handshake, so there is exactly one line to read: the error reply.
+const echo_permission_stub_unhandled =
+    "#!/bin/sh\n" ++
+    permission_request_line ++ "\n" ++
+    "IFS= read -r reply || exit 0\n" ++
+    "printf '{\"type\":\"system\",\"subtype\":\"echo\",\"reply\":%s}\\n' \"$reply\"\n" ++
+    "exit 0\n";
+
+/// What the permission handler was asked, and what it should answer.
+const PermissionRecord = struct {
+    decision: agent.PermissionDecision,
+    calls: usize = 0,
+    /// Whether the request arrived with the tool name and input the stub
+    /// sent, so the test proves the payload crossed the pipe rather than the
+    /// handler merely firing.
+    saw_bash: bool = false,
+    saw_ls: bool = false,
+};
+
+fn recordingPermissionHandler(
+    context: ?*anyopaque,
+    arena: std.mem.Allocator,
+    tool_name: []const u8,
+    input: std.json.Value,
+) anyerror!agent.PermissionDecision {
+    _ = arena;
+    const record: *PermissionRecord = @ptrCast(@alignCast(context.?));
+    record.calls += 1;
+    record.saw_bash = std.mem.eql(u8, tool_name, "Bash");
+    if (input == .object) {
+        if (input.object.get("command")) |command| {
+            if (command == .string) record.saw_ls = std.mem.eql(u8, command.string, "ls");
+        }
+    }
+    return record.decision;
+}
+
+/// Runs one permission prompt through `record`'s decision and hands back the
+/// reply the child received, parsed. Caller owns the returned tree.
+fn echoedPermissionReply(record: *PermissionRecord) !std.json.Parsed(std.json.Value) {
+    var stub = try Stub.init(echo_permission_stub);
+    defer stub.deinit();
+
+    const client = try stub.open(.{
+        .permission_handler = recordingPermissionHandler,
+        .permission_context = record,
+    });
+    defer _ = client.close();
+
+    return echoedField(client, "reply");
+}
+
+/// The decision object the child received, dug out of the envelope the
+/// permission writers build:
+///
+///   { type, response: { subtype, request_id, response: { behavior, ... } } }
+///
+/// The outer fields are checked on the way in: a reply under the wrong id, or
+/// not marked `success`, is one the CLI would discard, whatever it carries.
+fn permissionDecision(root: std.json.Value) !std.json.Value {
+    try std.testing.expectEqualStrings("control_response", root.object.get("type").?.string);
+    const outer = root.object.get("response").?;
+    try std.testing.expectEqualStrings("success", outer.object.get("subtype").?.string);
+    try std.testing.expectEqualStrings("p1", outer.object.get("request_id").?.string);
+    return outer.object.get("response").?;
+}
+
+test "a permission allow echoes the proposed input back to the child" {
+    // The official SDKs answer with `behavior` plus `updatedInput`, and the
+    // CLI runs the tool with whatever `updatedInput` says — so a plain allow
+    // has to carry the input back unchanged, not omit it.
+    var record: PermissionRecord = .{ .decision = .allow };
+    var parsed = try echoedPermissionReply(&record);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), record.calls);
+    try std.testing.expect(record.saw_bash);
+    try std.testing.expect(record.saw_ls);
+
+    const decision = try permissionDecision(parsed.value);
+    try std.testing.expectEqualStrings("allow", decision.object.get("behavior").?.string);
+    const input = decision.object.get("updatedInput").?;
+    try std.testing.expectEqual(@as(usize, 1), input.object.count());
+    try std.testing.expectEqualStrings("ls", input.object.get("command").?.string);
+    try std.testing.expect(decision.object.get("message") == null);
+}
+
+test "a permission allow_with_input replaces the input the child runs with" {
+    var record: PermissionRecord = .{ .decision = .{ .allow_with_input = "{\"command\":\"ls -la\"}" } };
+    var parsed = try echoedPermissionReply(&record);
+    defer parsed.deinit();
+
+    const decision = try permissionDecision(parsed.value);
+    try std.testing.expectEqualStrings("allow", decision.object.get("behavior").?.string);
+    // The handler's object, spliced raw, survived a parse on the child's
+    // side and another on the way back here.
+    const input = decision.object.get("updatedInput").?;
+    try std.testing.expectEqualStrings("ls -la", input.object.get("command").?.string);
+}
+
+test "a permission deny carries the message the model will read" {
+    var record: PermissionRecord = .{ .decision = .{ .deny = "use Read instead" } };
+    var parsed = try echoedPermissionReply(&record);
+    defer parsed.deinit();
+
+    const decision = try permissionDecision(parsed.value);
+    try std.testing.expectEqualStrings("deny", decision.object.get("behavior").?.string);
+    try std.testing.expectEqualStrings("use Read instead", decision.object.get("message").?.string);
+    // A deny proposes nothing to run, so there is no input to carry.
+    try std.testing.expect(decision.object.get("updatedInput") == null);
+}
+
+test "a permission prompt with no handler is refused, not left unanswered" {
+    // The CLI only routes prompts here when asked, but a flag is not a
+    // promise. Whatever arrives has to be answered: an unanswered control
+    // request leaves the CLI blocked until its own timeout, which reads as a
+    // hung session rather than a configuration mistake.
+    var stub = try Stub.init(echo_permission_stub_unhandled);
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    var parsed = try echoedField(client, "reply");
+    defer parsed.deinit();
+
+    const outer = parsed.value.object.get("response").?;
+    try std.testing.expectEqualStrings("error", outer.object.get("subtype").?.string);
+    try std.testing.expectEqualStrings("p1", outer.object.get("request_id").?.string);
+    try std.testing.expectEqualStrings("unsupported control request", outer.object.get("error").?.string);
+}
+
+// --- allocation failure ---
+
+test "an allocation failure inside next is OutOfMemory, and close still frees everything" {
+    // Every allocation on the path from `open` through the first event,
+    // failed one at a time. The counts come from a first pass that never
+    // fails, so the sweep tracks the code rather than a number that goes
+    // stale when a std.json internal adds or drops an allocation. Each pass
+    // spawns a fresh stub, since the one before it was reaped.
+    //
+    // `std.testing.allocator` backs the failing allocator, so a client that
+    // leaked on the way out — a parsed tree not freed when the session-id
+    // dupe failed, say — fails the test as a leak on top of the count check.
+    var stub = try Stub.init(two_line_stub);
+    defer stub.deinit();
+
+    var during_open: usize = 0;
+    var during_next: usize = 0;
+    {
+        var counting = std.testing.FailingAllocator.init(gpa, .{});
+        const client = try agent.Client.open(counting.allocator(), io, .{ .claude_path = stub.path });
+        during_open = counting.allocations;
+        var event = (try client.next()).?;
+        event.deinit();
+        during_next = counting.allocations - during_open;
+        _ = client.close();
+        try std.testing.expectEqual(counting.allocations, counting.deallocations);
+    }
+    // Both halves allocate, or the sweeps below would be empty and prove
+    // nothing.
+    try std.testing.expect(during_open > 0);
+    try std.testing.expect(during_next > 0);
+
+    // A failure during `open` is reported from `open`, with nothing left
+    // behind: no client, and no child to reap.
+    var fail_index: usize = 0;
+    while (fail_index < during_open) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, agent.Client.open(
+            failing.allocator(),
+            io,
+            .{ .claude_path = stub.path },
+        ));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    }
+
+    // A failure during `next` — the line buffer growing, the JSON parse, or
+    // the session-id dupe — is `OutOfMemory` from `next`, and `close` then
+    // frees whatever the failing path had already taken.
+    while (fail_index < during_open + during_next) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const client = try agent.Client.open(failing.allocator(), io, .{ .claude_path = stub.path });
+        try std.testing.expectError(error.OutOfMemory, client.next());
+        try std.testing.expect(failing.has_induced_failure);
+        _ = client.close();
+        try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    }
 }

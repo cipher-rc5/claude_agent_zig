@@ -186,6 +186,57 @@ pub fn writeControlError(
     try endControlResponse(js);
 }
 
+/// The input a permission reply carries back: the tool input as it was
+/// proposed, or a replacement the handler already rendered as JSON.
+pub const PermissionInput = union(enum) {
+    value: std.json.Value,
+    /// Spliced in verbatim. The client validates it before it gets here.
+    raw: []const u8,
+};
+
+/// Allows a `can_use_tool` request. The `behavior`/`updatedInput` shape is
+/// the one the official SDKs answer with; the CLI reads `updatedInput` as
+/// the input to run the tool with, so it is always sent, even when unchanged.
+pub fn writePermissionAllow(
+    js: *std.json.Stringify,
+    request_id: []const u8,
+    input: PermissionInput,
+) !void {
+    try beginControlResponse(js, "success", request_id);
+    try js.objectField("response");
+    try js.beginObject();
+    try js.objectField("behavior");
+    try js.write("allow");
+    try js.objectField("updatedInput");
+    switch (input) {
+        .value => |v| try js.write(v),
+        .raw => |r| {
+            try js.beginWriteRaw();
+            try js.writer.writeAll(r);
+            js.endWriteRaw();
+        },
+    }
+    try js.endObject();
+    try endControlResponse(js);
+}
+
+/// Denies a `can_use_tool` request. `message` is what the model sees.
+pub fn writePermissionDeny(
+    js: *std.json.Stringify,
+    request_id: []const u8,
+    message: []const u8,
+) !void {
+    try beginControlResponse(js, "success", request_id);
+    try js.objectField("response");
+    try js.beginObject();
+    try js.objectField("behavior");
+    try js.write("deny");
+    try js.objectField("message");
+    try js.write(message);
+    try js.endObject();
+    try endControlResponse(js);
+}
+
 /// Bodies of the MCP replies this client serves, as the `result` payload that
 /// `writeMcpResult` splices in.
 pub const results = struct {
@@ -406,6 +457,40 @@ test "initialize result echoes the offered protocol version" {
     try expectContains(r.text(), "\"protocolVersion\":\"2030-01-01\"");
     try expectContains(r.text(), "\"name\":\"host\"");
     try expectContains(r.text(), "\"version\":\"9.9.9\"");
+}
+
+test "permission allow echoes the proposed input under updatedInput" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"command":"ls -la","timeout":5}
+    , .{});
+    defer parsed.deinit();
+
+    var r = try render(writePermissionAllow, .{ "req_1", PermissionInput{ .value = parsed.value } });
+    defer r.deinit();
+
+    // A success envelope, not an mcp reply: the CLI matches permission answers
+    // by request id alone.
+    try expectContains(r.text(), "\"subtype\":\"success\"");
+    try expectContains(r.text(), "\"request_id\":\"req_1\"");
+    try expectContains(r.text(), "\"behavior\":\"allow\"");
+    try expectContains(r.text(), "\"updatedInput\":{\"command\":\"ls -la\",\"timeout\":5}");
+    try std.testing.expect(std.mem.indexOf(u8, r.text(), "mcp_response") == null);
+}
+
+test "permission allow splices a replacement input raw" {
+    var r = try render(writePermissionAllow, .{ "req_2", PermissionInput{ .raw = "{\"command\":\"ls\"}" } });
+    defer r.deinit();
+    // Raw, not re-encoded as a string.
+    try expectContains(r.text(), "\"updatedInput\":{\"command\":\"ls\"}");
+}
+
+test "permission deny carries the message the model sees" {
+    var r = try render(writePermissionDeny, .{ "req_3", "not on this host" });
+    defer r.deinit();
+    try expectContains(r.text(), "\"subtype\":\"success\"");
+    try expectContains(r.text(), "\"behavior\":\"deny\"");
+    try expectContains(r.text(), "\"message\":\"not on this host\"");
+    try std.testing.expect(std.mem.indexOf(u8, r.text(), "updatedInput") == null);
 }
 
 test "user message wire shape" {
