@@ -11,10 +11,12 @@ pub const ToolResult = struct {
     is_error: bool = false,
 };
 
-/// Invoked on the client's thread when Claude calls the tool. `arena` is reset
-/// immediately before each dispatch, so the handler can allocate freely and
-/// whatever it returns stays valid until the reply has been written. Nothing
-/// allocated in it survives the next tool call.
+/// Invoked on the thread inside `Client.next` when Claude calls the tool.
+/// `arena` is reset immediately before each dispatch, so the handler can
+/// allocate freely and whatever it returns stays valid until the reply has
+/// been written. Nothing allocated in it survives the next tool call. The
+/// handler may `send`, `interrupt`, or `kill` on the client, but must not
+/// call `next`: it is already inside it, and the lock is not reentrant.
 pub const ToolHandler = *const fn (
     context: ?*anyopaque,
     arena: Allocator,
@@ -35,8 +37,8 @@ pub const PermissionDecision = union(enum) {
     deny: []const u8,
 };
 
-/// Invoked on the client's thread when the CLI asks whether Claude may run a
-/// tool, which it does only when `Options.permission_handler` is set and the
+/// Invoked on the thread inside `Client.next` when the CLI asks whether Claude
+/// may run a tool, which it does only when `Options.permission_handler` is set and the
 /// call is not already pre-authorized by `allowed_tools` or a permission mode.
 /// `arena` follows the `ToolHandler` contract: reset before each dispatch, so
 /// a `deny` or `allow_with_input` string may live in it. `input` is the

@@ -84,6 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `notifications/initialized` answered under id 0, and a successful
   `tools/list`; plus `buildArgv` tests pinning the default argv exactly, every
   flag-emitting field, and that `extra_args` is exactly the tail of the argv.
+- A concurrency test (`tests/integration_test.zig`) driving two clients from
+  two threads at once, each against its own stub CLI with its own session id
+  and its own `sdk_mcp_servers` tool. `Client` is single-threaded per
+  instance, but nothing in `src/` is global, so independent clients are
+  expected to run side by side; that was true by construction and untested
+  until now. The test pins both the session ids and the tool replies, so
+  hoisting any per-client state to a global fails here rather than in a host.
+
 - A `pre-commit` hook in `.githooks/` running `fmt-check` and `docs-check` on
   the working tree, beside the existing `pre-push`; both installed by
   `just hooks-install`.
@@ -123,6 +131,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed inside `std` instead.
 
 ### Changed
+
+- `Client` is thread safe. Any method may be called from any thread,
+  concurrently with any other, under two rules: `next` is single-consumer, and
+  a handler must not call it from inside `next`; `close` must be the last call.
+  Three `Io.Mutex` locks back this, one per concern. The write lock covers the
+  stdin writer, `stdin_closed`, `flush_error`, and the `zig_N` request list,
+  and is held for one whole line and its flush by `send`, `sendCommand`,
+  `interrupt`, `closeStdin`, and every control reply `next` writes, so two
+  writers can no longer interleave a line on the pipe. It is not held while a
+  tool or permission handler runs, so a handler may `send`. The read lock is
+  held across `next`; `close` takes it after the reap so it cannot free the
+  client under a reader. The state lock and a condition cover `term`,
+  `killed`, `wait_error`, `stdout_closed`, `session_id`, and a `waiting` flag
+  that marks the one thread inside the blocking reap: a second `wait` or
+  `close` sleeps on the condition and returns the same status instead of
+  reaping twice. `sessionId` now takes `*Client`, since it reads under the
+  state lock; `lastLine` and `lastControlError` belong to the thread that
+  called `next`. The README's "not thread safe" note, the watchdog warning,
+  and `SECURITY.md`'s reliance on the single-thread rule are rewritten to the
+  new contract, and `tests/integration_test.zig` drives the client from real
+  OS threads: eight senders against a reader, a watchdog `kill` against a
+  parked `wait`, a `kill` against a reader blocked in `next`, and two
+  concurrent `wait`s.
+- `kill` from a watchdog thread is sound, and `term` after it is observed
+  rather than synthesized. When another thread is inside the reap, `kill`
+  sends `SIGTERM` by pid — captured at spawn as `Client.pid` — and lets that
+  thread observe the death; otherwise it signals and reaps itself through the
+  ordinary `Child.wait`. Either way there is exactly one reap, and `term` is
+  what the kernel reported: a child that traps the signal and exits cleanly is
+  `killed` with an `.exited` term. This removes the README's "no way to bound
+  `close`" limitation; the deadline still has to come from another thread,
+  since Zig 0.16's `Io` exposes no timed child wait. `kill` after a failed
+  reap now returns without signalling once the stdlib has cleared the handle,
+  since the pid may already have been reissued.
+- `open` moves the child's stdout descriptor out of the `Child` and the
+  client owns it until `close`. The stdlib closes every descriptor a `Child`
+  still holds when it reaps, which was the stale-fd hazard `stdout_closed`
+  guarded against on one thread and would have been a live one under a
+  reader blocked in `next` on another. The reap no longer touches the
+  descriptor; a reader parked in `read` sees end of stream when the child
+  dies. `stdout_closed` stays, so `next` after a reap still reports end of
+  stream rather than handing out whatever the child left buffered.
 
 - The tree is split by role: `src/` is the library alone, `examples/` holds the
   demo, and `tests/` holds the black-box suite. `src/main.zig` moved to

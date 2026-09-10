@@ -137,33 +137,34 @@ pub const Client = struct {
     control_error: ?[]u8 = null,
     session_id: ?[]u8 = null,
     stdin_closed: bool = false,
-    /// The read-side counterpart to `stdin_closed`. Reaping the child, by
-    /// `wait` or `kill`, closes its stdout inside the stdlib, but
-    /// `stdout_reader` holds the file by value and keeps a stale copy of the
-    /// descriptor. Reading through that copy once the number has been recycled
-    /// parses whatever unrelated file now owns it and hands it back as a
-    /// genuine event. This flag is what stops that: once set, `next` reports
-    /// end of stream instead of touching the reader.
+    /// The read-side counterpart to `stdin_closed`: set by the reap, after
+    /// which `next` reports end of stream rather than reading on. Whatever
+    /// the child left in the pipe is dropped, since only the exit status is
+    /// meaningful once it is gone. The descriptor itself stays open until
+    /// `close` — see `open` — so a reader mid-`read` on another thread is
+    /// not cut off; the child dying is what ends its read.
     stdout_closed: bool = false,
-    /// How the child ended, once it has been reaped by `wait` or `close`.
-    /// Null while it is still running, so a caller that only ever uses the
-    /// `defer _ = client.close()` idiom can still tell a clean exit from a
-    /// crash by reading it before the pointer goes away.
+    /// How the child ended, once it has been reaped by `wait`, `kill`, or
+    /// `close`. Null while it is still running, so a caller that only ever
+    /// uses the `defer _ = client.close()` idiom can still tell a clean exit
+    /// from a crash by reading it before the pointer goes away.
     ///
-    /// Observed, except after `kill`, which stores an assumed
-    /// `.signal = SIGTERM` and sets `killed`. Check `killed` first.
+    /// Always the status the kernel reported. Stable from the moment the
+    /// caller's own `wait` or `kill` returns; another thread reads it safely
+    /// through `wait`, which hands back the cached value.
     term: ?std.process.Child.Term = null,
-    /// Whether `kill` produced the value in `term`. When true, `term` is an
-    /// assumption rather than an observation and says nothing about how the
-    /// child actually ended; see `term` and `kill`.
+    /// Whether `kill` sent `SIGTERM` before the child was reaped. Says why
+    /// the child died, not how: `term` still holds the observed status, and
+    /// a child that traps the signal reads as `.exited`. Stable under the
+    /// same rule as `term`.
     killed: bool = false,
     /// Test seam: when set, control replies are written here instead of to
     /// the child's stdin, so the dispatch can be exercised without a
     /// subprocess. `void` outside a test build, so it cannot be set there.
     reply_override: if (builtin.is_test) ?*Io.Writer else void = if (builtin.is_test) null else {},
-    /// Set when reaping the child failed outright. A failed reap is not the
-    /// same as a `.unknown` exit status, so it is recorded separately rather
-    /// than folded into `term`.
+    /// Set when reaping the child failed outright, and not folded into
+    /// `term`: a failed reap is not a `.unknown` exit status. Stable under
+    /// the same rule as `term`.
     wait_error: ?std.process.Child.WaitError = null,
     /// Set when the final flush in `closeStdin` failed, meaning buffered
     /// protocol bytes were dropped before the descriptor went away.
@@ -171,8 +172,31 @@ pub const Client = struct {
     /// Recorded rather than returned, since `closeStdin` is called from `wait`
     /// and `kill`, neither of which can carry it. A swallowed flush loses a
     /// queued turn with no signal, which reads downstream as a CLI that ignored
-    /// a message.
+    /// a message. Stable once the caller's own `closeStdin`, `wait`, or
+    /// `kill` has returned.
     flush_error: ?Io.Writer.Error = null,
+    /// The child's pid, captured at spawn. `kill` signals through it rather
+    /// than through `child`, which the thread inside a reap owns.
+    pid: std.process.Child.Id,
+    /// Serializes the write side: the stdin writer, `stdin_closed`,
+    /// `flush_error`, and the `zig_N` request bookkeeping. Held for one line
+    /// and its flush, never while a tool or permission handler runs, so a
+    /// handler may `send`.
+    write_mutex: Io.Mutex = .init,
+    /// Serializes `next`: the line buffer, the scratch arena, and dispatch.
+    /// Not reentrant, so a handler must not call `next`. `close` takes it
+    /// after reaping so it cannot free the client under a reader.
+    read_mutex: Io.Mutex = .init,
+    /// Guards the lifecycle fields: `term`, `killed`, `wait_error`,
+    /// `stdout_closed`, `session_id`, and `waiting`. Never held across a
+    /// blocking call, and never held while taking another lock.
+    state_mutex: Io.Mutex = .init,
+    /// Broadcast under `state_mutex` when a reap finishes; see `waiting`.
+    reaped: Io.Condition = .init,
+    /// True while one thread is inside the blocking reap. That thread owns
+    /// `child`; a second `wait` sleeps on `reaped` rather than reaping again,
+    /// and `kill` signals `pid` and lets the reaper observe the death.
+    waiting: bool = false,
 
     /// Spawns the CLI. The returned pointer is stable; the reader and writer
     /// interfaces embed pointers into it.
@@ -210,6 +234,15 @@ pub const Client = struct {
         };
         errdefer child.kill(io);
 
+        // Moved out of `child` so a reap cannot close it. The stdlib closes
+        // every descriptor `child` still holds when it reaps, and `wait` or
+        // `kill` on one thread would then close stdout under a `next` blocked
+        // on another, leaving the reader to parse whatever file next took the
+        // number. Owned here instead, and closed by `close`, last.
+        const stdout_file = child.stdout.?;
+        child.stdout = null;
+        errdefer stdout_file.close(io);
+
         client.* = .{
             .gpa = gpa,
             .io = io,
@@ -217,7 +250,8 @@ pub const Client = struct {
             .stdin_buffer = stdin_buffer,
             .stdout_buffer = stdout_buffer,
             .stdin_writer = child.stdin.?.writerStreaming(io, stdin_buffer),
-            .stdout_reader = child.stdout.?.readerStreaming(io, stdout_buffer),
+            .stdout_reader = stdout_file.readerStreaming(io, stdout_buffer),
+            .pid = child.id.?,
             .line = .init(gpa),
             .max_line_bytes = options.max_line_bytes,
             .servers = options.sdk_mcp_servers,
@@ -246,47 +280,104 @@ pub const Client = struct {
     /// Closes stdin first, so a CLI waiting for more input finishes its turn
     /// and exits rather than blocking here. Idempotent: the reaped status is
     /// cached, so a later `close` returns the same value without waiting again.
+    ///
+    /// Safe from any thread. A second caller arriving while the reap is in
+    /// flight sleeps until it finishes and returns the same status, and a
+    /// `kill` from another thread ends the wait early; see `kill`.
     pub fn wait(client: *Client) std.process.Child.WaitError!std.process.Child.Term {
-        if (client.term) |term| return term;
-        if (client.wait_error) |err| return err;
-        client.closeStdin();
-        const term = client.child.wait(client.io) catch |err| {
-            // The reap failed, but the stdlib may still have torn the
-            // descriptors down, so the reader is no longer trustworthy either.
-            client.stdout_closed = true;
-            client.wait_error = err;
+        const io = client.io;
+        client.state_mutex.lockUncancelable(io);
+        // Another thread is inside the reap. Its result is this one's too.
+        while (client.waiting) client.reaped.waitUncancelable(io, &client.state_mutex);
+        if (client.term) |term| {
+            client.state_mutex.unlock(io);
+            return term;
+        }
+        if (client.wait_error) |err| {
+            client.state_mutex.unlock(io);
             return err;
-        };
-        client.stdout_closed = true;
-        client.term = term;
-        return term;
+        }
+        client.waiting = true;
+        client.state_mutex.unlock(io);
+        return client.reap();
     }
 
     /// Terminates the child without waiting for it to finish on its own, then
     /// reaps it. Use this when a wedged CLI must not hold up the host.
     ///
-    /// The status left in `term` is SYNTHESIZED, not observed: `Child.kill`
-    /// reaps the child itself and returns void, so a child that had already
-    /// exited cleanly reads the same as one this call signalled. Check `killed`
-    /// before drawing any conclusion from `term`.
+    /// Safe from any thread, including a watchdog while another thread sits
+    /// in `wait` or `close`: the child is signalled by pid, and the thread
+    /// already inside the reap observes the death and records it, so there is
+    /// exactly one reap. `term` is therefore the status the kernel reported,
+    /// not an assumption; a child that traps `SIGTERM` and exits cleanly reads
+    /// as `.exited`. `killed` says the signal was sent before the child was
+    /// reaped, whatever it then died of.
     ///
-    /// A no-op only once `term` records a genuine reap. A failed reap does not
-    /// disarm it — that is the path where the child may still be alive — but
-    /// re-killing a reaped child trips a stdlib assert, so `term` alone guards.
-    ///
-    /// Not thread-safe, like every other method here: the `term` guard is an
-    /// unsynchronized field read, so calling this from a watchdog thread while
-    /// another sits in `wait` is a double-reap, not a way to bound one. The
-    /// deadline has to come from outside the process.
+    /// A no-op once `term` records a reap, and once a failed reap has already
+    /// taken the pid — the process is gone either way, and signalling a pid
+    /// the kernel may have reissued is worse than nothing.
     pub fn kill(client: *Client) void {
-        if (client.term != null) return;
-        client.closeStdin();
-        client.child.kill(client.io);
-        // Reaped inside `kill`, so the reader's descriptor is stale from here.
-        client.stdout_closed = true;
-        // An assumption, not an observation. `killed` is what says so.
+        const io = client.io;
+        client.state_mutex.lockUncancelable(io);
+        if (client.term != null) {
+            client.state_mutex.unlock(io);
+            return;
+        }
+        if (client.waiting) {
+            // Another thread owns `child` for the duration of its reap. The
+            // signal is sent under the lock, right after confirming that reap
+            // has not yet recorded a result, which is as close as a pid-based
+            // kill can get to not racing a reissued pid.
+            client.killed = true;
+            client.signal();
+            client.state_mutex.unlock(io);
+            return;
+        }
+        if (client.child.id == null) {
+            // A failed reap: the stdlib has cleared the handle, so the child
+            // is reaped or unreachable, and the pid may already be someone
+            // else's.
+            client.state_mutex.unlock(io);
+            return;
+        }
+        client.waiting = true;
         client.killed = true;
-        client.term = .{ .signal = std.posix.SIG.TERM };
+        client.signal();
+        client.state_mutex.unlock(io);
+        _ = client.reap() catch {};
+    }
+
+    /// `SIGTERM` to the child, by pid. Called under `state_mutex` with the
+    /// child known to be unreaped, so the pid is this process's own live or
+    /// zombie child: it cannot be missing, and it cannot be someone else's.
+    /// The only failure left is a kernel refusal, and the reap that follows
+    /// is the right response to that too, so nothing is reported.
+    fn signal(client: *Client) void {
+        std.posix.kill(client.pid, .TERM) catch {};
+    }
+
+    /// The blocking reap. The caller has claimed `waiting` under
+    /// `state_mutex`, so this thread owns `child` until it clears the flag.
+    /// Records the outcome, marks the reader's stream ended, and wakes every
+    /// thread queued in `wait`.
+    fn reap(client: *Client) std.process.Child.WaitError!std.process.Child.Term {
+        const io = client.io;
+        client.closeStdin();
+        const result = client.child.wait(io);
+
+        client.state_mutex.lockUncancelable(io);
+        defer client.state_mutex.unlock(io);
+        client.waiting = false;
+        client.stdout_closed = true;
+        if (result) |term| {
+            client.term = term;
+        } else |err| {
+            // A failed reap is not the same as a `.unknown` exit status, so
+            // it is recorded separately rather than folded into `term`.
+            client.wait_error = err;
+        }
+        client.reaped.broadcast(io);
+        return result;
     }
 
     /// Reaps the child and releases the client. The returned status is safe to
@@ -295,8 +386,18 @@ pub const Client = struct {
     ///
     /// A failed reap surfaces as `.unknown` here only because this signature
     /// cannot carry an error. `wait` reports it properly.
+    ///
+    /// Must be the last call on the client, like a free. The one overlap it
+    /// tolerates is the common near miss: a reader still stepping out of
+    /// `next` after the child died. Taking the read lock orders this free
+    /// after that return.
     pub fn close(client: *Client) std.process.Child.Term {
         const term = client.wait() catch std.process.Child.Term{ .unknown = 0 };
+        client.read_mutex.lockUncancelable(client.io);
+        client.read_mutex.unlock(client.io);
+        // Owned since `open`; the reap left it alone. Closed only now, when
+        // no reader can be inside `next`.
+        client.stdout_reader.file.close(client.io);
         const gpa = client.gpa;
         if (client.session_id) |id| gpa.free(id);
         if (client.control_error) |text| gpa.free(text);
@@ -310,8 +411,11 @@ pub const Client = struct {
 
     /// The session id the CLI assigned, once any event has carried one. Pass
     /// it back as `Options.resume_session_id` to resume this conversation.
-    /// Valid until `close`.
-    pub fn sessionId(client: *const Client) ?[]const u8 {
+    /// Valid until `close`, from any thread: set once by `next` and never
+    /// replaced.
+    pub fn sessionId(client: *Client) ?[]const u8 {
+        client.state_mutex.lockUncancelable(client.io);
+        defer client.state_mutex.unlock(client.io);
         return client.session_id;
     }
 
@@ -322,7 +426,8 @@ pub const Client = struct {
     /// the first read, and after end of stream.
     ///
     /// Valid until the next call to `next`, which reuses the buffer. Log it
-    /// there, or copy it; do not keep the slice.
+    /// there, or copy it; do not keep the slice. Belongs to the thread that
+    /// called `next`: another thread's `next` may be rewriting it.
     pub fn lastLine(client: *const Client) []const u8 {
         return client.line.writer.buffered();
     }
@@ -330,7 +435,8 @@ pub const Client = struct {
     /// The error text from the last `control_response` the CLI addressed to
     /// one of this client's own requests, once `next` has returned
     /// `error.ControlRequestRejected`. Null until then. Replaced by the next
-    /// such error and freed by `close`; valid in between.
+    /// such error and freed by `close`; valid in between, on the thread that
+    /// called `next`.
     pub fn lastControlError(client: *const Client) ?[]const u8 {
         return client.control_error;
     }
@@ -344,6 +450,8 @@ pub const Client = struct {
     /// can carry it. Check `flush_error` when it matters that the last line
     /// actually left this process.
     pub fn closeStdin(client: *Client) void {
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
         if (client.stdin_closed) return;
         client.stdin_closed = true;
         client.stdin_writer.interface.flush() catch |err| {
@@ -361,14 +469,21 @@ pub const Client = struct {
     /// this check is what stops a late write landing on a recycled fd. It is a
     /// returned error rather than an assert because asserts vanish under
     /// `ReleaseFast` and `ReleaseSmall`, exactly where the fd may be reused.
+    ///
+    /// Caller holds `write_mutex`.
     fn stdin(client: *Client) WriteError!*Io.Writer {
         if (client.stdin_closed) return error.StdinClosed;
         return &client.stdin_writer.interface;
     }
 
     /// Queues a user turn. Safe to call while a turn is in flight; the CLI
-    /// treats it as mid-turn guidance.
+    /// treats it as mid-turn guidance. Safe from any thread, including a
+    /// handler running inside another thread's `next`: whole lines are
+    /// serialized against each other and against the control replies `next`
+    /// writes.
     pub fn send(client: *Client, text: []const u8) WriteError!void {
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
         const w = try client.stdin();
         try protocol.writeUserMessage(w, text);
         try finishLine(w);
@@ -383,6 +498,8 @@ pub const Client = struct {
     /// and then failing is harmless: the CLI acts on a line only once its
     /// newline lands, and no newline is written on the failing path.
     pub fn sendCommand(client: *Client, name: []const u8, arguments: []const u8) WriteError!void {
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
         const w = try client.stdin();
         try writeCommandMessage(w, name, arguments);
         try finishLine(w);
@@ -390,12 +507,16 @@ pub const Client = struct {
 
     /// Asks the CLI to abandon the turn in progress. The CLI's answer arrives
     /// on the control channel; a refusal surfaces from `next` as
-    /// `error.ControlRequestRejected`.
+    /// `error.ControlRequestRejected`. Safe from any thread, which is the
+    /// point: abandoning an in-flight turn means calling this while another
+    /// thread sits in `next`.
     pub fn interrupt(client: *Client) WriteError!void {
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
         _ = try client.stdin();
         var id_buf: [32]u8 = undefined;
         const request_id = client.nextRequestId(&id_buf);
-        try client.writeLine(protocol.writeInterrupt, .{request_id});
+        try client.writeLineLocked(protocol.writeInterrupt, .{request_id});
     }
 
     /// Reads the next conversation event. Returns null at end of stream. The
@@ -412,15 +533,19 @@ pub const Client = struct {
     /// Reading after closing stdin is otherwise normal.
     ///
     /// Draining to null before reaping is the intended flow, but calling this
-    /// after `wait`, `kill`, or `close` is legal and reports a clean end of
-    /// stream. Reaping closes the child's stdout, so anything still buffered is
-    /// lost and only the exit status remains meaningful.
+    /// after `wait` or `kill` is legal and reports a clean end of stream:
+    /// once the child is reaped only the exit status remains meaningful, so
+    /// anything still buffered is dropped rather than handed out.
+    ///
+    /// Single consumer. Concurrent calls serialize rather than corrupt, but
+    /// the lock is not reentrant, so a handler must not call this. A `kill`
+    /// or `wait` on another thread while this one is blocked reading is fine:
+    /// the descriptor stays open until `close`, and the child dying is what
+    /// ends the read.
     pub fn next(client: *Client) ReadError!?Event {
-        // The child has been reaped, so `stdout_reader` holds a descriptor the
-        // stdlib already closed. End of stream is the honest answer: there is
-        // nothing further to read, and reading anyway risks parsing whatever
-        // unrelated file has since inherited the number.
-        if (client.stdout_closed) return null;
+        client.read_mutex.lockUncancelable(client.io);
+        defer client.read_mutex.unlock(client.io);
+        if (client.stdoutClosed()) return null;
 
         while (true) {
             const line = (try client.nextLine()) orelse return null;
@@ -440,12 +565,17 @@ pub const Client = struct {
             if (event.getString("type")) |t| {
                 event.kind = std.meta.stringToEnum(Kind, t) orelse .unknown;
             }
+            // Read without the state lock: `next` is the only writer, and
+            // this thread is inside `next`.
             if (client.session_id == null) {
                 if (event.sessionId()) |id| {
                     // The tree owns the borrowed `id`, so it has to outlive the
                     // dupe, and has to be freed if the dupe is what fails.
                     errdefer event.deinit();
-                    client.session_id = try client.gpa.dupe(u8, id);
+                    const copy = try client.gpa.dupe(u8, id);
+                    client.state_mutex.lockUncancelable(client.io);
+                    client.session_id = copy;
+                    client.state_mutex.unlock(client.io);
                 }
             }
 
@@ -483,6 +613,8 @@ pub const Client = struct {
     /// `noteControlResponse` can tell the CLI's reply to it from an echo of
     /// something else. Fixed storage, dropping the oldest when full: an
     /// answer that never comes should not cost the session anything.
+    ///
+    /// Caller holds `write_mutex`.
     fn nextRequestId(client: *Client, buf: []u8) []const u8 {
         client.next_request_id += 1;
         if (client.pending_len == max_pending_requests) {
@@ -511,6 +643,8 @@ pub const Client = struct {
     /// Surfaces from `next` as `error.StdinClosed` rather than being dropped,
     /// which tells the caller the session can no longer serve tools — distinct
     /// from `error.WriteFailed`, meaning the child died.
+    ///
+    /// Caller holds `write_mutex`.
     fn replyWriter(client: *Client) WriteError!*Io.Writer {
         if (builtin.is_test) {
             if (client.reply_override) |w| return w;
@@ -519,8 +653,16 @@ pub const Client = struct {
         return &client.stdin_writer.interface;
     }
 
-    /// Writes one line by handing a `Stringify` over stdin to `f`.
+    /// Writes one line by handing a `Stringify` over stdin to `f`, holding the
+    /// write lock for the line and its flush.
     fn writeLine(client: *Client, comptime f: anytype, args: anytype) WriteError!void {
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
+        try client.writeLineLocked(f, args);
+    }
+
+    /// `writeLine` for a caller already holding `write_mutex`.
+    fn writeLineLocked(client: *Client, comptime f: anytype, args: anytype) WriteError!void {
         const w = try client.replyWriter();
         var js: std.json.Stringify = .{ .writer = w };
         try @call(.auto, f, .{&js} ++ args);
@@ -540,8 +682,10 @@ pub const Client = struct {
         return out.written();
     }
 
-    /// Writes an already rendered and terminated line.
+    /// Writes an already rendered and terminated line, under the write lock.
     fn writeRendered(client: *Client, line: []const u8) WriteError!void {
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
         const w = try client.replyWriter();
         try w.writeAll(line);
         try w.flush();
@@ -552,9 +696,11 @@ pub const Client = struct {
     /// narrowed here rather than widened into `OpenError`, which would put an
     /// unreachable `StdinClosed` on the public spawn path.
     fn sendInitialize(client: *Client) Io.Writer.Error!void {
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
         var id_buf: [32]u8 = undefined;
         const request_id = client.nextRequestId(&id_buf);
-        client.writeLine(protocol.writeInitialize, .{ request_id, client.servers, client.skills }) catch |err| switch (err) {
+        client.writeLineLocked(protocol.writeInitialize, .{ request_id, client.servers, client.skills }) catch |err| switch (err) {
             error.StdinClosed => unreachable,
             else => |e| return e,
         };
@@ -863,6 +1009,10 @@ pub const Client = struct {
         const response = objectField(root, "response") orelse return;
         const request_id = stringField(response, "request_id") orelse return;
         const number = ownRequestNumber(request_id) orelse return;
+        // The pending list is write-side state: `interrupt` on another
+        // thread may be appending to it.
+        client.write_mutex.lockUncancelable(client.io);
+        defer client.write_mutex.unlock(client.io);
         const index = std.mem.indexOfScalar(u64, client.pending_requests[0..client.pending_len], number) orelse return;
         std.mem.copyForwards(
             u64,
@@ -884,6 +1034,12 @@ pub const Client = struct {
     }
 
     // --- reading ---
+
+    fn stdoutClosed(client: *Client) bool {
+        client.state_mutex.lockUncancelable(client.io);
+        defer client.state_mutex.unlock(client.io);
+        return client.stdout_closed;
+    }
 
     /// The raw line, valid until the next call.
     fn nextLine(client: *Client) ReadError!?[]const u8 {
@@ -1205,6 +1361,12 @@ test "sendCommand omits the separator when there are no arguments" {
 /// reaches the child or the reader.
 fn dispatchFixture(out: *Io.Writer.Allocating, servers: []const McpServer) Client {
     var client: Client = undefined;
+    // The locks and the `Io` they park on are live even in a fixture that
+    // never reaches the child: every write path takes `write_mutex`.
+    client.io = std.testing.io;
+    client.write_mutex = .init;
+    client.read_mutex = .init;
+    client.state_mutex = .init;
     client.gpa = std.testing.allocator;
     client.scratch = .init(std.testing.allocator);
     client.servers = servers;
@@ -1816,6 +1978,12 @@ test "an oversized permission reply becomes a deny that says why" {
 /// A client with just the fields `noteControlResponse` touches.
 fn responseFixture() Client {
     var client: Client = undefined;
+    // The locks and the `Io` they park on are live even in a fixture that
+    // never reaches the child: every write path takes `write_mutex`.
+    client.io = std.testing.io;
+    client.write_mutex = .init;
+    client.read_mutex = .init;
+    client.state_mutex = .init;
     client.gpa = std.testing.allocator;
     client.next_request_id = 0;
     client.pending_len = 0;
@@ -1927,6 +2095,24 @@ const StubChild = struct {
     }
 };
 
+test "open takes the stdout descriptor out of the Child" {
+    // Reaping through the stdlib closes every descriptor the `Child` still
+    // holds. The reader keeps its own copy of stdout by value, so a reap on
+    // one thread would close the descriptor under a `next` blocked on
+    // another, and a recycled number would then be read as the child's
+    // stream. `open` moves stdout out of the `Child`; `close` closes it,
+    // last, once no reader can be inside `next`.
+    var stub = try StubChild.init("#!/bin/sh\nexit 0\n");
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    try std.testing.expect(client.child.stdout == null);
+    // stdin stays with the `Child` until `closeStdin` takes it.
+    try std.testing.expect(client.child.stdin != null);
+}
+
 test "open rejects a zero max_line_bytes instead of failing forever" {
     // Zero is a permanent-error trap: no line can ever satisfy it, so the read
     // loop would fail forever. Refused before anything is allocated or spawned.
@@ -1970,10 +2156,17 @@ test "open rejects a tool schema that is not a JSON object before spawning" {
     ));
 }
 
-test "a killed child reports its status as synthetic" {
-    // `term` after a kill is assumed, not observed. `killed` is what keeps the
-    // assumption from passing as one: a clean exit also reads as SIGTERM.
+test "killed pairs with term rather than replacing it" {
+    // `term` is what the kernel reported, even after a kill; `killed` is the
+    // separate fact that this client sent the signal. A child that trapped
+    // it and exited cleanly is `killed` with an `.exited` term.
     var client: Client = undefined;
+    // The locks and the `Io` they park on are live even in a fixture that
+    // never reaches the child: every write path takes `write_mutex`.
+    client.io = std.testing.io;
+    client.write_mutex = .init;
+    client.read_mutex = .init;
+    client.state_mutex = .init;
     client.term = null;
     client.wait_error = null;
     client.killed = false;
@@ -2003,8 +2196,8 @@ test "kill still runs after a failed reap" {
     client.wait_error = error.Unexpected;
     client.kill();
 
-    // `kill` ran: it reaps and records a synthesized status. A `kill` that
-    // returned early on `wait_error` leaves both of these unset.
+    // `kill` ran: it signalled, reaped, and recorded what it observed. A
+    // `kill` that returned early on `wait_error` leaves both of these unset.
     try std.testing.expect(client.killed);
     try std.testing.expectEqual(std.posix.SIG.TERM, client.term.?.signal);
 }
@@ -2049,6 +2242,12 @@ test "a control request arriving after closeStdin is refused, not written blind"
     // descriptor, and lands silently on an unrelated file once the fd number is
     // recycled. No `reply_override` here: it bypasses the very guard under test.
     var client: Client = undefined;
+    // The locks and the `Io` they park on are live even in a fixture that
+    // never reaches the child: every write path takes `write_mutex`.
+    client.io = std.testing.io;
+    client.write_mutex = .init;
+    client.read_mutex = .init;
+    client.state_mutex = .init;
     client.gpa = std.testing.allocator;
     client.scratch = .init(std.testing.allocator);
     defer client.scratch.deinit();

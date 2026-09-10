@@ -1284,3 +1284,314 @@ test "an allocation failure inside next is OutOfMemory, and close still frees ev
         try std.testing.expectEqual(failing.allocations, failing.deallocations);
     }
 }
+
+// --- concurrency: independent clients on independent threads ---
+
+/// Returns `n * 2` from its `arguments`, so a reply that came back carrying
+/// another client's work is a wrong number rather than a passing test.
+fn doublingHandler(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) anyerror!agent.ToolResult {
+    const n = arguments.object.get("n").?.integer;
+    return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{n * 2}) };
+}
+
+/// One client's whole session: spawn a stub, serve the tool call it makes,
+/// and report the session id it saw plus the reply the child received.
+///
+/// Everything here is per-thread. The `Stub` writes its own temp dir, `open`
+/// spawns its own child, and the `McpServer` array lives on this frame for
+/// the life of the client — `Options` borrows it, so a shared one would be
+/// the easy way to accidentally prove nothing.
+const Session = struct {
+    session_id: [16]u8 = undefined,
+    session_id_len: usize = 0,
+    doubled: [16]u8 = undefined,
+    doubled_len: usize = 0,
+    err: ?anyerror = null,
+
+    fn run(session: *Session, id: []const u8) void {
+        session.body(id) catch |e| {
+            session.err = e;
+        };
+    }
+
+    fn body(session: *Session, id: []const u8) !void {
+        const servers = [_]agent.McpServer{.{
+            .name = "s",
+            .tools = &.{.{
+                .name = "t",
+                .description = "d",
+                .handler = doublingHandler,
+            }},
+        }};
+
+        // The session id is baked into this thread's stub, so the `system`
+        // line the client parses can only have come from its own child.
+        //
+        // Concatenated rather than formatted: the stub fragments are full of
+        // literal JSON braces, which a format string would read as
+        // placeholders and which escaping would make unreadable.
+        const script = try std.mem.concat(gpa, u8, &.{
+            "#!/bin/sh\n" ++
+                "trap '' PIPE\n" ++
+                "printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"",
+            id,
+            "\"}\\n'\n" ++
+                tool_call_line ++ "\n" ++
+                read_reply ++ "\n" ++
+                "printf '{\"type\":\"system\",\"subtype\":\"echo\",\"reply\":%s}\\n' \"$reply\"\n" ++
+                "exit 0\n",
+        });
+        defer gpa.free(script);
+
+        var stub = try Stub.init(script);
+        defer stub.deinit();
+
+        const client = try stub.open(.{ .sdk_mcp_servers = &servers });
+        defer _ = client.close();
+
+        var parsed = try echoedField(client, "reply");
+        defer parsed.deinit();
+
+        const reply = try replyText(parsed.value);
+        if (reply.is_error) return error.ToolReturnedError;
+
+        const seen = client.sessionId() orelse return error.NoSessionId;
+        @memcpy(session.session_id[0..seen.len], seen);
+        session.session_id_len = seen.len;
+        @memcpy(session.doubled[0..reply.text.len], reply.text);
+        session.doubled_len = reply.text.len;
+    }
+
+    fn sessionId(session: *const Session) []const u8 {
+        return session.session_id[0..session.session_id_len];
+    }
+
+    fn doubledText(session: *const Session) []const u8 {
+        return session.doubled[0..session.doubled_len];
+    }
+};
+
+test "two clients on two threads run independent sessions" {
+    // `Client` is documented as single-threaded, which constrains the methods
+    // of ONE client to one thread. It is not a claim that a process may hold
+    // only one: there is no global mutable state in `src/`, every buffer,
+    // arena, request-id counter and pending list is a field on the client,
+    // and each `open` spawns its own child. This pins that, so a later change
+    // that hoists any of it to a global fails here rather than in a host.
+    //
+    // Both threads share `std.testing.allocator` (a mutex-guarded
+    // DebugAllocator) and `std.testing.io` (an `Io.Threaded`), so the
+    // allocator and the Io are not what is under test — the client is. A leak
+    // on either thread still fails the test, since the shared allocator
+    // checks at the end of the run.
+    var a: Session = .{};
+    var b: Session = .{};
+
+    const t1 = try std.Thread.spawn(.{}, Session.run, .{ &a, "SESSION_A" });
+    const t2 = try std.Thread.spawn(.{}, Session.run, .{ &b, "SESSION_B" });
+    t1.join();
+    t2.join();
+
+    if (a.err) |e| return e;
+    if (b.err) |e| return e;
+
+    // Each client kept its own session id. Crossed ids would mean the id was
+    // read through something shared rather than off its own stream.
+    try std.testing.expectEqualStrings("SESSION_A", a.sessionId());
+    try std.testing.expectEqualStrings("SESSION_B", b.sessionId());
+
+    // And each served its own tool call. Both stubs send `n: 41`, so this
+    // says the dispatch ran twice and neither reply was lost or duplicated
+    // into the other's pipe.
+    try std.testing.expectEqualStrings("82", a.doubledText());
+    try std.testing.expectEqualStrings("82", b.doubledText());
+}
+
+// --- thread safety ---
+//
+// The tests above drive one client from one thread. These drive it from
+// several, which is the contract `Client` documents: any method from any
+// thread, with `next` single-consumer and `close` last. OS threads rather
+// than `io.async` tasks, because "thread safe" is a claim about threads and
+// `Io.Threaded` might schedule two tasks onto one.
+
+/// Echoes every stdin line back on stdout. What the client wrote is exactly
+/// what `next` then parses, so two `send`s that interleaved on the pipe come
+/// back as one line that is not JSON.
+const echo_stub =
+    \\#!/bin/sh
+    \\trap '' PIPE
+    \\while IFS= read -r line; do printf '%s\n' "$line"; done
+    \\exit 0
+    \\
+;
+
+const sender_threads = 8;
+const sends_per_thread = 64;
+/// Well past the CLI-facing write buffer's flush points, so a racing `send`
+/// has plenty of chances to land mid-line rather than between lines.
+const send_text_bytes = 3 * 1024;
+
+/// One thread's worth of `send` calls. The text is a run of one letter, a
+/// different letter per thread, so a mixed line would also be visibly mixed.
+const Sender = struct {
+    client: *agent.Client,
+    letter: u8,
+    err: ?anyerror = null,
+
+    fn run(s: *Sender) void {
+        var text: [send_text_bytes]u8 = undefined;
+        @memset(&text, s.letter);
+        var i: usize = 0;
+        while (i < sends_per_thread) : (i += 1) {
+            s.client.send(&text) catch |e| {
+                s.err = e;
+                return;
+            };
+        }
+    }
+};
+
+/// The reader side: drains to end of stream on its own thread, counting user
+/// turns, and records the first read error instead of raising it.
+const Reader = struct {
+    client: *agent.Client,
+    user_events: usize = 0,
+    err: ?anyerror = null,
+
+    fn run(r: *Reader) void {
+        while (true) {
+            const maybe = r.client.next() catch |e| {
+                r.err = e;
+                return;
+            };
+            var event = maybe orelse return;
+            defer event.deinit();
+            if (event.kind == .user) r.user_events += 1;
+        }
+    }
+};
+
+test "sends from several threads never interleave on the pipe" {
+    // Every line `send` writes is echoed back and parsed. With the write side
+    // unserialized, two threads render into one buffer at once and the echo
+    // comes back as a torn line: `next` reports `InvalidJson`, or the count
+    // falls short because two turns merged into one unparseable line.
+    var stub = try Stub.init(echo_stub);
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    var reader: Reader = .{ .client = client };
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+
+    var senders: [sender_threads]Sender = undefined;
+    var threads: [sender_threads]std.Thread = undefined;
+    for (&senders, 0..) |*s, i| {
+        s.* = .{ .client = client, .letter = 'a' + @as(u8, @intCast(i)) };
+        threads[i] = try std.Thread.spawn(.{}, Sender.run, .{s});
+    }
+    for (threads) |t| t.join();
+
+    // Senders are done, so end of input is honest; the stub then exits and
+    // the reader sees end of stream.
+    client.closeStdin();
+    reader_thread.join();
+
+    for (senders) |s| if (s.err) |e| return e;
+    if (reader.err) |e| return e;
+    try std.testing.expectEqual(@as(usize, sender_threads * sends_per_thread), reader.user_events);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try client.wait());
+}
+
+/// Sleeps `ms`, then kills. The watchdog shape the README used to forbid.
+fn killAfter(client: *agent.Client, ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+    client.kill();
+}
+
+/// One protocol line, then a child that holds both pipes open and ignores
+/// stdin closing: `exec` so the signal lands on the thing holding them.
+const lingering_stub =
+    \\#!/bin/sh
+    \\printf '{"type":"system","subtype":"init","session_id":"L1"}\n'
+    \\exec sleep 5
+    \\
+;
+
+test "kill from another thread releases a wait parked on a child that ignores stdin" {
+    // `wait` closes stdin and reaps; the child does not care about stdin, so
+    // the reap parks. A watchdog `kill` on another thread has to end that
+    // without reaping a second time, and the parked `wait` then returns the
+    // status it actually observed.
+    var stub = try Stub.init(lingering_stub);
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    const watchdog = try std.Thread.spawn(.{}, killAfter, .{ client, 200 });
+    const term = try client.wait();
+    watchdog.join();
+
+    try std.testing.expect(client.killed);
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.TERM }, term);
+}
+
+test "kill from another thread ends a next blocked on a child that never exits" {
+    // The reader is parked in `read` on the child's stdout. Killing the child
+    // closes the write end and the read returns end of stream; the reaper
+    // must not close the descriptor out from under the read on the way.
+    var stub = try Stub.init(lingering_stub);
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    const watchdog = try std.Thread.spawn(.{}, killAfter, .{ client, 200 });
+    try std.testing.expectEqual(@as(usize, 1), try drain(client));
+    watchdog.join();
+
+    try std.testing.expect(client.killed);
+    try std.testing.expect(try client.next() == null);
+}
+
+/// A `wait` on its own thread, result and error captured for the joiner.
+const Waiter = struct {
+    client: *agent.Client,
+    term: ?std.process.Child.Term = null,
+    err: ?anyerror = null,
+
+    fn run(w: *Waiter) void {
+        w.term = w.client.wait() catch |e| {
+            w.err = e;
+            return;
+        };
+    }
+};
+
+test "concurrent waits reap once and agree on the status" {
+    // Two threads in `wait` at once. The second must not reap: a second
+    // `wait4` on a reaped pid is a stdlib bug trap. It waits for the first
+    // and hands back the same observed status.
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\sleep 0.3
+        \\exit 4
+        \\
+    );
+    defer stub.deinit();
+
+    const client = try stub.open(.{});
+    defer _ = client.close();
+
+    var waiter: Waiter = .{ .client = client };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    const term = try client.wait();
+    thread.join();
+
+    if (waiter.err) |e| return e;
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 4 }, term);
+    try std.testing.expectEqual(term, waiter.term.?);
+}

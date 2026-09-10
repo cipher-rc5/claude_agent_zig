@@ -131,17 +131,20 @@ mid-session.
 
 Claude sees these as `mcp__host__add`, so the allow rule is `mcp__host__*`.
 Handlers run on the caller's thread, inside `next()`, between two conversation
-events. Because tool calls come back over stdin, **stdin must stay open for the
-whole turn**: call `closeStdin` after the `result` event, not before.
+events. A handler may call `send`, `sendCommand`, `interrupt`, or `kill` on the
+client, but not `next`: the lock `next` runs under is not reentrant. Because
+tool calls come back over stdin, **stdin must stay open for the whole turn**:
+call `closeStdin` after the `result` event, not before.
 
 A handler's text is capped at `agent.max_tool_result_bytes` (16 KiB). Return
 more and the model gets an `is_error` result saying the output was too long,
 rather than the payload. The cap is not arbitrary: the reply is written to the
 child's stdin from inside `next()`, so a reply larger than the pipe buffer
 blocks there while the child blocks writing stdout that nothing is draining —
-both processes wedge, and `kill` is unreachable because the caller's thread is
-inside `next()`. Zig 0.16 has no non-blocking or readiness primitive for a
-child pipe, so a ceiling below the smallest plausible pipe buffer is the fix.
+both processes wedge. A watchdog thread could `kill` its way out, but a host
+driving the client from one thread has no such thread, and Zig 0.16 has no
+non-blocking or readiness primitive for a child pipe, so a ceiling below the
+smallest plausible pipe buffer is the fix.
 A tool with more to say should return a summary, or write the payload
 somewhere the agent can read with its own file tools.
 
@@ -316,29 +319,35 @@ a wait under `Io.Select` clears `child.id`, discarding the handle needed to
 escalate afterwards.
 
 `kill()` is the escape hatch, and the deadline is the caller's to set, since
-only the host knows what "too long" means for its workload. It signals the
-child and reaps it, which releases a thread parked in `close`. Note that `kill`
-synthesizes `.signal = TERM` rather than observing a status, so read `killed`
-before branching on `term`.
+only the host knows what "too long" means for its workload. It sends the child
+`SIGTERM` and reaps it, and it is safe to call from a watchdog thread while
+another thread sits in `close` or `wait`, which is the shape that bounds a
+`close`: the watchdog signals the child by pid, and the thread already inside
+the reap observes the death and returns. There is exactly one reap, so `term`
+is always the status the kernel reported, never an assumption. `killed` says
+the signal was sent; a child that trapped it and exited cleanly is `killed`
+with an `.exited` term.
 
-**But do not call it from a watchdog thread while another thread sits in
-`close` or `wait`.** That is the obvious shape and it is unsound: `kill` guards
-only on `term`, which nothing synchronizes, so racing it against an in-flight
-reap is a double reap, and the standard library asserts on the second one. The
-`Client` is single threaded (see below), and `kill` is not an exception to
-that.
+```zig
+const watchdog = try std.Thread.spawn(.{}, struct {
+    fn run(c: *agent.Client, io: std.Io) void {
+        io.sleep(.fromSeconds(30), .awake) catch {};
+        c.kill(); // a no-op if the child was reaped in the meantime
+    }
+}.run, .{ client, io });
+defer watchdog.join();
+_ = try client.wait(); // returns within the deadline, one way or the other
+```
 
-What this leaves is honest rather than comfortable: within one thread there is
-no way to bound `close`, because the thread that would enforce the deadline is
-the one already blocked. A host that cannot tolerate a wedged child needs the
-bound somewhere this library does not reach — supervise the process externally,
-or spawn the CLI under a wrapper that imposes its own timeout. `kill` is for
-the case where the host is *not* blocked: a turn that has gone on too long by
-the host's own accounting, called between turns rather than during one.
+The same holds for a thread blocked inside `next`: the client owns the child's
+stdout descriptor for its whole life and closes it only in `close`, so a reap
+on another thread never pulls the descriptor out from under a read. The child
+dying is what ends the read, as end of stream.
 
-Removing this limitation needs a timed or cancellable child wait, which Zig
-0.16's `Io` vtable does not expose. It is a real constraint of the platform,
-not a decision to revisit here.
+The deadline still has to come from another thread, because Zig 0.16's `Io`
+vtable exposes no timed or cancellable child wait: within one thread there is
+no way to bound `close`, as the thread that would enforce the deadline is the
+one already blocked. That is a constraint of the platform, not of the client.
 
 Multi-turn conversations skip `closeStdin` entirely, read events until a
 `result` arrives, then call `send` again on the same client. Calling `send`
@@ -397,15 +406,26 @@ guidance.
   allocation error would be a lie about the behaviour.
 - The control channel is pumped only while the caller is inside `next()`. That
   is fine for a turn-driven loop, since the caller is always there while the
-  agent is working, but a host that wants to service tool calls from another
-  thread needs its own reader task.
-- `Client` is not thread safe. Every method must be called from one thread:
-  there is no lock, and `send` racing `next` interleaves two JSON objects on a
-  single line, which the CLI reads as malformed protocol. This is why
-  `interrupt` is of limited use in practice — abandoning an in-flight turn
-  means calling it while another thread sits in `next`, which is exactly the
-  race above. It is here for hosts that drive the client from their own reader
-  task and can serialize the two.
+  agent is working. A host that wants tool calls serviced while it does other
+  work keeps one thread in `next` and drives the rest from others.
+- `Client` is thread safe. Any method may be called from any thread,
+  concurrently with any other, under two rules. `next` is single-consumer:
+  concurrent calls serialize rather than corrupt, and a handler must not call
+  it from inside `next`, since the lock is not reentrant. `close` must be the
+  last call, like a free. Three locks back this, one per concern, and none is
+  held across a blocking call it does not own: whole lines on stdin — `send`,
+  `sendCommand`, `interrupt`, `closeStdin`, and the control replies `next`
+  writes — are serialized against each other, so two writers cannot interleave
+  on the pipe; `next` holds a read lock for the line, the arena, and the
+  dispatch; and the lifecycle fields sit under a third. That is what makes
+  `interrupt` usable: abandoning an in-flight turn means calling it while
+  another thread sits in `next`, and it is safe to.
+- `lastLine` and `lastControlError` belong to the thread that called `next`,
+  valid until that thread's next call. `sessionId` is safe from any thread.
+  The public status fields — `term`, `killed`, `wait_error`, `flush_error` —
+  are stable once the caller's own `wait`, `kill`, or `closeStdin` has
+  returned; another thread reads the status safely through `wait`, which
+  returns the cached value once the child is reaped.
 - `Options` slices are borrowed, not copied. `sdk_mcp_servers` and `skills`
   are held by pointer for the life of the client, so whatever backs them has
   to outlive it. A local array in the function that calls `open` is the easy

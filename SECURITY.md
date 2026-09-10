@@ -136,8 +136,9 @@ Tool results and other control-protocol replies are not queued or handed to a
 writer task: they are written directly to the child's stdin from inside
 `Client.next()`, on the caller's own thread, while a turn is in flight. That
 makes stdin a resource shared between the caller's `send`/`closeStdin` calls
-and the client's own reply path, and the two are only separated by the
-single-threaded discipline `Client` already requires.
+and the client's own reply path. The client's write lock serializes them a
+whole line at a time, so a `send` from another thread cannot land inside a
+reply; the lock is not held while a handler runs, so a handler may `send`.
 
 The constraint that follows is that stdin must stay open for the whole turn: a
 reply issued after `closeStdin` has no valid descriptor to write to. Because
@@ -145,9 +146,11 @@ the stdlib closes the descriptor rather than holding it open, the number can be
 reused by anything else the host opens afterwards, so an unguarded write of
 this kind targets a closed or recycled descriptor rather than failing cleanly —
 which means a protocol reply, whose contents are model-influenced, can land in
-an unrelated file. Call `closeStdin` only after the `result` event, and treat
-the client's single-thread rule as load-bearing for this reason and not only
-for framing.
+an unrelated file. The client refuses such a write with `error.StdinClosed`
+rather than issuing it, and the check runs under the same lock as the close,
+so a `closeStdin` from another thread cannot slip between the check and the
+write. Call `closeStdin` only after the `result` event all the same: the
+refusal ends the session's ability to serve tools, it does not restore it.
 
 Every reply that carries caller- or CLI-sized data is rendered first and
 measured against a 16 896-byte line bound before it is written, because a reply
