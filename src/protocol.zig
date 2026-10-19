@@ -1,8 +1,5 @@
 // src/protocol.zig
-// The stream-json wire format: every line this process writes to the CLI.
-//
-// These are free functions over a writer rather than methods on the client, so
-// the field shapes the CLI is strict about stay testable without a subprocess.
+// Serializes stream-json messages to the CLI.
 
 const std = @import("std");
 const Io = std.Io;
@@ -35,9 +32,8 @@ pub fn writeUserMessage(w: *Io.Writer, text: []const u8) !void {
     try std.json.Stringify.value(message, .{}, w);
 }
 
-/// Declares this process's in-process MCP servers and, when set, the skills
-/// Claude may invoke. The CLI routes SDK tool calls back over the control
-/// protocol instead of spawning a subprocess.
+/// Declares in-process MCP servers and the optional skill allowlist. SDK tool
+/// calls return over the control protocol.
 pub fn writeInitialize(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -47,21 +43,19 @@ pub fn writeInitialize(
     try js.beginObject();
     try js.objectField("type");
     try js.write("control_request");
+    try js.objectField("request_id");
+    try js.write(request_id);
     try js.objectField("request");
     try js.beginObject();
     try js.objectField("subtype");
     try js.write("initialize");
-    try js.objectField("request_id");
-    try js.write(request_id);
     if (servers.len > 0) {
         try js.objectField("sdkMcpServers");
         try js.beginArray();
         for (servers) |server| try js.write(server.name);
         try js.endArray();
     }
-    // Omitting the field entirely is what allows every skill. An empty array
-    // is a real value meaning "allow none", so this cannot collapse to a
-    // length check.
+    // Null omits the field and allows all skills; an empty array allows none.
     if (skills) |list| {
         try js.objectField("skills");
         try js.beginArray();
@@ -77,19 +71,17 @@ pub fn writeInterrupt(js: *std.json.Stringify, request_id: []const u8) !void {
     try js.beginObject();
     try js.objectField("type");
     try js.write("control_request");
+    try js.objectField("request_id");
+    try js.write(request_id);
     try js.objectField("request");
     try js.beginObject();
     try js.objectField("subtype");
     try js.write("interrupt");
-    try js.objectField("request_id");
-    try js.write(request_id);
     try js.endObject();
     try js.endObject();
 }
 
-/// Opens `{"type":"control_response","response":{"subtype":...,"request_id":...`
-/// and leaves the two objects open for the caller to add fields and close with
-/// `endControlResponse`.
+/// Opens the control-response envelope; finish with `endControlResponse`.
 fn beginControlResponse(
     js: *std.json.Stringify,
     subtype: []const u8,
@@ -111,9 +103,8 @@ fn endControlResponse(js: *std.json.Stringify) !void {
     try js.endObject();
 }
 
-/// The `mcp_response` wrapper is load-bearing. Without it the CLI does not
-/// match the reply to its request and stalls until its own timeout. Leaves the
-/// jsonrpc object open for either a `result` or an `error` field.
+/// Opens the required `mcp_response` wrapper and JSON-RPC object. The CLI
+/// cannot correlate the reply without this wrapper.
 fn beginMcpResponse(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -153,6 +144,24 @@ pub fn writeMcpResult(
     try endMcpResponse(js);
 }
 
+/// Removes insignificant whitespace from validated JSON to preserve line framing.
+fn writeCompactJson(w: *Io.Writer, raw: []const u8) Io.Writer.Error!void {
+    var quoted = false;
+    var escaped = false;
+    var start: usize = 0;
+    for (raw, 0..) |byte, index| {
+        if (quoted) {
+            if (escaped) escaped = false else if (byte == '\\') escaped = true else if (byte == '"') quoted = false;
+        } else if (byte == '"') {
+            quoted = true;
+        } else if (std.ascii.isWhitespace(byte)) {
+            try w.writeAll(raw[start..index]);
+            start = index + 1;
+        }
+    }
+    try w.writeAll(raw[start..]);
+}
+
 /// A JSON-RPC error reply. Codes follow the spec: -32601 unknown method or
 /// server, -32602 bad params.
 pub fn writeMcpError(
@@ -173,8 +182,7 @@ pub fn writeMcpError(
     try endMcpResponse(js);
 }
 
-/// Answers a control request this client does not implement. Answering at all
-/// is the point: silence leaves the CLI blocked until its own timeout.
+/// Rejects unsupported control requests so the CLI does not wait for a timeout.
 pub fn writeControlError(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -186,17 +194,14 @@ pub fn writeControlError(
     try endControlResponse(js);
 }
 
-/// The input a permission reply carries back: the tool input as it was
-/// proposed, or a replacement the handler already rendered as JSON.
+/// Permission reply input: the proposed value or pre-rendered replacement JSON.
 pub const PermissionInput = union(enum) {
     value: std.json.Value,
     /// Spliced in verbatim. The client validates it before it gets here.
     raw: []const u8,
 };
 
-/// Allows a `can_use_tool` request. The `behavior`/`updatedInput` shape is
-/// the one the official SDKs answer with; the CLI reads `updatedInput` as
-/// the input to run the tool with, so it is always sent, even when unchanged.
+/// Allows `can_use_tool`. Always sends `updatedInput`, even when unchanged.
 pub fn writePermissionAllow(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -212,7 +217,7 @@ pub fn writePermissionAllow(
         .value => |v| try js.write(v),
         .raw => |r| {
             try js.beginWriteRaw();
-            try js.writer.writeAll(r);
+            try writeCompactJson(js.writer, r);
             js.endWriteRaw();
         },
     }
@@ -237,12 +242,9 @@ pub fn writePermissionDeny(
     try endControlResponse(js);
 }
 
-/// Bodies of the MCP replies this client serves, as the `result` payload that
-/// `writeMcpResult` splices in.
+/// MCP result bodies spliced into replies by `writeMcpResult`.
 pub const results = struct {
-    /// `initialize`. `offered` is the protocolVersion the CLI proposed; it
-    /// drops the connection on a mismatch, and the value moves with CLI
-    /// releases, so mirroring it is what keeps the handshake working.
+    /// Echoes the offered `protocolVersion`; the CLI rejects a mismatch.
     pub fn initialize(
         js: *std.json.Stringify,
         server: *const McpServer,
@@ -269,7 +271,7 @@ pub const results = struct {
         try js.endObject();
     }
 
-    /// `tools/list`. Each `input_schema` is spliced in verbatim.
+    /// `tools/list`. Validated schemas are compacted to keep one-line framing.
     pub fn toolsList(js: *std.json.Stringify, server: *const McpServer) !void {
         try js.beginObject();
         try js.objectField("tools");
@@ -282,7 +284,7 @@ pub const results = struct {
             try js.write(tool.description);
             try js.objectField("inputSchema");
             try js.beginWriteRaw();
-            try js.writer.writeAll(tool.input_schema);
+            try writeCompactJson(js.writer, tool.input_schema);
             js.endWriteRaw();
             try js.endObject();
         }
@@ -310,12 +312,7 @@ pub const results = struct {
 
 // --- tests ---
 
-// The functions under test are `pub` for client.zig, but agent.zig
-// deliberately does not re-export the wire format. A tests/ file could reach
-// them only by widening the public surface, or by making protocol.zig its own
-// module — which Zig forbids while agent.zig also imports it, since a file
-// belongs to exactly one module. `render` and `expectContains` stay private
-// for the same reason.
+// Wire-format helpers are internal to the library; their tests stay here.
 
 const Rendered = struct {
     out: Io.Writer.Allocating,
@@ -329,7 +326,7 @@ const Rendered = struct {
     }
 };
 
-/// Renders one line through a fresh Stringify, so tests read as a single call.
+/// Renders one protocol line for assertions.
 fn render(comptime f: anytype, args: anytype) !Rendered {
     var result: Rendered = .{ .out = .init(std.testing.allocator) };
     errdefer result.deinit();
@@ -345,9 +342,30 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
+fn expectRequestEnvelope(text: []const u8, request_id: []const u8, subtype: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+    const envelope = parsed.value.object;
+    try std.testing.expectEqualStrings("control_request", envelope.get("type").?.string);
+    try std.testing.expectEqualStrings(request_id, envelope.get("request_id").?.string);
+    const request = envelope.get("request").?.object;
+    try std.testing.expectEqualStrings(subtype, request.get("subtype").?.string);
+    try std.testing.expect(!request.contains("request_id"));
+}
+
+test "initialize request correlation belongs to the top-level envelope" {
+    var empty = try render(writeInitialize, .{ "zig_1", &[_]McpServer{}, null });
+    defer empty.deinit();
+    try expectRequestEnvelope(empty.text(), "zig_1", "initialize");
+    const servers = [_]McpServer{.{ .name = "host" }};
+    const skills: []const []const u8 = &.{"review"};
+    var configured = try render(writeInitialize, .{ "quoted\"id\n", &servers, skills });
+    defer configured.deinit();
+    try expectRequestEnvelope(configured.text(), "quoted\"id\n", "initialize");
+}
+
 test "skills distinguishes unset from empty" {
-    // Unset allows every discovered skill, and the CLI signals that by the
-    // field being absent rather than by an empty array.
+    // Null omits the allowlist and allows all discovered skills.
     var unset = try render(writeInitialize, .{ "zig_1", &[_]McpServer{}, null });
     defer unset.deinit();
     try std.testing.expect(std.mem.indexOf(u8, unset.text(), "\"skills\"") == null);
@@ -370,7 +388,7 @@ test "initialize omits sdkMcpServers when there are none" {
     defer skills_only.deinit();
     try std.testing.expect(std.mem.indexOf(u8, skills_only.text(), "sdkMcpServers") == null);
 
-    // The CLI is strict about both names, so pin the exact camelCase spelling.
+    // CLI field names are case-sensitive.
     const servers = [_]McpServer{.{ .name = "host" }};
     var with_servers = try render(writeInitialize, .{ "zig_1", &servers, null });
     defer with_servers.deinit();
@@ -384,11 +402,10 @@ test "mcp result carries the load-bearing envelope" {
     try expectContains(r.text(), "\"type\":\"control_response\"");
     try expectContains(r.text(), "\"subtype\":\"success\"");
     try expectContains(r.text(), "\"request_id\":\"zig_2\"");
-    // Without the mcp_response wrapper the CLI stalls until its own timeout.
     try expectContains(r.text(), "\"mcp_response\"");
     try expectContains(r.text(), "\"jsonrpc\":\"2.0\"");
     try expectContains(r.text(), "\"id\":7");
-    // The raw payload is spliced in, not re-encoded as a string.
+    // Keep the payload as JSON, not a JSON string.
     try expectContains(r.text(), "\"result\":{\"ok\":true}");
 }
 
@@ -418,8 +435,7 @@ test "control error is an error subtype, not an mcp reply" {
 test "interrupt request shape" {
     var r = try render(writeInterrupt, .{"zig_6"});
     defer r.deinit();
-    try expectContains(r.text(), "\"type\":\"control_request\"");
-    try expectContains(r.text(), "\"subtype\":\"interrupt\"");
+    try expectRequestEnvelope(r.text(), "zig_6", "interrupt");
 }
 
 test "tools/list splices input schemas verbatim" {
@@ -434,7 +450,6 @@ test "tools/list splices input schemas verbatim" {
     var r = try render(results.toolsList, .{&server});
     defer r.deinit();
     try expectContains(r.text(), "\"name\":\"add\"");
-    // Spliced raw: a re-encoded schema would arrive escaped as a string.
     try expectContains(r.text(), "\"inputSchema\":{\"type\":\"object\"");
 }
 
@@ -468,8 +483,7 @@ test "permission allow echoes the proposed input under updatedInput" {
     var r = try render(writePermissionAllow, .{ "req_1", PermissionInput{ .value = parsed.value } });
     defer r.deinit();
 
-    // A success envelope, not an mcp reply: the CLI matches permission answers
-    // by request id alone.
+    // Permission replies use the control envelope without an MCP wrapper.
     try expectContains(r.text(), "\"subtype\":\"success\"");
     try expectContains(r.text(), "\"request_id\":\"req_1\"");
     try expectContains(r.text(), "\"behavior\":\"allow\"");
@@ -480,7 +494,6 @@ test "permission allow echoes the proposed input under updatedInput" {
 test "permission allow splices a replacement input raw" {
     var r = try render(writePermissionAllow, .{ "req_2", PermissionInput{ .raw = "{\"command\":\"ls\"}" } });
     defer r.deinit();
-    // Raw, not re-encoded as a string.
     try expectContains(r.text(), "\"updatedInput\":{\"command\":\"ls\"}");
 }
 

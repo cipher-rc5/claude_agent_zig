@@ -1,6 +1,6 @@
 # claude_agent_zig
 
-Claude Agent SDK client for Zig 0.16, built on the Claude Code CLI
+Claude Agent SDK client for Zig 0.17, built on the Claude Code CLI
 `stream-json` protocol.
 
 ## Why this shape
@@ -124,8 +124,9 @@ carries the worked version, including what it rejects.
 
 `input_schema` is spliced into the `tools/list` reply verbatim rather than
 re-encoded, so `open` checks that every schema parses as JSON and is an object
-before it allocates or spawns anything, and returns `error.InvalidToolSchema`
-otherwise. A schema assembled at runtime therefore fails at `open`, where the
+before it spawns anything, and returns `error.InvalidToolSchema`
+otherwise. Schemas may nest at most 128 containers. A schema assembled at
+runtime therefore fails at `open`, where the
 caller can see it, rather than as a corrupted protocol frame the CLI stalls on
 mid-session.
 
@@ -134,28 +135,26 @@ Handlers run on the caller's thread, inside `next()`, between two conversation
 events. A handler may call `send`, `sendCommand`, `interrupt`, or `kill` on the
 client, but not `next`: the lock `next` runs under is not reentrant. Because
 tool calls come back over stdin, **stdin must stay open for the whole turn**:
-call `closeStdin` after the `result` event, not before.
+call `closeStdin` after the final result and any background work finish.
 
-A handler's text is capped at `agent.max_tool_result_bytes` (16 KiB). Return
-more and the model gets an `is_error` result saying the output was too long,
-rather than the payload. The cap is not arbitrary: the reply is written to the
-child's stdin from inside `next()`, so a reply larger than the pipe buffer
-blocks there while the child blocks writing stdout that nothing is draining —
-both processes wedge. A watchdog thread could `kill` its way out, but a host
-driving the client from one thread has no such thread, and Zig 0.16 has no
-non-blocking or readiness primitive for a child pipe, so a ceiling below the
-smallest plausible pipe buffer is the fix.
-A tool with more to say should return a summary, or write the payload
-somewhere the agent can read with its own file tools.
+A handler's text is capped at `agent.max_tool_result_bytes` (16 KiB). Larger
+results become `is_error` replies. Every complete control reply, including
+escaped content, ids, envelope, and newline, is limited to 16 896 bytes.
+Oversized `initialize` and `tools/list` replies receive JSON-RPC errors;
+oversized tool results receive failed-call results. A fallback follows the
+same limit. Correlation ids are never truncated: if a correlated fallback
+cannot fit, `next()` returns terminal `error.ReplyTooLong` and the transport
+is disabled and the child is force-terminated. Return a summary or a reference
+for larger tool outputs.
 
-The bound that is actually enforced is on the whole rendered reply line —
-envelope, request ids and newline included — at `max_tool_result_bytes` plus
-512 bytes of headroom, 16 896 bytes in all, because that is what lands in the
-pipe. It applies to every reply that carries caller- or CLI-sized data, not
-only tool results: an `initialize` or `tools/list` reply that does not fit
-(roughly seventeen tools with 1 KiB schemas) is answered with a JSON-RPC
-`-32603` error naming the size and the bound, rather than a body of the wrong
-shape that would register nothing and say nothing.
+The size bound limits memory and protocol output; it does not guarantee that
+a pipe write completes immediately. Pipe capacity varies. After acquiring the
+write lock, pipe I/O uses
+`Options.write_timeout_ms` (5 seconds by default), including initialization
+during `open`. Waiting for the lock and synchronous host callbacks have no
+API deadline. A timeout or partial write makes the transport terminal, so
+later writes cannot silently continue a broken frame.
+Use `terminate` to stop and reap the child after a transport failure.
 
 **Permission prompts.** The CLI asks before running a tool that nothing
 pre-authorized: one outside `allowed_tools`, under a permission mode that
@@ -205,12 +204,11 @@ without `tool_name` gets a control error, and without a handler installed a
 `can_use_tool` request still gets the `unsupported control request` error
 reply it always did, so the CLI does not hang either way.
 
-The reply is bounded like a tool result, because it carries the tool input
-back and that is as large as the CLI made it: an allow whose rendered line
-exceeds 16 896 bytes is turned into a deny naming the size and the bound. In
-practice that means a `Write` of more than about 16 KiB of content through a
-prompting session is denied with an explanatory message the model can act on;
-pre-authorize such tools with `allowed_tools` if that matters.
+Permission replies share the complete-frame limit. Oversized allows and denial
+messages become short denials; correlation metadata that cannot fit returns
+terminal `error.ReplyTooLong`. Large inputs can therefore require
+pre-authorization through `allowed_tools`, rather than an echoed permission
+reply.
 
 `allowed_tools` and `permission_mode` compose with the handler rather than
 compete with it: only calls the two do not already settle reach the handler,
@@ -234,7 +232,7 @@ that has it. Pass `permission_mode` explicitly, or a narrower
 
 No dependencies beyond the standard library.
 
-Three directories, by role: `src/` is the library, `examples/` is the demo,
+Three directories, by role: `src/` is the library, `examples/` holds executable examples,
 `tests/` is the black-box suite.
 
 | File | |
@@ -245,14 +243,20 @@ Three directories, by role: `src/` is the library, `examples/` is the demo,
 | `src/tool.zig` | `Tool`, `ToolResult`, `McpServer`, and the permission handler types. |
 | `src/protocol.zig` | The wire format — every line this process writes to the CLI. |
 | `src/client.zig` | `Client`: process lifecycle, the read loop, control dispatch. |
+| `src/transport.zig` | Deadline-aware pipe I/O and termination cancellation. |
 | `examples/demo.zig` | Demo that streams one turn to stdout. |
 | `examples/demo_tools.zig` | The two example tools that demo exposes, and its permission handler. |
+| `examples/streaming.zig` | Complete single-turn streaming and exit-status handling. |
+| `examples/permissions.zig` | Complete permission allow/deny handling. |
+| `examples/initialization.zig` | Complete initialization-rejection handling. |
+| `examples/shutdown.zig` | A turn deadline, termination, and reader cleanup. |
 | `tests/all.zig` | Test root for the suite below; lists each file with `_ =`. |
 | `tests/client_test.zig` | The public shape of `Client` and the re-export surface. |
 | `tests/event_test.zig` | `Event` accessors, over fixed protocol lines. |
 | `tests/integration_test.zig` | The real client against scripted stub CLIs: lifecycle, tool calls, framing. |
 | `tests/options_test.zig` | `Options` and `PermissionMode` on the public surface. |
 | `tests/tool_test.zig` | `Tool`, `ToolResult`, `McpServer` defaults and lookup. |
+| `tests/transport_contract_test.zig` | Public transport failure, cancellation, and fragmented framing contracts. |
 
 The table is exact by construction: `just docs-check` fails when it and the
 tree under those three directories disagree, so it can only list them. The
@@ -266,6 +270,8 @@ path.
 
 ## Usage
 
+One foreground turn with no background tasks:
+
 ```zig
 const client = try agent.Client.open(gpa, io, .{
     .allowed_tools = "Read,Glob,Grep,mcp__host__*",
@@ -273,7 +279,10 @@ const client = try agent.Client.open(gpa, io, .{
     .model = "claude-sonnet-4-6",
     .sdk_mcp_servers = &servers,
 });
-defer _ = client.close();
+defer {
+    _ = client.terminate(250) catch {};
+    _ = client.close();
+}
 
 try client.send("Summarize README.md");
 
@@ -294,65 +303,61 @@ switch (try client.wait()) {
 }
 ```
 
-`try client.next()` is the short form. Two of its errors cost one line, not
-the stream, and a host that wants to keep reading can, with something to log:
+These foreground-only examples cover [streaming](examples/streaming.zig),
+[permission decisions](examples/permissions.zig),
+[initialization rejection](examples/initialization.zig), and
+[bounded shutdown](examples/shutdown.zig). `zig build examples-check` compiles
+all four without running a model request. They accept `CLAUDE_BIN` to select
+the CLI; running one uses the CLI's normal authentication and billing.
 
-```zig
-const event = client.next() catch |err| switch (err) {
-    // The line is still in the buffer until the next call, so log it now.
-    error.InvalidJson => { try log.print("bad line: {s}\n", .{client.lastLine()}); continue; },
-    // The CLI refused this client's own `initialize` or `interrupt`; the
-    // stream is intact, but a refused `initialize` means no SDK tools.
-    error.ControlRequestRejected => { try log.print("refused: {s}\n", .{client.lastControlError().?}); continue; },
-    else => return err,
-};
-```
+`error.InvalidJson` and `error.ProtocolTooLong` discard one input line; a
+caller may log `lastLine()` and keep reading. JSON nesting above 128 returns
+terminal `error.ProtocolTooDeep` and stops the session. `error.InitializationRejected`
+reports a rejected handshake, while `error.ControlRequestRejected` reports a
+rejected interrupt. `lastControlError()` supplies the latest CLI rejection
+diagnostic until another rejection replaces it or `close()` frees it. Initialization rejection leaves requested SDK tools
+and skill restrictions unconfigured; stop the session if those are required.
+`status().initialization` distinguishes pending, accepted, rejected, failed,
+and sessions that did not require initialization. `open` sends the handshake
+but does not wait for its acknowledgement; keep calling `next()` to process it.
 
-**`close()` can block forever on a child that never exits.** Both `close` and
-`wait` reap the child with an unbounded blocking wait, so the `defer _ =
-client.close()` above returns only when the CLI actually exits. A CLI that is
-hung but alive never returns an error from that wait — it simply does not
-return — so nothing on this path times out and the host thread stays parked in
-`close` indefinitely. This is a real constraint rather than an oversight: Zig
-0.16's `Io` vtable exposes no timed or non-blocking child wait, and cancelling
-a wait under `Io.Select` clears `child.id`, discarding the handle needed to
-escalate afterwards.
+An accepted interrupt cancels the current turn. The CLI may report
+`error_during_execution` and exit 1; inspect `event.getString("terminal_reason")`
+for `aborted_streaming` or `aborted_tools` to distinguish cancellation from
+other failures. The result and exit status remain available to the caller.
 
-`kill()` is the escape hatch, and the deadline is the caller's to set, since
-only the host knows what "too long" means for its workload. It sends the child
-`SIGTERM` and reaps it, and it is safe to call from a watchdog thread while
-another thread sits in `close` or `wait`, which is the shape that bounds a
-`close`: the watchdog signals the child by pid, and the thread already inside
-the reap observes the death and returns. There is exactly one reap, so `term`
-is always the status the kernel reported, never an assumption. `killed` says
-the signal was sent; a child that trapped it and exited cleanly is `killed`
-with an `.exited` term.
+`wait()` and `close()` wait for the child to exit, with no graceful-exit
+deadline. Drain required events before reaping; output buffered after a reap
+is discarded. Keep a reader active if the child still needs to write stdout. `terminate(grace_ms)` requests SIGTERM, escalates to SIGKILL after
+the grace interval, and returns the observed exit status. `forceKill()` skips
+the grace interval. `kill()` uses `Options.termination_grace_ms` (250 ms by
+default) and discards any wait error; prefer `terminate` when errors matter.
+These operations share one reaper and can run while another thread waits,
+reads, or writes. Termination cancels pipe I/O before reaping, so a blocked
+writer does not prevent escalation. Scheduler delays and an uninterruptible
+kernel task can extend wall-clock completion beyond the configured grace.
 
-```zig
-const watchdog = try std.Thread.spawn(.{}, struct {
-    fn run(c: *agent.Client, io: std.Io) void {
-        io.sleep(.fromSeconds(30), .awake) catch {};
-        c.kill(); // a no-op if the child was reaped in the meantime
-    }
-}.run, .{ client, io });
-defer watchdog.join();
-_ = try client.wait(); // returns within the deadline, one way or the other
-```
-
-The same holds for a thread blocked inside `next`: the client owns the child's
-stdout descriptor for its whole life and closes it only in `close`, so a reap
-on another thread never pulls the descriptor out from under a read. The child
-dying is what ends the read, as end of stream.
-
-The deadline still has to come from another thread, because Zig 0.16's `Io`
-vtable exposes no timed or cancellable child wait: within one thread there is
-no way to bound `close`, as the thread that would enforce the deadline is the
-one already blocked. That is a constraint of the platform, not of the client.
+Only the direct child is signaled. The host must not independently reap it
+or enable automatic SIGCHLD reaping; SDK coordination assumes ownership of
+that child's wait status. Hosts must also preserve the ignored SIGPIPE
+disposition installed by the default `std.Io.Threaded` initialization so a
+closed pipe returns a write error. Descendants can survive termination;
+canceling SDK pipe I/O prevents their inherited descriptors from keeping the
+client blocked, but does not kill those processes. Handlers run synchronously
+inside the host and must return before their reader can finish. A handler that
+never returns defeats a thread-join or `close()` deadline; use cooperative
+cancellation or process isolation when hard callback deadlines are required.
+Join every client-using thread before `close()` destroys the client.
 
 Multi-turn conversations skip `closeStdin` entirely, read events until a
 `result` arrives, then call `send` again on the same client. Calling `send`
 while a turn is still in flight is also valid; the CLI treats it as mid-turn
 guidance.
+
+Background tasks can issue SDK tool calls after the foreground `result`.
+Keep reading and track their lifecycle before closing stdin; the client does
+not close it automatically. The single-turn examples close after their first
+result and do not manage background tasks.
 
 ## Notes on the implementation
 
@@ -380,14 +385,10 @@ guidance.
   exhaustive `_` tag would never be produced; the cost is that a new named
   variant is a source-breaking change for a `switch (e.kind)` that names every
   arm, so write an `else` arm.
-- `control_response` lines — the CLI answering this client's own `initialize`
-  and `interrupt` requests — are matched by id rather than discarded. A
-  success carries nothing the caller needs; an error is returned from `next()`
-  as `error.ControlRequestRejected` with the CLI's text in
-  `lastControlError()`. The stream stays readable, but a refused `initialize`
-  means the session has no SDK tools and no skill allowlist, whatever
-  `Options` asked for, and the first symptom otherwise would be the model
-  reporting it cannot find a tool.
+- `control_response` lines are matched to accepted requests. Sixteen pending
+  slots are shared by initialization and interrupts: at most fifteen interrupts
+  while initialization is pending, sixteen otherwise. Overflow returns
+  `error.TooManyPendingRequests`; accepted initialization is never evicted.
 - `--bare` defaults to off, so a session picks up project configuration and
   works with an existing `claude` login. Turning it on skips hooks, LSP, plugin
   sync, auto memory, and `CLAUDE.md` auto-discovery, and in that mode
@@ -400,32 +401,23 @@ guidance.
   child retains no reference to it.
 - stderr is inherited so CLI startup warnings stay visible. Change to `.pipe`
   if the host needs to capture them.
-- `WriteError` is exactly `error{ StdinClosed, WriteFailed }`. No write path
-  allocates: `send` and `interrupt` render straight into the stdin writer's
-  buffer and `sendCommand` streams its text in escaped pieces, so an
-  allocation error would be a lie about the behaviour.
+- Public writes distinguish closed stdin, write failure, deadline expiration,
+  terminal transport, and a full pending-interrupt list. A partial write or
+  deadline failure disables further writes; start a new session after cleanup.
 - The control channel is pumped only while the caller is inside `next()`. That
   is fine for a turn-driven loop, since the caller is always there while the
   agent is working. A host that wants tool calls serviced while it does other
   work keeps one thread in `next` and drives the rest from others.
-- `Client` is thread safe. Any method may be called from any thread,
-  concurrently with any other, under two rules. `next` is single-consumer:
-  concurrent calls serialize rather than corrupt, and a handler must not call
-  it from inside `next`, since the lock is not reentrant. `close` must be the
-  last call, like a free. Three locks back this, one per concern, and none is
-  held across a blocking call it does not own: whole lines on stdin — `send`,
-  `sendCommand`, `interrupt`, `closeStdin`, and the control replies `next`
-  writes — are serialized against each other, so two writers cannot interleave
-  on the pipe; `next` holds a read lock for the line, the arena, and the
-  dispatch; and the lifecycle fields sit under a third. That is what makes
-  `interrupt` usable: abandoning an in-flight turn means calling it while
-  another thread sits in `next`, and it is safe to.
-- `lastLine` and `lastControlError` belong to the thread that called `next`,
-  valid until that thread's next call. `sessionId` is safe from any thread.
-  The public status fields — `term`, `killed`, `wait_error`, `flush_error` —
-  are stable once the caller's own `wait`, `kill`, or `closeStdin` has
-  returned; another thread reads the status safely through `wait`, which
-  returns the cached value once the child is reaped.
+- Client methods synchronize stdin writes, event reading, and lifecycle state.
+  Keep a single `next()` consumer; handlers must not call its non-reentrant
+  read loop. `close()` destroys the client and must follow every other call
+  and every thread join. Handlers may call send methods or termination APIs.
+- `lastLine()` belongs to the `next()` consumer until its next call.
+  `lastControlError()` belongs to that consumer until the next rejection or
+  `close()`. `sessionId()` is synchronized.
+  `status()` returns a synchronized snapshot of initialization, termination,
+  reap, stdin, and transport state. Read status through this method while
+  other threads run; direct access to mutable public fields is not synchronized.
 - `Options` slices are borrowed, not copied. `sdk_mcp_servers` and `skills`
   are held by pointer for the life of the client, so whatever backs them has
   to outlive it. A local array in the function that calls `open` is the easy
@@ -443,15 +435,12 @@ guidance.
 
 ## Platforms
 
-macOS and Linux are the supported platforms, and both are verified: the suite
-runs on macOS (Apple Silicon) and the tree cross-compiles cleanly with
-`zig build -Dtarget=x86_64-linux`. The library itself is plain `std`, but two
-things around it are POSIX-shaped: the demo reads its arguments with
-`init.minimal.args.iterate()` (`examples/demo.zig`), which Zig rejects on
-Windows in favour of `initAllocator`, so `zig build -Dtarget=x86_64-windows`
-fails there; and the black-box suite and the benchmark drive the client
-through `#!/bin/sh` stub CLIs written at runtime, so they need a Bourne shell
-at `/bin/sh`. Windows is therefore not supported.
+macOS on Apple Silicon is the supported and validated target. The local gate
+and runtime stress tests run natively on macOS. Linux is untested and is
+outside the supported-platform validation scope.
+
+The transport uses POSIX pipe and signal operations. Integration tests and
+benchmarks also require `/bin/sh`. Windows is not supported.
 
 ## Build
 
@@ -459,12 +448,13 @@ at `/bin/sh`. Windows is therefore not supported.
 zig build
 zig build test
 CLAUDE_BIN=claude zig build run -- "explain this repo"
-zig build bench -- 100000    # read-loop benchmark, ReleaseFast via `just bench`
+zig build examples-check     # compile complete lifecycle examples
+zig build bench -Doptimize=ReleaseFast -- 20000 all 5
 zig build docs               # autodocs for the agent module into zig-out/docs/
 ```
 
 `build.zig` refuses any Zig other than the one `build.zig.zon` names
-(`0.16.0`): the manifest's `minimum_zig_version` is only a floor, and a later
+(`0.17.0`): the manifest's `minimum_zig_version` is only a floor, and a later
 toolchain would otherwise be accepted there and fail somewhere inside `std`
 instead of at the first line of the build.
 
@@ -478,8 +468,12 @@ just test-release                 # zig build test -Doptimize=ReleaseSafe
 just dev "explain this repo"      # build and run one turn
 just ci                           # fmt-check + docs-check + test + test-release + build, the gate
 just canary                       # check the CLI meets the version floor and accepts what we emit
-just ci-full                      # ci plus the canary
-just bench [lines]                # Client.next() over a synthetic stream, ReleaseFast
+just ci-extended                  # supervised macOS checks, examples, ReleaseFast, docs
+just canary-strict                # fail if CLI compatibility cannot be checked
+just ci-full                      # extended gate plus strict CLI parser probes
+just runtime-validate _dev/validation/macos # fresh tests, 100 stress runs/group, generated fuzz
+just compatibility-live _dev/validation/live # opt-in model calls with sanitized evidence
+just bench [lines] [workload] [runs] # real-pipe benchmark, ReleaseFast
 just docs                         # autodocs into zig-out/docs/
 just release <version>            # dist/: tarball, SHA256SUMS, SBOM, optional signature
 just release-verify <version>     # check dist/ sums, and the signature when configured
@@ -487,45 +481,81 @@ just canary-schedule-install      # run the canary weekly (launchd on macOS)
 just canary-schedule-uninstall    # remove that schedule
 ```
 
+Benchmark workloads are `normal`, `escaped`, `large` (8 KiB deltas),
+`control` (one dispatched MCP tool call per delta), and `recovery` (one
+2 MiB event followed by normal deltas); `all` runs each. Output is JSONL,
+one record per repetition. Startup and transcript generation are excluded;
+latency includes `next()`, accessor work, and owned-event cleanup. Retained
+SDK memory is measured after EOF and before `close`; harness transcript and
+latency-array memory are excluded. The recovery workload checks that a large
+valid event does not pin its buffers for subsequent small events.
+
+Use at least five release runs with the same machine, compiler, and workload.
+Compare medians and dispersion; investigate repeatable throughput regressions
+above 10% or allocated-bytes/event increases above 10%. These are investigation
+triggers, not hardware-independent performance guarantees. A small extended-gate
+run checks execution and cleanup only; it is not a performance baseline.
+
+`scripts/bench_compare.py` compares explicitly supplied before/after executables
+in seeded, balanced pairs, excluding warmups. It records build/source hashes,
+host load, raw metrics, and paired uncertainty estimates in a new ignored
+directory. Compile both executables with the same harness, Zig, mode, and
+target; the collector rejects mismatched metadata or changing inputs.
+
 The tooling files, none of which are part of the package:
 
 | File | |
 |---|---|
-| `build.zig` | The build graph: the `agent` module, the demo, three test roots, `bench`, `docs`, and the exact-Zig-version guard. |
+| `build.zig` | Library, demo, tests, complete examples, benchmark, docs, and exact toolchain guard. |
 | `justfile` | Every recipe above. |
-| `bench/next_bench.zig` | Streams a synthetic `stream_event` transcript through `next()` over a real pipe and reports events/s, bytes and allocations per event. |
+| `bench/next_bench.zig` | Five real-pipe workloads with latency distributions, throughput, allocation, and memory metrics. |
 | `scripts/docs-check.sh` | The README-vs-tree gate: the Layout table must match `src/`, `examples/`, `tests/` exactly, and the Usage block must compile. |
 | `scripts/release.sh` | Cuts `dist/` for a version; never tags, commits, or pushes. |
 | `scripts/release-verify.sh` | Checks what `release.sh` left in `dist/`. |
+| `scripts/runtime_validation.py` | Fresh native test counts, stress/fuzz campaigns, and source fingerprints. |
+| `scripts/live-compatibility.py` | Explicitly authorized live protocol matrix with sanitized evidence and owned-session cleanup. |
+| `scripts/bench_compare.py` | Supervised, seeded paired performance comparisons. |
 | `.githooks/pre-commit` | `fmt-check` and `docs-check` on the working tree. |
-| `.githooks/pre-push` | `just ci` on each commit being pushed, in a temporary worktree. |
+| `.githooks/pre-push` | `just ci` on each distinct pushed ref tip, in a temporary worktree. |
 
 **CI is strictly local, by design: there is no hosted CI and no workflow file.**
 The gate is two git hooks under `.githooks/`, version-controlled rather than
 hidden in `.git/hooks/`, and installed once per clone with `just hooks-install`
 (which points `core.hooksPath` at the directory). `pre-commit` runs the fast
 checks, formatting and the README drift check, on the working tree.
-`pre-push` gates the commits actually leaving the machine: it checks each
-pushed commit out into a temporary detached worktree, runs `just ci` there
-with that commit's own `justfile`, and removes the worktree on every exit
-path, so a dirty tree or a pushed side branch cannot make a green result mean
-anything other than "this commit passes". Both hooks fail closed when `zig`
-is missing, and both can be bypassed with `--no-verify`, which is the whole
-CI this repository has. `just canary` is deliberately not part of `ci`: it
-needs the `claude` binary and tests the installed CLI rather than the commit,
-so it belongs in `ci-full`, before a release or after a CLI upgrade, and
-`just canary-schedule-install` runs it weekly so drift is caught without
-anyone remembering to.
+`pre-push` gates each distinct pushed ref tip in a temporary detached
+worktree, using that tip's own `justfile`. It does not test every intermediate
+commit in a pushed range. Both hooks can be bypassed with `--no-verify`;
+there is no remote enforcement. `just ci-extended` adds supervised runtime
+checks, complete-example compilation, ReleaseFast tests, docs generation,
+offline compatibility fixtures and tooling tests on macOS.
+`just runtime-validate PATH` additionally compiles and directly executes every
+test root in Debug, ReleaseSafe, and ReleaseFast, repeats each race group 100
+times, and runs both fuzz harnesses. Its new, ignored output directory records
+the source fingerprints, host/toolchain, exact commands, and actual test counts;
+cached summaries cannot pass as fresh executions.
+`just canary` probes the installed CLI parser and may skip a missing binary;
+`just canary-strict` fails when compatibility cannot be checked. Neither
+submits model requests. `just compatibility-live PATH` separately opts into
+seven real CLI scenarios: MCP registration/list/call, permission allow/deny/
+replacement, interruption, correlated rejection, and persisted-session resume.
+The rejection scenario explicitly changes one interrupt subtype to an invalid
+value to exercise a real CLI refusal. The matrix uses harmless SDK tools,
+temporary workspaces, at most eight CLI clients, USD 0.05 per-client budget
+thresholds, and a 60-second deadline per scenario. Budget thresholds are not
+billing guarantees. Sanitized wire evidence and generated-session cleanup are
+recorded in a new evidence directory. Live model use is never part of a gate.
 
 Releases are cut locally too. `just release <version>` refuses a dirty tree, a
 version that does not match `build.zig.zon`, or a version `CHANGELOG.md` has no
-heading for; runs `just ci-full`; and writes `dist/`: a `git archive` tarball,
+heading for; runs the extended gate and strict CLI probes; and writes `dist/`: a `git archive` tarball,
 a minimal CycloneDX 1.5 SBOM, `SHA256SUMS` over both, and an `ssh-keygen`
 signature of the sums when `RELEASE_SIGNING_KEY` names a key. It prints the
 `git tag` command and stops; tagging and pushing the tag stay the owner's
 decision. `just release-verify <version>` checks the sums and, when
-`RELEASE_ALLOWED_SIGNERS` is set, the signature; without that variable it says
-the signature was not checked rather than implying it was.
+`RELEASE_ALLOWED_SIGNERS` is set, the signature. It validates every archive
+entry and structured SBOM metadata, then builds an extracted package consumer.
+Without a signer trust file, checksum success does not authenticate provenance.
 
 Depending on this package from another Zig project needs a tag to point at,
 and no tag exists yet: `just release <version>` prints the `git tag` command

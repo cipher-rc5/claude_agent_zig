@@ -1,16 +1,13 @@
 // build.zig
-// Build graph: the `agent` module, the demo executable, the three test roots,
-// the benchmark, and the autodocs.
+// Builds the library, demo, tests, benchmark, and API docs.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const manifest = @import("build.zig.zon");
 
-// The codebase uses 0.16 APIs (the `Io` interface, `std.json.Stringify`,
-// `std.process.spawn`) and is tested on exactly one toolchain. The manifest's
-// `minimum_zig_version` is only a floor, so a later zig would be accepted
-// there and then fail somewhere inside std instead of here.
+// Require the tested toolchain: the manifest minimum also accepts newer,
+// potentially incompatible stdlib APIs.
 comptime {
     const required = std.SemanticVersion.parse(manifest.minimum_zig_version) catch unreachable;
     if (builtin.zig_version.order(required) != .eq) {
@@ -24,11 +21,9 @@ comptime {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filters = b.option([]const []const u8, "test-filter", "Run tests whose names contain a filter") orelse &.{};
 
-    // The library, exposed under the name `agent`. Everything outside src/
-    // reaches it through this module rather than by a relative path: a file
-    // may belong to only one module, and a root under examples/ or tests/
-    // cannot import upward out of its own module path.
+    // Use a shared module: Zig forbids importing above a module root.
     const agent_mod = b.addModule("agent", .{
         .root_source_file = b.path("src/agent.zig"),
         .target = target,
@@ -50,20 +45,14 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run the demo client").dependOn(&run.step);
 
-    // Three test roots, because Zig only runs tests reachable from a root's
-    // import graph:
-    //
-    //   src/agent.zig     the library — its test block `_ =`s every module,
-    //                     including the ones whose tests cover private decls
-    //   tests/all.zig     the black-box suite, which sees only public API
-    //   examples/demo.zig the demo, whose test block `_ =`s demo_tools.zig
-    //
-    // A root reached any other way contributes zero tests silently, so each
-    // one is listed here explicitly and each `_ =` above is load-bearing.
+    // Each root must reference its test modules; imports alone do not run
+    // tests. Cover library internals, public API tests, and demo tools
+    // separately.
     const test_step = b.step("test", "Run unit tests");
+    const test_compile_step = b.step("test-compile", "Compile all test roots without running them");
     for ([_][]const u8{
         "src/agent.zig",
         "tests/all.zig",
@@ -74,16 +63,29 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        // src/agent.zig is itself the root of `agent` here, so it must not
-        // also import it — a file belongs to one module.
+        // The library root must not import itself as a second module.
         if (!std.mem.eql(u8, root, "src/agent.zig")) mod.addImport("agent", agent_mod);
-        const tests = b.addTest(.{ .root_module = mod });
+        const tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
         test_step.dependOn(&b.addRunArtifact(tests).step);
+        test_compile_step.dependOn(&tests.step);
     }
 
-    // The read-loop benchmark. Its own step rather than part of `test`: it
-    // takes seconds, its numbers are only meaningful under a release mode,
-    // and a benchmark that "fails" is a regression to read, not a red gate.
+    const examples_step = b.step("examples-check", "Compile the complete API examples");
+    for ([_][]const u8{ "streaming", "permissions", "initialization", "shutdown" }) |name| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("agent", agent_mod);
+        const example = b.addExecutable(.{
+            .name = b.fmt("example-{s}", .{name}),
+            .root_module = mod,
+        });
+        examples_step.dependOn(&example.step);
+    }
+
+    // Run benchmarks separately in release mode; timing is not a test gate.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/next_bench.zig"),
         .target = target,
@@ -95,12 +97,10 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     const bench_run = b.addRunArtifact(bench_exe);
-    if (b.args) |args| bench_run.addArgs(args);
+    bench_run.addPassthruArgs();
     b.step("bench", "Measure Client.next() over a synthetic stream").dependOn(&bench_run.step);
 
-    // Autodocs for the public surface. An object rather than the executable,
-    // so the docs describe the `agent` module and not the demo wrapped around
-    // it. The object itself is never installed; only its emitted docs are.
+    // Generate docs from the library object; install only the emitted docs.
     const docs_obj = b.addObject(.{
         .name = "agent",
         .root_module = agent_mod,

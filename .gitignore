@@ -2,3 +2,6 @@
 zig-out/
 _dev/
 dist/
+__pycache__/
+*.pyc
+.DS_Store

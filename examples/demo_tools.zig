@@ -4,13 +4,8 @@
 const std = @import("std");
 const agent = @import("agent");
 
-/// Names `host_env` will answer for. The allowlist is the point of the tool
-/// rather than a detail of it.
-///
-/// A handler's arguments are model-influenced, and this process inherits its
-/// parent's environment — which on a developer machine holds credentials. An
-/// unrestricted version of this tool would hand those to the model on request.
-/// The pattern to copy: name what a tool may reach, not what it may not.
+/// Environment variables exposed by `host_env`. Keep an explicit allowlist to
+/// prevent model-supplied names from exposing inherited credentials.
 const readable_env = [_][]const u8{
     "HOME",
     "LANG",
@@ -21,8 +16,7 @@ const readable_env = [_][]const u8{
     "USER",
 };
 
-/// Reads one of `readable_env` from the host process's environment, reached
-/// through the context pointer rather than a global.
+/// Reads an allowlisted environment variable from the context map.
 fn hostEnv(context: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
     const environ: *const std.process.Environ.Map = @ptrCast(@alignCast(context.?));
     const obj = switch (arguments) {
@@ -34,8 +28,7 @@ fn hostEnv(context: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.V
         else => return .{ .text = "name must be a string", .is_error = true },
     };
 
-    // Refused before the lookup, so the reply cannot separate a set secret from
-    // an unset one and confirm a name by which error comes back.
+    // Check before lookup so refusals cannot reveal whether a secret is set.
     if (!isReadable(name)) return .{ .text = "not a readable variable", .is_error = true };
 
     const value = environ.get(name) orelse return .{ .text = "not set", .is_error = true };
@@ -49,17 +42,9 @@ fn isReadable(name: []const u8) bool {
     return false;
 }
 
-/// Adds two operands, keeping integer arithmetic exact.
-///
-/// A JSON `number` arrives as an IEEE 754 double, so an argument above 2^53 is
-/// already rounded before any handler runs — and `{"type":"integer"}` rounds
-/// identically, since the loss happens on serialization. Only a decimal string
-/// survives intact, which is why `a` and `b` are declared as strings. JSON
-/// numbers are still accepted, at the usual double precision.
-///
-/// Operands the schema does not promise are reported rather than guessed at:
-/// an integer too large for `i64`, a non-decimal spelling like `"0x10"`, and
-/// anything non-finite.
+/// Adds operands with exact i64 arithmetic when both are integers. Decimal
+/// strings preserve integers above 2^53 through CLI serialization; numeric JSON
+/// inputs are also accepted. Rejects non-decimal and out-of-range input.
 fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
     const obj = switch (arguments) {
         .object => |o| o,
@@ -68,8 +53,6 @@ fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Valu
     const a = operandOf(obj.get("a") orelse return .{ .text = "missing a", .is_error = true });
     const b = operandOf(obj.get("b") orelse return .{ .text = "missing b", .is_error = true });
 
-    // Report the operand itself before reporting anything about the sum: an
-    // out-of-range integer is a rejected input, not an arithmetic result.
     switch (a) {
         .invalid => return .{ .text = "a must be a number in decimal", .is_error = true },
         .out_of_range => return .{ .text = "a is out of range", .is_error = true },
@@ -81,38 +64,27 @@ fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Valu
         else => {},
     }
 
-    // Exact whenever both operands are integers, whichever way they arrived.
     if (a == .integer and b == .integer) {
         const sum = std.math.add(i64, a.integer, b.integer) catch
             return .{ .text = "sum out of range", .is_error = true };
         return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{sum}) };
     }
 
-    // Mixed and fractional operands add in f128, which holds any `i64` and any
-    // `f64` without rounding either one. Adding in f64 instead would discard
-    // an integer operand's exactness the moment the other side was fractional:
-    // 0.5 + 9007199254740993 answered ...992 rather than ...993.5.
+    // Use f128 so mixed arithmetic preserves i64 operands above 2^53.
     const sum = a.wide() + b.wide();
     if (!inF64Range(sum)) return .{ .text = "sum out of range", .is_error = true };
     return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{sum}) };
 }
 
-/// One classified operand. `out_of_range` stays distinct from `invalid`: a
-/// well-formed integer that no longer fits is a range error worth naming, while
-/// `"abc"` is not a number at all. Folding them lets `"9223372036854775808"`
-/// reach the float path and come back as a wrong number.
+/// Keep integer range errors distinct so overflow never falls back to floats.
 const Operand = union(enum) {
     integer: i64,
     float: f128,
     out_of_range,
     invalid,
 
-    /// The operand in the width the mixed path adds in.
-    ///
-    /// The rejected variants are named rather than folded into an `else`: both
-    /// are unreachable today, but an `else` would silently swallow a variant
-    /// added later and turn a rejected input into a panic. Naming them makes
-    /// that a compile error instead.
+    /// Widens a validated operand for mixed arithmetic. Explicit rejected
+    /// variants keep this switch exhaustive when variants are added.
     fn wide(self: Operand) f128 {
         return switch (self) {
             .integer => |i| @floatFromInt(i),
@@ -122,8 +94,7 @@ const Operand = union(enum) {
     }
 };
 
-/// Classifies one argument, whether it arrived as a JSON number or as the
-/// decimal string the schema asks for.
+/// Classifies a JSON number or decimal string.
 fn operandOf(value: std.json.Value) Operand {
     return switch (value) {
         .integer => |i| .{ .integer = i },
@@ -133,41 +104,30 @@ fn operandOf(value: std.json.Value) Operand {
     };
 }
 
-/// Parses a decimal operand. The schema promises "a number in decimal", so
-/// this validates the spelling first rather than inheriting whatever
-/// `parseFloat` happens to accept — it also takes hex, binary, octal, Zig's
-/// `_` digit separators, and the words `inf` and `nan`, none of which the
-/// schema offers and none of which a JSON number could have carried.
+/// Validate decimal syntax before parsing; `parseFloat` also accepts
+/// non-decimal forms, digit separators, and non-finite values.
 fn parseDecimal(s: []const u8) Operand {
     if (!isDecimal(s)) return .invalid;
     if (std.fmt.parseInt(i64, s, 10)) |i| {
         return .{ .integer = i };
     } else |err| switch (err) {
-        // Well-formed digits that do not fit. Reported, never retried as a
-        // float: an f64 answer here would be silently wrong.
+        // Do not retry an overflowing integer as a float; it would lose
+        // precision.
         error.Overflow => return .out_of_range,
         error.InvalidCharacter => {},
     }
     const f = std.fmt.parseFloat(f128, s) catch return .invalid;
-    // `"1e400"` is spelled in decimal but names no value this tool can carry.
     return if (inF64Range(f)) .{ .float = f } else .out_of_range;
 }
 
-/// Whether an `f128` names a value the tool's own domain covers.
-///
-/// f128 is the width the mixed path adds in, not the range it promises: the
-/// operands are `number`s, and a JSON number is an f64. Bounding by f64
-/// instead of by f128's own limits keeps that promise in both directions —
-/// `"1e400"` is rejected rather than answered, and `1e308 + 1e308` is reported
-/// as out of range rather than returning a 309-digit value f64 cannot hold.
-/// The extra mantissa is still used, so 0.5 + 9007199254740993 stays exact.
+/// Limit values to finite f64 range while retaining f128 precision for mixed
+/// arithmetic.
 fn inF64Range(f: f128) bool {
     return std.math.isFinite(f) and @abs(f) <= std.math.floatMax(f64);
 }
 
-/// True for the decimal grammar the schema describes: an optional sign, digits
-/// with an optional fractional part (either side may be empty, but not both),
-/// and an optional decimal exponent. Deliberately narrower than `parseFloat`.
+/// Decimal grammar: optional sign, at least one digit around an optional
+/// decimal point, and an optional exponent. Narrower than `parseFloat`.
 fn isDecimal(s: []const u8) bool {
     var rest = s;
     if (rest.len > 0 and (rest[0] == '+' or rest[0] == '-')) rest = rest[1..];
@@ -200,14 +160,9 @@ fn digitRun(s: []const u8) usize {
     return n;
 }
 
-/// The demo's permission handler, installed when `AGENT_PERMISSIONS=host`.
-/// It allows everything: the point is to show a prompt arriving and being
-/// answered from this process, not to make a policy. `context` is the stderr
-/// writer, so the log line lands beside the other diagnostics rather than in
-/// the agent's output on stdout.
-///
-/// A real handler would branch on `tool_name` and `input` here, and deny with
-/// a message telling the model what to do instead.
+/// Demo-only handler for `AGENT_PERMISSIONS=host`: logs to the stderr writer in
+/// `context` and allows every call. Production handlers should decide based on
+/// `tool_name` and `input`.
 pub fn logAndAllow(
     context: ?*anyopaque,
     _: std.mem.Allocator,
@@ -229,23 +184,16 @@ pub fn build(environ: *const std.process.Environ.Map) [2]agent.Tool {
             .description = "Read one of a fixed set of non-secret environment " ++
                 "variables from the host process: HOME, LANG, PATH, PWD, SHELL, " ++
                 "TERM, USER. Any other name is refused.",
-            // `enum` states the same restriction the handler enforces, so the
-            // model is told the boundary rather than discovering it by refusal.
-            // The handler still checks: a schema is a hint to the model, never
-            // a control on what arrives.
+            // Advertise the allowlist in the schema; the handler still enforces
+            // it.
             .input_schema =
             \\{"type":"object","properties":{"name":{"type":"string","enum":["HOME","LANG","PATH","PWD","SHELL","TERM","USER"]}},"required":["name"]}
             ,
             .handler = hostEnv,
             .context = @ptrCast(@constCast(environ)),
         },
-        // Declared as strings on purpose. A JSON `number` argument is an IEEE
-        // 754 double by the time it reaches the wire, so anything above 2^53
-        // arrives already rounded no matter how exact the handler is — and
-        // measuring against the CLI shows `{"type":"integer"}` rounds exactly
-        // the same way. A decimal string is the only shape that survives, so
-        // it is what the schema asks for, with the description telling the
-        // model to send digits rather than a quoted float.
+        // Decimal strings avoid CLI rounding for large integers, even when the
+        // alternative schema type would be `integer`.
         .{
             .name = "add",
             .description = "Add two numbers. Send each as a decimal string so " ++
@@ -260,10 +208,7 @@ pub fn build(environ: *const std.process.Environ.Map) [2]agent.Tool {
 
 // --- tests ---
 
-// These stay here: they exercise `addNumbers`, which is private — the tool is
-// reached by the agent through the handler pointer `build` installs, not by
-// name. Moving them would mean making the handler public purely for test
-// layout.
+// Tests exercise private numeric and environment handlers.
 
 test "add handles integers, floats and bad input" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -278,11 +223,8 @@ test "add handles integers, floats and bad input" {
     const missing = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":1}", .{});
     try std.testing.expect((try addNumbers(null, a, missing.value)).is_error);
 
-    // A non-object argument is a caller error, reported back rather than fatal.
     try std.testing.expect((try addNumbers(null, a, .{ .integer = 3 })).is_error);
 
-    // A string that is not a number at all is still reported. Numeric strings
-    // are a supported shape; "x" is not one.
     const stringy = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":1,\"b\":\"x\"}", .{});
     try std.testing.expect((try addNumbers(null, a, stringy.value)).is_error);
 }
@@ -292,10 +234,7 @@ test "decimal strings are the shape that survives the wire" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The schema asks for strings because a JSON number is rounded to a double
-    // before it ever reaches this process. Measured against the CLI, sending
-    // 9007199254740993 as a number - or as a JSON integer - delivers ...992;
-    // sent as a string it arrives whole, and this is the path that carries it.
+    // Decimal strings preserve integers above 2^53 through CLI serialization.
     const exact = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -304,19 +243,15 @@ test "decimal strings are the shape that survives the wire" {
     );
     try std.testing.expectEqualStrings("9007199254740993", (try addNumbers(null, a, exact.value)).text);
 
-    // Mixing the two shapes still adds exactly.
     const mixed = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":\"17\",\"b\":25}", .{});
     try std.testing.expectEqualStrings("42", (try addNumbers(null, a, mixed.value)).text);
 
-    // A negative decimal string is an integer too.
     const negative = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":\"-5\",\"b\":\"2\"}", .{});
     try std.testing.expectEqualStrings("-3", (try addNumbers(null, a, negative.value)).text);
 
-    // A fractional string is not an integer, so it takes the float path.
     const fractional = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":\"2.5\",\"b\":\"0.5\"}", .{});
     try std.testing.expectEqualStrings("3", (try addNumbers(null, a, fractional.value)).text);
 
-    // Overflow is reported through the string path as well.
     const overflow = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -331,10 +266,7 @@ test "an integer too large for i64 is reported, not answered as a float" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // i64::MAX + 1. One past the value the test above covers, and the point
-    // where treating a failed `parseInt` as "not an integer" would hand the
-    // operand to the float path: that answers 9223372036854776000 with
-    // is_error false, a wrong number reported as a good one.
+    // i64::MAX + 1 must be a range error, not a float fallback.
     for ([_][]const u8{
         "{\"a\":\"9223372036854775808\",\"b\":\"1\"}",
         "{\"a\":\"99999999999999999999999999\",\"b\":\"1\"}",
@@ -351,9 +283,7 @@ test "each operand keeps its own exactness" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // b is exact past 2^53 and a is fractional. Adding in f64 would round the
-    // pair to 9007199254740992 — b's exactness discarded because a's was not
-    // available. The mixed path adds in f128, which holds both.
+    // Mixed arithmetic must preserve the integer above 2^53.
     const mixed = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -364,7 +294,6 @@ test "each operand keeps its own exactness" {
     try std.testing.expectEqualStrings("9007199254740993.5", result.text);
     try std.testing.expect(!result.is_error);
 
-    // The same either way round.
     const swapped = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -379,9 +308,7 @@ test "the handler honours its own schema" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The schema says "a number in decimal". None of these are one, and each
-    // would otherwise produce a confident answer: inf, nan, a silent overflow
-    // to inf, 32 from hex, and 1000 from Zig's digit separators.
+    // Reject syntax outside the decimal grammar, including inf, nan, and hex.
     for ([_][]const u8{
         "{\"a\":\"inf\",\"b\":\"1\"}",
         "{\"a\":\"-inf\",\"b\":\"1\"}",
@@ -405,7 +332,6 @@ test "the handler honours its own schema" {
         try std.testing.expect(result.is_error);
     }
 
-    // The spellings the grammar does promise keep working.
     for ([_][2][]const u8{
         .{ "{\"a\":\"1e10\",\"b\":\"0\"}", "10000000000" },
         .{ "{\"a\":\"+5\",\"b\":\"1\"}", "6" },
@@ -426,8 +352,7 @@ test "integer addition stays exact past the f64 mantissa" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // 2^53 + 1 is the first integer f64 cannot represent, so a float round
-    // trip would answer 9007199254740992 here.
+    // 2^53 + 1 exposes precision loss from an f64 round trip.
     const big = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -436,11 +361,9 @@ test "integer addition stays exact past the f64 mantissa" {
     );
     try std.testing.expectEqualStrings("9007199254740993", (try addNumbers(null, a, big.value)).text);
 
-    // A float operand still opts into float arithmetic.
     const mixed = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":2,\"b\":0.5}", .{});
     try std.testing.expectEqualStrings("2.5", (try addNumbers(null, a, mixed.value)).text);
 
-    // Overflow is a reported error, not a wrap.
     const overflow = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -451,10 +374,7 @@ test "integer addition stays exact past the f64 mantissa" {
 }
 
 test "host_env answers only for the allowlisted names" {
-    // The regression this pins is a credential disclosure, not a nicety: the
-    // demo pre-authorizes `mcp__host__*`, the process inherits its parent's
-    // environment, and the tool's argument comes from the model. Drop the
-    // allowlist and a turn that asks for AWS_SECRET_ACCESS_KEY gets it.
+    // The pre-authorized host_env tool must never expose inherited credentials.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -471,7 +391,6 @@ test "host_env answers only for the allowlisted names" {
     try std.testing.expect(!ok.is_error);
     try std.testing.expectEqualStrings("/home/demo", ok.text);
 
-    // Set, secret, and refused — the value must not appear in the reply.
     const secret = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -482,8 +401,7 @@ test "host_env answers only for the allowlisted names" {
     try std.testing.expect(refused.is_error);
     try std.testing.expect(std.mem.indexOf(u8, refused.text, "sk-must-not-leak") == null);
 
-    // An allowlisted name that happens to be unset is a different answer from a
-    // refusal, and neither reveals whether a non-allowlisted name exists.
+    // Unset allowlisted names must remain distinct from refused names.
     const unset = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"TERM\"}", .{});
     try std.testing.expectEqualStrings("not set", (try hostEnv(ctx, a, unset.value)).text);
     const absent = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"NOPE\"}", .{});
@@ -494,8 +412,7 @@ test "host_env answers only for the allowlisted names" {
 }
 
 test "the permission hook logs the call and allows it" {
-    // `AGENT_PERMISSIONS=host` is a demonstration, so the line it prints is
-    // the whole behaviour: the tool name, then the input as JSON, on stderr.
+    // Verify the demo log contains the tool name and JSON input.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -1,16 +1,7 @@
 #!/usr/bin/env bash
 # scripts/docs-check.sh
-# Mechanical README-vs-code drift gate. Run by `just docs-check`, which `just ci`
-# depends on. Two independent checks, both fail-closed:
-#
-#   (a) layout — the "## Layout" table must list exactly the .zig files that
-#       exist under src/, examples/ and tests/. No missing rows, no stale rows.
-#   (b) usage  — every ```zig block in the README that looks like a full usage
-#       program must still COMPILE against the current `agent` module. Blocks
-#       are compiled, not run: this catches renamed fields, changed signatures
-#       and removed methods, which is the drift class the docs keep hitting.
-#
-# Deterministic and offline. No network, no `claude` binary, no test execution.
+# Checks the README Layout table and compiles complete Zig usage examples. Runs
+# offline without the CLI or executing compiled examples.
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,15 +15,12 @@ if [ ! -f "$readme" ]; then
     exit 1
 fi
 
-# ---------------------------------------------------------------- (a) layout
+# Layout table
 echo "docs-check: [layout] README '## Layout' table vs the real tree"
 
-# Real tree: every .zig file under the three source dirs, sorted.
 actual="$(find src examples tests -name '*.zig' -type f 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort)"
 
-# Documented: first column of each table row inside the "## Layout" section,
-# taking only `backticked` paths that end in .zig. The section runs from the
-# "## Layout" heading to the next "## " heading.
+# Read backticked .zig paths from the Layout section until the next heading.
 documented="$(awk '
     /^## Layout[[:space:]]*$/ { in_section = 1; next }
     in_section && /^## / { in_section = 0 }
@@ -61,14 +49,13 @@ else
     fi
 fi
 
-# ----------------------------------------------------------------- (b) usage
+# Usage examples
 echo "docs-check: [usage] README \`\`\`zig blocks compile against src/agent.zig"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# Split the README into its ```zig blocks, one file per block, numbered by the
-# line the fence opens on so failures point at the README.
+# Extract Zig blocks, numbered by their opening line for diagnostics.
 awk -v dir="$work" '
     /^```zig[[:space:]]*$/ { inblk = 1; start = NR; out = dir "/block_" NR ".zig"; next }
     inblk && /^```[[:space:]]*$/ { inblk = 0; close(out); next }
@@ -81,11 +68,8 @@ if [ -z "$blocks" ]; then
     exit 1
 fi
 
-# A block is a "usage program" if it calls into the client lifecycle. Fragment
-# blocks (bare struct literals, single field assignments) are not compilable on
-# their own and are skipped by design — they are checked by eye, not here.
-# The prelude wraps a block in a main() with the imports and locals the README
-# text establishes but does not repeat inside every fence.
+# Compile blocks containing Client.open; skip standalone fragments. Supply the
+# imports and locals established by the README prose.
 compiled=0
 for blk in $blocks; do
     line="$(basename "$blk" .zig | sed 's/^block_//')"
@@ -102,29 +86,26 @@ for blk in $blocks; do
         echo 'const agent = @import("agent");'
         echo 'const Allocator = std.mem.Allocator;'
         echo ''
-        # Locals the Usage prose introduces before the fence.
+        # Provide the tool fixtures introduced in the Usage prose.
         echo 'fn addNumbers(_: ?*anyopaque, arena: Allocator, _: std.json.Value) !agent.ToolResult {'
         echo '    return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{@as(u8, 0)}) };'
         echo '}'
         echo 'const tools = [_]agent.Tool{.{ .name = "add", .description = "d", .input_schema = "{}", .handler = addNumbers }};'
         echo 'const servers = [_]agent.McpServer{.{ .name = "host", .tools = &tools }};'
         echo ''
-        # Mirrors examples/demo.zig's own prologue, so the block is compiled
-        # in the same shape a real caller would write it.
+        # Use the same main prologue as examples/demo.zig.
         echo 'pub fn main(init: std.process.Init) !void {'
         echo '    const io = init.io;'
         echo '    const gpa = init.gpa;'
         echo '    var buf: [64]u8 = undefined;'
         echo '    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);'
         echo '    const out = &stdout.interface;'
-        # The block itself, indented so a stray top-level decl is a clear error.
         printf '%s\n' "$body" | sed 's/^/    /'
         echo '}'
     } > "$prog"
 
-    # Compile only — the binary is emitted into the temp dir and never run,
-    # so this stays fast and side-effect free. (-femit-bin=/dev/null is not
-    # usable here: the linker cannot write to a device node on macOS.)
+    # Compile without running. Emit to a temporary file because the macOS linker
+    # cannot write to /dev/null.
     if err="$(zig build-exe \
                 --dep agent \
                 -Mroot="$prog" \

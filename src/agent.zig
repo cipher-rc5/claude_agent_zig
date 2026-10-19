@@ -1,19 +1,5 @@
 // src/agent.zig
-// Client for the Claude Code CLI stream-json protocol.
-//
-// The Agent SDK ships only for Python and TypeScript. Both are thin wrappers
-// around the `claude` binary running with `--input-format stream-json` and
-// `--output-format stream-json`, which is a newline-delimited JSON protocol
-// over the child process stdin/stdout pipes. This module speaks that protocol
-// directly.
-//
-// This file is the public surface. The implementation is split by concern:
-//
-//   options.zig   session configuration, and the CLI flags it becomes
-//   event.zig     one protocol line, and the accessors for reading it
-//   tool.zig      in-process MCP tools and the servers grouping them
-//   protocol.zig  the wire format: every line this process writes
-//   client.zig    process lifecycle, the read loop, control dispatch
+// Public API for the Claude Code CLI stream-json client.
 
 const options = @import("options.zig");
 const event = @import("event.zig");
@@ -22,8 +8,7 @@ const client = @import("client.zig");
 
 pub const Options = options.Options;
 pub const PermissionMode = options.PermissionMode;
-/// The oldest CLI this protocol has been exercised against. Not probed at
-/// `open`; `just canary` checks it. See `options.min_cli_version`.
+/// Oldest tested CLI version; checked by `just canary`, not `open`.
 pub const min_cli_version = options.min_cli_version;
 
 pub const Event = event.Event;
@@ -40,16 +25,16 @@ pub const Client = client.Client;
 pub const OpenError = client.OpenError;
 pub const ReadError = client.ReadError;
 pub const WriteError = client.WriteError;
+pub const Status = client.Status;
+pub const InitializationState = client.InitializationState;
+pub const max_reply_line_bytes = client.max_reply_line_bytes;
 
-/// Re-exported from `std.process.Child`: both appear in the signatures of
-/// `Client.wait` and `Client.close`, so a caller that names either type would
-/// otherwise need its own `@import("std")` purely to spell a return value.
+/// Child exit status and wait error types used by `Client.wait` and
+/// `Client.close`.
 pub const Term = @import("std").process.Child.Term;
 pub const WaitError = @import("std").process.Child.WaitError;
 
-/// The ceiling on a tool handler's result text. A handler returning more gets
-/// an `is_error` result in its place; see `Client.max_tool_result_bytes` for
-/// why the bound exists.
+/// Maximum tool result text size. Larger results become `is_error` replies.
 pub const max_tool_result_bytes = client.max_tool_result_bytes;
 
 test {
@@ -58,5 +43,6 @@ test {
     _ = event;
     _ = tool;
     _ = @import("protocol.zig");
+    _ = @import("transport.zig");
     _ = client;
 }

@@ -1,13 +1,5 @@
 // tests/options_test.zig
-// Black-box tests for the option types on the public surface.
-//
-// The `buildArgv` tests are deliberately not here. `buildArgv` is `pub` in
-// options.zig so client.zig can call it, but it is not re-exported by
-// agent.zig, so it is not public API — and re-exporting it purely to relocate
-// a test would widen the public surface. That includes the fact that
-// `permission_handler` emits `--permission-prompt-tool stdio` and
-// `--permission-prompts host`: the argv is not observable from here, so only
-// what `Options` itself promises is pinned.
+// Public option tests; internal buildArgv tests stay in src/options.zig.
 
 const std = @import("std");
 const agent = @import("agent");
@@ -16,12 +8,11 @@ test "initialize is needed only for sdk servers or a skill allowlist" {
     const servers = [_]agent.McpServer{.{ .name = "host" }};
     try std.testing.expect(!(agent.Options{}).needsInitialize());
     try std.testing.expect((agent.Options{ .sdk_mcp_servers = &servers }).needsInitialize());
-    // An empty allowlist still has to be declared, so it counts.
     try std.testing.expect((agent.Options{ .skills = &.{} }).needsInitialize());
 }
 
 test "permission modes render the exact spellings the CLI accepts" {
-    // The CLI matches these verbatim, so the camelCase ones are load-bearing.
+    // CLI mode names are case-sensitive.
     try std.testing.expectEqualStrings("manual", agent.PermissionMode.manual.cliName());
     try std.testing.expectEqualStrings("auto", agent.PermissionMode.auto.cliName());
     try std.testing.expectEqualStrings("dontAsk", agent.PermissionMode.dont_ask.cliName());
@@ -34,10 +25,8 @@ test "permission modes render the exact spellings the CLI accepts" {
 }
 
 test "min_cli_version is a dotted three-part version" {
-    // `just canary` parses this out of src/options.zig with sed and feeds it
-    // to `sort -V`, so its shape is a contract with a shell script: three
-    // decimal parts, dots between, nothing else. A pre-release suffix or a
-    // leading `v` would compare wrongly there without failing anything here.
+    // `just canary` parses this declaration for `sort -V`; require three
+    // decimal components without a prefix or suffix.
     const version: []const u8 = agent.min_cli_version;
     try std.testing.expect(version.len > 0);
 
@@ -60,15 +49,10 @@ fn allowEverything(
 }
 
 test "permission prompts stay with the CLI unless a handler is installed" {
-    // Null by default, so a session that never mentions permissions keeps
-    // the CLI's own behaviour. The context pointer follows the handler and
-    // means nothing without one.
     const defaults: agent.Options = .{};
     try std.testing.expect(defaults.permission_handler == null);
     try std.testing.expect(defaults.permission_context == null);
 
-    // A plain `fn` coerces into the field, which is how a caller installs
-    // one. The handshake rule for it is pinned separately below.
     var marker: u8 = 0;
     const with_handler: agent.Options = .{
         .permission_handler = allowEverything,
@@ -78,10 +62,8 @@ test "permission prompts stay with the CLI unless a handler is installed" {
 }
 
 test "a permission decision is one of allow, allow with input, or deny" {
-    // The three shapes the CLI reply can take, each constructible from the
-    // public surface. A switch with no `else` is what pins the set: adding a
-    // variant fails to compile here, which is the intended reminder to
-    // document its wire shape.
+    // An exhaustive switch requires explicit coverage for new decision
+    // variants.
     const decisions = [_]agent.PermissionDecision{
         .allow,
         .{ .allow_with_input = "{\"command\":\"ls -la\"}" },
@@ -103,10 +85,13 @@ test "a permission decision is one of allow, allow with input, or deny" {
 }
 
 test "a permission handler alone is enough to need the initialize handshake" {
-    // The CLI routes prompts to a host that has opened with `initialize`, as
-    // the official SDK does; a handler with no servers and no skill list must
-    // therefore still trigger it, or the first prompt is blocked instead of
-    // dispatched.
+    // A permission handler alone must trigger the initialize handshake.
     try std.testing.expect((agent.Options{ .permission_handler = allowEverything }).needsInitialize());
     try std.testing.expect(!(agent.Options{}).needsInitialize());
+}
+
+test "bounded I/O defaults are explicit" {
+    const defaults: agent.Options = .{};
+    try std.testing.expectEqual(@as(u32, 5_000), defaults.write_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 250), defaults.termination_grace_ms);
 }

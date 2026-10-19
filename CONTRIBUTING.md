@@ -14,28 +14,25 @@ If you have found a security issue, do not open a public issue or PR — follow
 
 ## Toolchain
 
-Zig **0.16.0** exactly, and `build.zig` enforces it: a comptime check compares
-`builtin.zig_version` with the `.minimum_zig_version` that `build.zig.zon`
-declares and refuses any other version, naming both. The manifest field is
-only a floor by itself, and a later toolchain would otherwise be accepted
-there and fail somewhere inside `std` instead of at the first line of the
-build. The codebase uses 0.16 APIs (the new `Io` interface,
-`std.json.Stringify`, `std.process.spawn`) that do not compile on 0.15 or
-earlier, and it is tested on exactly one toolchain.
+Zig **0.17.0** exactly. `build.zig` checks the version declared in
+`build.zig.zon` and rejects other toolchains before building. The manifest's
+minimum alone would also accept newer, potentially incompatible versions.
 
 The library has no dependencies beyond the standard library, and nothing should
-be added. `zig build` needs no network access.
+be added. `zig build` needs no network access. Local delivery tooling requires
+Python 3.12 or newer, a Bourne shell, `just`, and standard Git/SSH tools.
 
-The `claude` CLI is a *runtime* dependency, needed only to actually talk to an
-agent (`just dev`). Building and testing do not require it. Check both
+The `claude` CLI is a runtime dependency for agent requests (`just dev`) and
+a required parser-compatibility check for releases. Building, unit tests, and
+the extended offline gate do not require it. Check both
 toolchains with:
 
 ```
 just versions
 ```
 
-macOS and Linux are the supported platforms; see the README's Platforms
-section for why Windows is not.
+macOS on Apple Silicon is the supported platform. Linux is untested and
+outside the validation scope; Windows is unsupported. See README Platforms.
 
 ## The gate
 
@@ -59,10 +56,12 @@ It is offline, needs no `claude` binary, runs nothing it compiles, and takes
 about a second. When it fails it prints the compiler error and points at the
 README line — it never edits the README for you.
 
-`test-release` runs the suite under `ReleaseSafe`. The client reasons about
-release modes explicitly — asserts that vanish under `ReleaseFast`, safety
-checks that stay under `ReleaseSafe` — so a gate that ran Debug alone would
-never exercise the modes the code is written around.
+`test-release` runs the suite under `ReleaseSafe`. `just ci-extended` also
+runs ReleaseFast, compiles complete examples, generates API docs, exercises
+offline protocol and delivery fixtures, checks shell syntax, runs benchmark
+and argument-forwarding smoke checks on macOS. Each command has an
+independent process supervisor deadline. Platform claims require native
+runtime evidence; sharing POSIX APIs does not establish another OS's behavior.
 
 Two git hooks enforce the gate, and CI is strictly local: there is no hosted
 workflow, by decision. Install the hooks once per clone:
@@ -79,18 +78,12 @@ hidden in `.git/hooks/`. `just hooks-uninstall` clears the setting.
   working tree — what the editor just saved is what `zig fmt` and the drift
   check need on disk. It fails closed without `zig` or the script. Bypass one
   commit with `git commit --no-verify`; the push gate still runs on it.
-- **`pre-push`** gates the **commits being pushed**, not the working tree.
-  For each non-zero local sha git names on stdin it checks that commit out
-  detached into a temporary worktree, runs `just ci` there with that commit's
-  own `justfile` (or the same steps by hand when `just` is absent), and
-  removes the worktree on every exit path, including a failure or an
-  interrupt. A dirty tree or a pushed side branch therefore cannot make a
-  green result mean anything other than "this commit passes". Two refs at the
-  same commit are gated once; a ref delete is skipped with a note; a sha that
-  cannot be checked out blocks the push rather than passing. The worktree
-  shares the main tree's `.zig-cache`, so the two optimize modes are
-  incremental rather than a cold rebuild. Bypass with `git push --no-verify`,
-  which skips the only CI this repository has.
+- **`pre-push`** gates each distinct pushed ref tip in a temporary detached
+  worktree, using that tip's `justfile` and sharing the main tree's Zig cache.
+  It tests tips, not every intermediate commit in a pushed range. Ref deletes
+  are skipped; checkout failures block the push. Worktrees are removed on
+  success, failure, or interruption. `git push --no-verify` bypasses the
+  repository's local push gate. There is no remote enforcement.
 
 ## Recipes
 
@@ -102,56 +95,66 @@ hidden in `.git/hooks/`. `just hooks-uninstall` clears the setting.
 | `just test` | `zig build test` — unit tests across all modules. |
 | `just test-release` | `zig build test -Doptimize=ReleaseSafe`. Used by `ci`. |
 | `just check` | Build and test with a full `--summary all` step breakdown. |
-| `just fmt` | `zig fmt build.zig src examples tests bench` — formats in place. |
+| `just fmt` | `zig fmt build.zig src examples tests bench scripts` — formats in place. |
 | `just fmt-check` | Fails if anything is unformatted. Used by `ci`. |
 | `just docs-check` | Fails if the README has drifted from the code. Used by `ci`. |
 | `just ci` | `fmt-check` + `docs-check` + `test` + `test-release` + `build`. The gate. |
 | `just dev "<prompt>"` | Build and run one turn against the agent. |
 | `just dev-release "<prompt>"` | Same, `-Doptimize=ReleaseFast`. |
-| `just bench [lines]` | `zig build bench -Doptimize=ReleaseFast`: `Client.next()` over a synthetic `stream_event` transcript (default 20 000 lines). |
+| `just bench [lines] [workload] [runs]` | Real-pipe ReleaseFast benchmark; defaults to 20 000 normal deltas and one run. |
+| `zig build examples-check` | Compiles streaming, permission, initialization, and shutdown programs without running them. |
 | `just docs` | `zig build docs` — autodocs for the `agent` module into `zig-out/docs/`. |
 | `just clean` | Removes `zig-out/` and `.zig-cache/`. |
 | `just versions` | Prints the `zig` and `claude` versions in use. |
 | `just hooks-install` | Points `core.hooksPath` at `.githooks/` (both hooks). |
 | `just hooks-uninstall` | Clears `core.hooksPath`, disabling the gate. |
 | `just canary` | Checks the installed CLI meets `min_cli_version` and still accepts every flag and permission mode this client emits. |
-| `just ci-full` | `ci` plus `canary`. Run before a release or after a CLI upgrade. |
+| `just canary-strict` | Fails if the CLI is missing, incompatible, or its parser probes are inconclusive. |
+| `just compatibility` | Public-client tests against a synthetic offline protocol fixture. |
+| `just compatibility-live PATH` | Opt-in live protocol matrix with bounded CLI sessions, deadlines, and sanitized evidence; never part of a gate. |
+| `just tooling-test` | Offline canary, artifact, signer, supervisor, and hook fixtures. |
+| `just runtime-validate PATH` | Fresh macOS test matrix, 100 stress runs per group, generated fuzz, and strict parser checks; writes evidence to a new ignored directory. |
+| `just ci-extended` | Supervised native macOS checks. |
+| `just ci-full` | `ci-extended` plus `canary-strict`; required for release validation. |
 | `just canary-schedule-install` | Runs `canary` weekly: a launchd agent on macOS, a printed crontab line elsewhere. |
 | `just canary-schedule-uninstall` | Removes that schedule. |
 | `just release <version>` | Cuts `dist/` for a version: tarball, `SHA256SUMS`, CycloneDX SBOM, optional ssh signature. Never tags, commits, or pushes. |
-| `just release-verify <version>` | Checks what `release` left in `dist/`: sums, archive prefix, SBOM, and the signature when configured. |
+| `just release-verify <version>` | Validates every archive entry, exact source membership, checksums, SBOM metadata, optional signer trust, and an isolated package consumer. |
 
-`canary` is worth knowing about: the Claude Code CLI is versioned independently
-of this library, so an upgrade can silently break the wire protocol. It probes
-the CLI's `--help` for each flag `buildArgv` generates, `--permission-prompts`
-included, probes the two flags `--help` omits (`--max-turns` and
-`--permission-prompt-tool`) by rejection, checks the installed version against
-the floor, and exits 0 with a
-SKIP when the CLI is not on `PATH`, so it is safe to run anywhere. It is not
-part of `ci` — run it after upgrading the CLI, or let
-`canary-schedule-install` run it weekly.
+`canary` checks the installed CLI's version, advertised flags, permission
+modes, and parser-only probes for unadvertised flags. A sentinel unknown
+option ensures a probe reached argument parsing; unrelated execution failure
+cannot count as flag acceptance. Version, timeout, and inconclusive-probe
+failures are errors. The developer recipe skips a missing binary; the strict
+recipe fails. Neither submits a model request. The flag list is maintained
+in `scripts/canary.py`; update it when `buildArgv` emits another flag. Modes
+and the version floor are derived from `src/options.zig`.
 
-Three details of how it matches matter, because the first two were once wrong:
+`compatibility` exercises initialization, MCP list/call, permission allow/deny,
+interrupt, and resume against a hand-authored synthetic fixture. It is not a
+recorded transcript of the current CLI. Live behavioral verification requires
+an explicit opt-in run in a controlled workspace with resource and cost limits.
+`just compatibility-live PATH` explicitly permits the live matrix in temporary
+workspaces using harmless SDK tools, empty built-in tools, and disabled
+settings/skills/hooks. Seven isolated scenarios cover MCP registration/list/call,
+permission allow/deny/replacement, interruption, rejection, and resumed sessions.
+One rejection case deliberately changes an interrupt subtype; that test does
+not represent rejection of a valid interrupt. The interruption case requires
+observed stream progress followed by curtailed output and a correlated
+acknowledgement; a canceled terminal result is recorded as cancellation.
+Defaults allow eight CLI clients
+and twelve configured model turns, with USD 0.05 per-client budget thresholds
+(USD 0.40 aggregate) and a 60-second process deadline per scenario. These are
+CLI thresholds, not billing guarantees or exact API-request limits. The script
+requires `--allow-model-use`, preserves sanitized evidence, and removes only
+session artifacts associated with fresh UUIDs it generated. No live model
+request is part of either local gate.
 
-- Flag names are matched **anchored** on a word boundary, not as substrings. An
-  unanchored match reports `ok --add-dir` against a CLI that has renamed the
-  flag to `--add-dirs`, which is precisely the drift the canary exists to catch.
-- The permission-mode list is **derived from `src/options.zig`** by parsing the
-  wire names out of `cliName()`, rather than being repeated in the justfile. A
-  hardcoded copy drifts silently when a mode is added, and the mode that went
-  missing was `bypassPermissions` — the one that disables every permission
-  check. If `cliName()` stops being a flat `.tag => "wireName",` switch, the
-  parse yields nothing and the canary fails rather than passing on an empty
-  list.
-- The version floor is likewise parsed out of `src/options.zig`, from the
-  line `pub const min_cli_version = "X.Y.Z";` at column 0, and compared with
-  `sort -V`. An empty parse is a failure, not a pass: a renamed or reformatted
-  declaration must not silently lift the floor. Nothing probes the version at
-  `open`, since `--version` would cost a spawn per session to learn something
-  that does not change between sessions.
-
-The flag list itself is hardcoded in the justfile, unlike the modes. A flag
-added to `buildArgv` must be added there by hand.
+For protocol or CLI-integration changes, run the opt-in live matrix before
+publishing the corresponding release. Retain evidence matching the SDK source
+and CLI version being released. Parser probes and synthetic fixtures cannot
+establish current CLI control-envelope behavior. Keep live model use manual
+with the matrix's budget thresholds and process deadlines.
 
 `release` is the other recipe with rules. It refuses a dirty tree, a version
 that does not match `build.zig.zon`'s `.version`, a version `CHANGELOG.md` has
@@ -162,7 +165,11 @@ the owner's decision, made after looking at what is in `dist/`. The signature
 is an `ssh-keygen -Y sign` over `SHA256SUMS`, produced only when
 `RELEASE_SIGNING_KEY` names a private key, and `release-verify` checks it only
 when `RELEASE_ALLOWED_SIGNERS` names an `allowed_signers` file; without that it
-says the signature was not checked rather than implying it was.
+reports integrity-only verification. Set `RELEASE_ALLOWED_SIGNERS`, or run
+`bash scripts/release-verify.sh <version> --require-signature`, when
+authentication is required. `release-verify` uses
+the trusted local `HEAD` by default; `--commit <full-sha>` selects another
+trusted local commit for exact archive and metadata comparison.
 
 Environment variables honoured: `CLAUDE_BIN` (path to the CLI, default
 `claude`), `AGENT_SKILLS` (comma list restricting invocable skills; unset means
@@ -182,6 +189,11 @@ reach the public repository.
 The directory stays on your disk; it is only absent from git. If you add
 anything under `_dev/`, leave it there — do not `git add -f` it, and do not
 move internal notes into a tracked path.
+
+Complete each audit with both `critical_analysis_<YYYYMMDD_HHMMSS>.md` and
+`improvements_<YYYYMMDD_HHMMSS>.md` under `_dev/reviews/`, using the
+`codebase-audit` skill's report and checklist templates. Preserve prior runs,
+state the score's rubric, and leave unverified tasks open.
 
 `.gitignore` covers `.zig-cache/`, `zig-out/`, `dist/` and `_dev/`. Confirm a
 path is ignored before assuming it is:
@@ -215,7 +227,7 @@ stays checkable against the tree.
 ### Where a test goes
 
 The repo is three directories by role: `src/` is the library, `examples/` is
-the demo, `tests/` is the black-box suite. (`bench/` is tooling, not a role;
+executable examples, `tests/` is the black-box suite. (`bench/` is tooling, not a role;
 it carries no tests.)
 
 **The rule for a new test is what it needs to touch.**
@@ -290,6 +302,33 @@ number of distinct tests. Count distinct tests, not summary lines.
 surface and re-exports everything callers should touch. Keep the README's
 layout table and usage example in sync when that surface changes, and add the
 new name to the re-export test in `tests/client_test.zig`.
+
+## Performance evidence
+
+Run `zig build bench -Doptimize=ReleaseFast -- 20000 all 5` on a quiet machine.
+Record the exact compiler, OS/architecture, hardware, workload, repetitions,
+and concurrent load with the JSONL results. Report medians and dispersion;
+one smoke run is not a baseline. Workloads cover normal/escaped deltas,
+8 KiB deltas, MCP tool dispatch, and a 2 MiB event followed by small events.
+
+Metrics include throughput, per-event p50/p95/p99/max latency, successful
+backing allocations and allocated growth bytes per returned event, and
+peak/retained SDK-owned memory. Event ownership and cleanup are included;
+startup, transcript creation, and harness timing storage are excluded.
+Investigate repeatable regressions above 10% in median throughput or allocated
+bytes/event on an identical workload. Recheck noisy timing before deciding a
+change regressed. Safety fixes may justify a measured cost. Keep internal
+benchmark/review evidence under ignored `_dev/`.
+
+For comparisons, compile the same metadata-bearing benchmark harness against
+each SDK snapshot in ReleaseFast, then run `scripts/bench_compare.py` with
+explicit `--before`, `--after`, `--before-source`, `--after-source`, `--seed`,
+and a new ignored `--output` directory. Defaults use 20 measured pairs and
+three warmup pairs per workload. The schedule balances and randomizes order;
+warmups are excluded from summaries. Preserve raw samples and bootstrap
+intervals, and check host load before drawing timing conclusions. Recorded
+source hashes identify supplied inputs; they do not independently prove which
+sources produced an executable.
 
 ## Commits
 

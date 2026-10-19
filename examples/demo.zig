@@ -1,18 +1,12 @@
 // examples/demo.zig
-// Streams one turn from the agent, exposing an in-process tool the agent can
-// call. The tools themselves live in demo_tools.zig.
-//
-// The library is reached through the `agent` module declared in build.zig,
-// not by a relative path: a file may belong to only one module, and a root
-// under examples/ cannot import upward out of its own module path.
+// Streams one foreground turn with the tools in demo_tools.zig.
 
 const std = @import("std");
 const agent = @import("agent");
 const demo_tools = @import("demo_tools.zig");
 
 test {
-    // `main` is only reachable at runtime, so without this the test runner
-    // never pulls in the demo tools and their tests silently do not run.
+    // Reference demo tools explicitly so their tests run.
     _ = demo_tools;
 }
 
@@ -28,8 +22,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const out = &stdout.interface;
 
-    // Skipped lines are reported here rather than on stdout so that piping
-    // stdout still yields only the agent's output.
+    // Keep diagnostics on stderr so stdout contains only agent output.
     var stderr_buffer: [256]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const log = &stderr.interface;
@@ -37,12 +30,11 @@ pub fn main(init: std.process.Init) !void {
     const tools = demo_tools.build(init.environ_map);
     const servers = [_]agent.McpServer{.{ .name = "host", .tools = &tools }};
 
-    // AGENT_SKILLS, when set, is a comma list restricting which skills the
-    // agent may invoke. Unset leaves every discovered skill available.
+    // AGENT_SKILLS is a comma-separated invocation allowlist; unset allows all.
     var skill_names: std.ArrayList([]const u8) = .empty;
     defer skill_names.deinit(gpa);
     if (init.environ_map.get("AGENT_SKILLS")) |list| {
-        // An empty AGENT_SKILLS is a deliberate empty allowlist, not "unset".
+        // An empty value explicitly allows no skills.
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |name| {
             const trimmed = std.mem.trim(u8, name, " ");
@@ -50,11 +42,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // AGENT_PERMISSIONS=host routes the CLI's permission prompts to this
-    // process, where `demo_tools.logAndAllow` logs each one on stderr and
-    // allows it. Only calls outside `allowed_tools` prompt, so with the
-    // allowlist above this is reached by a Bash or Edit call, say. Unset
-    // leaves the CLI's own handling, which refuses what nothing authorized.
+    // AGENT_PERMISSIONS=host logs and allows prompts for calls outside the
+    // allowlist. Unset uses the CLI default, which refuses unauthorized calls.
     const host_permissions = if (init.environ_map.get("AGENT_PERMISSIONS")) |v|
         std.mem.eql(u8, v, "host")
     else
@@ -72,25 +61,19 @@ pub fn main(init: std.process.Init) !void {
         .permission_handler = if (host_permissions) demo_tools.logAndAllow else null,
         .permission_context = @ptrCast(log),
     });
-    // `close` reaps the child; the status it returns is the only signal when
-    // the CLI dies on startup, since that produces no events at all and the
-    // read loop below just ends. Checked after the loop rather than discarded.
-    defer _ = client.close();
+    // Inspect the exit status after streaming to catch startup failures.
+    defer {
+        _ = client.terminate(250) catch {};
+        _ = client.close();
+    }
 
-    // A prompt beginning with /name dispatches that skill or command; there
-    // is nothing special to do for it beyond sending the text.
+    // The CLI dispatches prompts beginning with /name as skills or commands.
     try client.send(prompt);
-    // stdin stays open for the turn: it is the return path for tool calls.
+    // Keep stdin open for tool replies until the turn ends.
 
     while (true) {
-        // Two of the four `ReadError`s cost one line and no more, so aborting
-        // on them throws away a stream the library went out of its way to keep:
-        // on an overlong line `readLine` discards through the next newline to
-        // resync to a clean line boundary (src/client.zig), and a line that is
-        // not JSON never reaches the reader's state at all. Either way the
-        // following line parses normally, so the loop reports the gap and reads
-        // on. The rest are not per-line faults — the pipe is gone or the
-        // allocator is empty — and there is no next line to advance to.
+        // Invalid JSON and oversized lines discard one line; report and
+        // continue. Other read errors end the session.
         const event = client.next() catch |err| switch (err) {
             error.ProtocolTooLong, error.InvalidJson => {
                 try log.print("[skipped] unreadable line: {t}\n", .{err});
@@ -123,29 +106,23 @@ pub fn main(init: std.process.Init) !void {
                 try out.print("\n[result] session={s}\n", .{e.sessionId() orelse "?"});
                 if (e.resultText()) |text| try out.print("{s}\n", .{text});
                 try out.flush();
-                // One turn only, so signal end of input now.
+                // The single turn is complete; signal EOF.
                 client.closeStdin();
             },
             else => {},
         }
     }
 
-    // A CLI that failed to start streams nothing, so the loop above ends
-    // normally and the exit status is what distinguishes that from success.
-    // Returning an error here would collapse every failure into one name and
-    // drop the status itself, which is the only detail a shell caller can act
-    // on. Exiting with the child's own code forwards it instead. `process.exit`
-    // does not unwind, so stdout is flushed first and the `defer`s above are
-    // deliberately given up: the child is already reaped by `wait`, and the
-    // remaining allocations die with the process.
+    // Forward the child exit status, including startup failures with no events.
+    // Flush stdout before `process.exit`, which skips deferred cleanup. The
+    // child is already reaped; remaining allocations end with this process.
     switch (try client.wait()) {
         .exited => |code| if (code != 0) {
             try out.print("[exit] the CLI exited with status {d}\n", .{code});
             try out.flush();
             std.process.exit(code);
         },
-        // Signalled or stopped: there is no exit code to forward, and 1 is the
-        // conventional stand-in.
+        // Use 1 when the child has no exit code to forward.
         else => |term| {
             try out.print("[exit] the CLI ended abnormally: {any}\n", .{term});
             try out.flush();

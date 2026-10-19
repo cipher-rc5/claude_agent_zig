@@ -53,7 +53,7 @@ must come from configuration you control, never from user input.
 
 Note also that the flags this library generates are themselves security
 relevant. `allowed_tools`, `tools`, and `permission_mode` are what constrain
-what the agent may do; a permissive setting such as `.dont_ask` grants the
+what the agent may do; `.bypass_permissions` grants the
 model broad authority over the host's filesystem and shell through the CLI's
 built-in tools. Setting `permission_handler` adds `--permission-prompt-tool
 stdio` and `--permission-prompts host`, which route the CLI's permission
@@ -69,7 +69,7 @@ to break out of its position inject structure into the surrounding envelope:
 
 - `Tool.input_schema` (`src/tool.zig`), spliced by `results.toolsList`.
   `Client.open` checks that every schema parses as JSON and is a JSON object
-  before it allocates or spawns anything, and returns
+  before spawning, and returns
   `error.InvalidToolSchema` otherwise. A schema assembled at runtime is
   therefore refused at `open`, not emitted onto the stream.
 - `PermissionDecision.allow_with_input` (`src/tool.zig`), spliced by
@@ -82,8 +82,10 @@ to break out of its position inject structure into the surrounding envelope:
 
 The check on the first two is `std.json.validate` plus a leading-`{` test. It
 proves well-formedness, not meaning: a schema or an updated input that is valid
-JSON but semantically wrong is still passed through. Build these values with a
-JSON serializer, or keep them constant.
+JSON but semantically wrong is still passed through. Schemas and replacement
+inputs may nest at most 128 containers. CLI JSON beyond that depth returns
+terminal `error.ProtocolTooDeep` and stops the session before dispatch. Build
+raw JSON values with a serializer, or keep them constant.
 
 ### In-process tool handlers
 
@@ -152,12 +154,34 @@ so a `closeStdin` from another thread cannot slip between the check and the
 write. Call `closeStdin` only after the `result` event all the same: the
 refusal ends the session's ability to serve tools, it does not restore it.
 
-Every reply that carries caller- or CLI-sized data is rendered first and
-measured against a 16 896-byte line bound before it is written, because a reply
-larger than the stdin pipe deadlocks both processes with `kill` unreachable.
-One that does not fit is replaced by a short reply that says why: an
-`is_error` tool result, a JSON-RPC error for `initialize` and `tools/list`, or
-a deny for a permission prompt.
+All control replies, including denials and fallbacks, are rendered through a
+16 896-byte complete-frame budget. Escaped data, correlation ids, envelope,
+and newline count toward the budget. Oversized content receives a bounded
+method-appropriate error or denial. If the required correlation metadata
+cannot fit, `next()` returns `error.ReplyTooLong` and force-terminates the
+session rather than truncating an id or emitting an oversized fallback.
+
+A small frame can still block on a full pipe. Nonblocking transport writes
+use `Options.write_timeout_ms` (5 seconds by default) after obtaining the
+write lock, including initialization before `open()` returns. Lock acquisition
+and synchronous callbacks have no API deadline. Failed or timed-out writes
+make the transport terminal;
+start a new session after cleanup. The size limit is not a pipe-capacity or
+immediate-progress guarantee.
+
+`terminate(grace_ms)` cancels pipe I/O, requests SIGTERM, and escalates to
+SIGKILL after the grace interval. It signals only the direct child; descendants
+may survive and need host-managed isolation or process supervision. Canceling
+I/O prevents inherited pipe descriptors from stranding an SDK reader after
+termination. Synchronous tool and permission handlers still need to return;
+termination cannot safely stop arbitrary code running inside the host.
+The host must not independently reap the SDK-owned child or automatically
+reap SIGCHLD children. Preserve the ignored SIGPIPE disposition installed by
+the default `std.Io.Threaded` initialization; custom hosts must arrange the
+same protection so a closed pipe surfaces as a write error rather than a
+process signal. `wait()` and `close()` alone have no graceful-exit
+deadline. Join all client-using threads before destroying the client with
+`close()`.
 
 ### Error names reach the model
 
@@ -186,9 +210,9 @@ inherits the parent's environment.
 These bound what can reach `main` and what a consumer can check, and each has
 a limit worth stating.
 
-- **The gate runs on the commit, locally.** `.githooks/pre-push` checks each
-  pushed commit out into a temporary worktree and runs `just ci` there, so a
-  green result is a verdict on that commit and not on whatever was on disk.
+- **The gate runs on pushed ref tips, locally.** `.githooks/pre-push` checks
+  each distinct pushed ref tip in a temporary worktree and runs `just ci`
+  there. Intermediate commits in the pushed range are not tested.
   It is opt-in per clone (`just hooks-install`), it can be bypassed with
   `--no-verify`, and there is no hosted CI behind it by decision: a push from
   a clone without the hook lands unchecked. The hook is a guard against
@@ -196,12 +220,18 @@ a limit worth stating.
 - **Release artefacts are checksummed and optionally signed.** `just release`
   writes `SHA256SUMS` over the tarball and the SBOM, and signs the sums with
   `ssh-keygen -Y sign` when `RELEASE_SIGNING_KEY` is set. `just release-verify`
-  checks the sums, and checks the signature only when
+  validates every archive entry, exact source membership, structured SBOM
+  metadata, checksums, and an isolated package consumer. It checks the
+  signature only when
   `RELEASE_ALLOWED_SIGNERS` is set, reporting it as not checked otherwise. No
   release has been cut yet and no signing key has been published, so there is
   nothing for a consumer to verify against today; until a tag and an
   `allowed_signers` entry exist, the pipeline is a procedure rather than a
-  guarantee.
+  guarantee. Integrity checks alone do not authenticate the publisher.
+- **CLI parser compatibility is required for release validation.** The strict
+  canary fails when the CLI is missing or its probes are inconclusive. It
+  submits no model requests; offline synthetic protocol fixtures do not certify
+  behavior of the currently installed CLI.
 - **The build pins its toolchain.** `build.zig` refuses any Zig other than the
   one `build.zig.zon` names, and the manifest declares no dependencies, so the
   compiler and `std` are the whole supply chain.

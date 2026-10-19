@@ -1,7 +1,6 @@
 #!/bin/sh
-# Local CI gate. Blocks a push unless every commit being pushed passes
-# `just ci`, each checked out on its own in a temporary worktree.
-# Enabled with `just hooks-install` (sets core.hooksPath=.githooks).
+# Runs `just ci` for each pushed ref tip in a temporary worktree. Enable with
+# `just hooks-install`.
 set -e
 
 echo "──────────────────────────────────────────────"
@@ -21,15 +20,8 @@ blocked() {
 repo=$(git rev-parse --show-toplevel) || blocked
 cd "$repo" || blocked
 
-# The gate runs on the COMMIT being pushed, not on the working tree. Git names
-# each ref on stdin as `<local-ref> <local-sha> <remote-ref> <remote-sha>`;
-# each non-zero local sha is checked out detached into a temporary worktree
-# and the gate runs there, so a dirty tree or a pushed side branch cannot make
-# a green result mean something other than "this commit passes".
-#
-# Every exit path removes the worktree. `git worktree remove --force` is used
-# because the gate leaves build output in it; `prune` afterwards drops the
-# bookkeeping if the directory is already gone.
+# Read ref tips from Git stdin and validate each nonzero local SHA in a detached
+# worktree. Cleanup removes build output and worktree bookkeeping.
 wt=""
 cleanup() {
     if [ -n "$wt" ]; then
@@ -38,17 +30,16 @@ cleanup() {
         wt=""
     fi
 }
-trap cleanup EXIT INT TERM HUP
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-# The worktree gets a cold cache otherwise, which turns a few seconds of
-# incremental work into a full rebuild in both optimize modes. Zig's cache is
-# content-addressed, so sharing the main tree's is safe.
+# Share the content-addressed Zig cache to avoid rebuilding from scratch.
 ZIG_LOCAL_CACHE_DIR="$repo/.zig-cache"
 export ZIG_LOCAL_CACHE_DIR
 
-# Runs the gate in the current directory: `just ci` when just is installed,
-# otherwise the same steps by hand. A gate that green-lights because a tool
-# is absent is worse than no gate at all.
+# Use `just ci` or equivalent commands; missing tools must fail the gate.
 run_gate() {
     if command -v just >/dev/null 2>&1; then
         just ci || return 1
@@ -59,15 +50,15 @@ run_gate() {
         echo "pre-push: neither 'just' nor 'zig' is on PATH; cannot verify this push."
         return 1
     fi
-    zig fmt --check build.zig src examples tests bench || return 1
+    zig fmt --check build.zig src examples tests bench scripts || return 1
     if [ -f scripts/docs-check.sh ]; then
         bash scripts/docs-check.sh || return 1
     else
         echo "pre-push: scripts/docs-check.sh missing in this commit; cannot verify doc drift."
         return 1
     fi
-    zig build test || return 1
-    zig build test -Doptimize=ReleaseSafe || return 1
+    zig build test --test-timeout 10s || return 1
+    zig build test -Doptimize=ReleaseSafe --test-timeout 10s || return 1
     zig build || return 1
 }
 
@@ -76,12 +67,12 @@ checked=""
 gated=0
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ -z "$local_sha" ] && continue
-    # A delete (`git push :branch`) pushes nothing; there is no tree to check.
+    # Deleted refs have no local commit to check.
     if [ "$local_sha" = "$zero" ]; then
         echo "pre-push: NOTE — $remote_ref is being deleted; nothing to verify."
         continue
     fi
-    # Two refs at the same commit need one verdict.
+    # Check identical ref tips once.
     case " $checked " in
         *" $local_sha "*) continue ;;
     esac
@@ -107,7 +98,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 done
 
 if [ "$gated" -eq 0 ]; then
-    echo "pre-push: no commits to gate."
+    echo "pre-push: no ref tips to gate."
 fi
 echo ""
 echo "pre-push: local CI gate passed. Pushing."

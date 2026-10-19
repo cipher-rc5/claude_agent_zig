@@ -1,49 +1,39 @@
 // src/tool.zig
-// In-process MCP tools: what a handler receives, and how servers group them.
+// In-process MCP tools, servers, and permission handlers.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const ToolResult = struct {
     text: []const u8,
-    /// Reported to Claude as a failed call it can recover from, rather than a
-    /// protocol error that stops the run.
+    /// Reports a recoverable tool failure to Claude.
     is_error: bool = false,
 };
 
-/// Invoked on the thread inside `Client.next` when Claude calls the tool.
-/// `arena` is reset immediately before each dispatch, so the handler can
-/// allocate freely and whatever it returns stays valid until the reply has
-/// been written. Nothing allocated in it survives the next tool call. The
-/// handler may `send`, `interrupt`, or `kill` on the client, but must not
-/// call `next`: it is already inside it, and the lock is not reentrant.
+/// Runs synchronously inside `Client.next`. `arena` resets before each
+/// dispatch; returned data must remain valid until the reply is written. May
+/// call `send`, `interrupt`, or `kill`; must not call the non-reentrant `next`.
 pub const ToolHandler = *const fn (
     context: ?*anyopaque,
     arena: Allocator,
     arguments: std.json.Value,
 ) anyerror!ToolResult;
 
-/// What a `PermissionHandler` decides about one tool call.
+/// Permission decision for a tool call.
 pub const PermissionDecision = union(enum) {
     /// Run the tool with the input it was proposed with.
     allow,
-    /// Run the tool with this input instead. A raw JSON object, spliced into
-    /// the reply verbatim; it is validated first, and a value that is not a
-    /// JSON object becomes a deny rather than a corrupted frame. Bounded like
-    /// a tool result: an object too large for one pipe-load is also denied.
+    /// Replacement input as a raw JSON object. Invalid objects and oversized
+    /// reply lines are denied.
     allow_with_input: []const u8,
-    /// Refuse the call. The text is shown to the model, so it should say what
-    /// to do instead, not just that the call was refused.
+    /// Refusal message shown to the model; explain how it can proceed.
     deny: []const u8,
 };
 
-/// Invoked on the thread inside `Client.next` when the CLI asks whether Claude
-/// may run a tool, which it does only when `Options.permission_handler` is set and the
-/// call is not already pre-authorized by `allowed_tools` or a permission mode.
-/// `arena` follows the `ToolHandler` contract: reset before each dispatch, so
-/// a `deny` or `allow_with_input` string may live in it. `input` is the
-/// proposed tool input, or JSON `null` when the request carried none. A
-/// handler error becomes a deny carrying the error's name.
+/// Runs inside `Client.next` for calls not authorized by tool rules or a
+/// permission mode, when `Options.permission_handler` is set. Uses the
+/// `ToolHandler` arena lifetime. `input` is JSON null when absent. Handler
+/// errors become denials containing the error name; OutOfMemory propagates.
 pub const PermissionHandler = *const fn (
     context: ?*anyopaque,
     arena: Allocator,
@@ -54,22 +44,19 @@ pub const PermissionHandler = *const fn (
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    /// A JSON Schema object, emitted verbatim in the `tools/list` reply. It
-    /// is spliced into the protocol frame raw rather than re-encoded, so
-    /// `Client.open` checks that it parses as JSON and is an object, and
-    /// refuses the session with `error.InvalidToolSchema` otherwise.
+    /// JSON Schema object emitted verbatim in `tools/list`. `Client.open`
+    /// rejects malformed JSON and non-object values with
+    /// `error.InvalidToolSchema`.
     input_schema: []const u8 = "{\"type\":\"object\",\"properties\":{}}",
     handler: ToolHandler,
     context: ?*anyopaque = null,
 };
 
-/// Claude sees these as `mcp__<server name>__<tool name>`, so an allow rule
-/// for them looks like `mcp__calc__*`.
+/// Tools are named `mcp__<server>__<tool>`; allow a server with `mcp__calc__*`.
 pub const McpServer = struct {
     name: []const u8,
-    /// Reported to the CLI in the `initialize` handshake as this server's own
-    /// version. It matches the package version only by coincidence; the two
-    /// are unrelated and version independently.
+    /// Server version reported in `initialize`, independent of the package
+    /// version.
     version: []const u8 = "0.1.0",
     tools: []const Tool = &.{},
 
@@ -91,9 +78,8 @@ pub fn findServer(servers: []const McpServer, name: []const u8) ?*const McpServe
 
 // --- tests ---
 
-// Exercises `findServer`, which is `pub` for client.zig but not re-exported by
-// agent.zig, so moving this would widen the public surface. The `findTool` half
-// of the coverage lives in tests/tool_test.zig, reached through `McpServer`.
+// `findServer` is internal; public `findTool` tests live in
+// tests/tool_test.zig.
 test "lookup by name" {
     const tools = [_]Tool{
         .{ .name = "add", .description = "", .handler = undefined },

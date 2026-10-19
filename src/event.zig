@@ -3,14 +3,8 @@
 
 const std = @import("std");
 
-/// The `type` of a protocol line, as far as this module names them.
-///
-/// Exhaustive on purpose, and that has a cost worth knowing: adding a variant
-/// here is a source-breaking change for every caller whose `switch (e.kind)`
-/// names each arm. Write an `else` arm. `unknown` already absorbs every wire
-/// type this enum does not name, so a non-exhaustive `_` tag would never be
-/// produced and would buy nothing but a mandatory `else` on every switch; the
-/// variant is only ever added when an accessor needs it.
+/// Known protocol line types; unrecognized wire types map to `unknown`. Include
+/// an `else` switch arm to allow future enum variants.
 pub const Kind = enum {
     /// Session lifecycle: `init`, `api_retry`, `plugin_install`.
     system,
@@ -36,12 +30,8 @@ pub const Event = struct {
         event.* = undefined;
     }
 
-    /// The whole parsed line. The escape hatch for everything the typed
-    /// accessors below do not cover: the protocol carries far more per event
-    /// than this struct names, notably the nested `message` object on
-    /// `assistant` and `user` lines and the cost and usage fields on `result`,
-    /// and adding a named accessor for each would track a wire format this
-    /// module does not control. Pair it with `objectField` and `stringField`.
+    /// Full parsed line, including fields without typed accessors. Use
+    /// `objectField` and `stringField` to inspect nested values.
     pub fn root(event: Event) std.json.Value {
         return event.parsed.value;
     }
@@ -59,9 +49,8 @@ pub const Event = struct {
         };
     }
 
-    /// Whether `key` holds a string array containing `needle`. Use it on
-    /// `system/init` to confirm a skill or tool actually loaded before the
-    /// session starts working.
+    /// Whether the string array at `key` contains `needle`. Use with
+    /// `system/init` to check loaded skills and tools.
     pub fn arrayContains(event: Event, key: []const u8, needle: []const u8) bool {
         const items = event.getArray(key) orelse return false;
         for (items) |item| {
@@ -98,8 +87,7 @@ pub const Event = struct {
     }
 };
 
-/// Field of a JSON object, or null when `value` is not an object or lacks it.
-/// Shared with the control-request decoding in `client.zig`.
+/// Object field, or null if absent or `value` is not an object.
 pub fn objectField(value: std.json.Value, key: []const u8) ?std.json.Value {
     const obj = switch (value) {
         .object => |o| o,

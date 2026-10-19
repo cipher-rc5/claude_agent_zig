@@ -1,9 +1,5 @@
 // tests/tool_test.zig
-// Black-box tests for the in-process tool types on the public surface.
-//
-// The `findServer` test stays in src/tool.zig: `findServer` is `pub` so
-// client.zig can call it, but agent.zig does not re-export it, so it is not
-// public API.
+// Public tool API tests; internal findServer tests stay in src/tool.zig.
 
 const std = @import("std");
 const agent = @import("agent");
@@ -19,8 +15,8 @@ test "a server finds its own tools by name" {
 }
 
 test "a tool carries a default object schema and a default server version" {
-    // Both defaults are wire-visible: the schema is spliced into `tools/list`
-    // verbatim, and the version is reported in the `initialize` handshake.
+    // Both defaults appear on the wire: schema in tools/list, version in
+    // initialize.
     const tool: agent.Tool = .{ .name = "noop", .description = "", .handler = undefined };
     try std.testing.expectEqualStrings(
         "{\"type\":\"object\",\"properties\":{}}",
