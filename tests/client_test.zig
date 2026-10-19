@@ -1,6 +1,5 @@
 // tests/client_test.zig
-// Public Client API tests; private read and dispatch tests stay in
-// src/client.zig.
+// Public Client API contracts; private tests stay in src/client.zig.
 
 const std = @import("std");
 const agent = @import("agent");
@@ -18,7 +17,6 @@ test "the write API declares an explicit error set" {
     const closed: agent.WriteError = error.StdinClosed;
     try std.testing.expectEqual(agent.WriteError.StdinClosed, closed);
 
-    // Public writes must remain allocation-free.
     const members = [_]agent.WriteError{ error.StdinClosed, error.WriteFailed, error.WriteTimedOut, error.TransportFailed, error.TooManyPendingRequests, error.ReplyTooLong };
     try std.testing.expectEqual(members.len, @typeInfo(agent.WriteError).error_set.error_names.?.len);
 }
@@ -29,8 +27,7 @@ test "the read and open APIs declare their error sets" {
     try std.testing.expectEqual(agent.WaitError!agent.Term, returnType(agent.Client.wait));
     try std.testing.expectEqual(agent.Term, returnType(agent.Client.close));
 
-    // Pin ReadError exactly for exhaustive switches. Check library-specific
-    // OpenError members separately from stdlib spawn errors.
+    // Pin ReadError for exhaustive switches; stdlib spawn errors may vary.
     const read_members = [_]agent.ReadError{
         error.ControlRequestRejected,
         error.InvalidJson,
@@ -58,7 +55,6 @@ test "the read and open APIs declare their error sets" {
 }
 
 test "the public surface re-exports every type a caller needs" {
-    // Check re-exported names and types through the single public module.
     try std.testing.expect(@typeInfo(agent.Options) == .@"struct");
     try std.testing.expect(@typeInfo(agent.PermissionMode) == .@"enum");
     try std.testing.expect(@typeInfo(agent.Event) == .@"struct");
@@ -72,8 +68,6 @@ test "the public surface re-exports every type a caller needs" {
     try std.testing.expect(@typeInfo(agent.ReadError) == .error_set);
     try std.testing.expect(@typeInfo(agent.WriteError) == .error_set);
 
-    // Handlers must accept plain function pointers with the documented
-    // arguments.
     const tool_fn = @typeInfo(agent.ToolHandler).pointer.child;
     try std.testing.expectEqual(@as(usize, 3), @typeInfo(tool_fn).@"fn".param_types.len);
     try std.testing.expectEqual(anyerror!agent.ToolResult, @typeInfo(tool_fn).@"fn".return_type.?);
@@ -84,7 +78,6 @@ test "the public surface re-exports every type a caller needs" {
         @typeInfo(permission_fn).@"fn".return_type.?,
     );
 
-    // Re-export the exact stdlib lifecycle types.
     try std.testing.expect(agent.Term == std.process.Child.Term);
     try std.testing.expect(agent.WaitError == std.process.Child.WaitError);
 
@@ -95,7 +88,6 @@ test "the public surface re-exports every type a caller needs" {
 }
 
 test "Kind names every wire type the client dispatches on, plus unknown" {
-    // Unknown wire types must remain representable.
     try std.testing.expect(@hasField(agent.Kind, "unknown"));
     try std.testing.expect(@hasField(agent.Kind, "control_request"));
     try std.testing.expect(@hasField(agent.Kind, "sdk_control_request"));
@@ -106,7 +98,6 @@ test "Kind names every wire type the client dispatches on, plus unknown" {
 }
 
 test "the diagnostic accessors return borrowed slices" {
-    // Diagnostic accessors return borrowed slices without allocation.
     try std.testing.expectEqual([]const u8, returnType(agent.Client.lastLine));
     try std.testing.expectEqual(?[]const u8, returnType(agent.Client.lastControlError));
     try std.testing.expectEqual(?[]const u8, returnType(agent.Client.sessionId));

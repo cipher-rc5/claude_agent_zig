@@ -10,30 +10,25 @@ pub const ToolResult = struct {
     is_error: bool = false,
 };
 
-/// Runs synchronously inside `Client.next`. `arena` resets before each
-/// dispatch; returned data must remain valid until the reply is written. May
-/// call `send`, `interrupt`, or `kill`; must not call the non-reentrant `next`.
+/// Runs synchronously in `next`; `arena` resets before each dispatch.
+/// Keep results valid through reply writing. May send/interrupt/kill, but never reenter `next`.
 pub const ToolHandler = *const fn (
     context: ?*anyopaque,
     arena: Allocator,
     arguments: std.json.Value,
 ) anyerror!ToolResult;
 
-/// Permission decision for a tool call.
 pub const PermissionDecision = union(enum) {
-    /// Run the tool with the input it was proposed with.
+    /// Keeps the proposed input.
     allow,
-    /// Replacement input as a raw JSON object. Invalid objects and oversized
-    /// reply lines are denied.
+    /// Raw replacement JSON object; invalid or oversized replies are denied.
     allow_with_input: []const u8,
-    /// Refusal message shown to the model; explain how it can proceed.
+    /// Refusal message shown to the model.
     deny: []const u8,
 };
 
-/// Runs inside `Client.next` for calls not authorized by tool rules or a
-/// permission mode, when `Options.permission_handler` is set. Uses the
-/// `ToolHandler` arena lifetime. `input` is JSON null when absent. Handler
-/// errors become denials containing the error name; OutOfMemory propagates.
+/// Handles calls unresolved by tool rules/mode inside `next`, using `ToolHandler` lifetimes.
+/// Missing input is JSON null. Errors become named denials; OutOfMemory propagates.
 pub const PermissionHandler = *const fn (
     context: ?*anyopaque,
     arena: Allocator,
@@ -44,9 +39,7 @@ pub const PermissionHandler = *const fn (
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    /// JSON Schema object emitted verbatim in `tools/list`. `Client.open`
-    /// rejects malformed JSON and non-object values with
-    /// `error.InvalidToolSchema`.
+    /// JSON Schema object for `tools/list`; invalid values fail `open` with `InvalidToolSchema`.
     input_schema: []const u8 = "{\"type\":\"object\",\"properties\":{}}",
     handler: ToolHandler,
     context: ?*anyopaque = null,
@@ -55,8 +48,7 @@ pub const Tool = struct {
 /// Tools are named `mcp__<server>__<tool>`; allow a server with `mcp__calc__*`.
 pub const McpServer = struct {
     name: []const u8,
-    /// Server version reported in `initialize`, independent of the package
-    /// version.
+    /// MCP server version, independent of the package version.
     version: []const u8 = "0.1.0",
     tools: []const Tool = &.{},
 
@@ -68,7 +60,6 @@ pub const McpServer = struct {
     }
 };
 
-/// Locates a server by the name the CLI used in the `mcp_message` envelope.
 pub fn findServer(servers: []const McpServer, name: []const u8) ?*const McpServer {
     for (servers) |*server| {
         if (std.mem.eql(u8, server.name, name)) return server;
@@ -78,8 +69,7 @@ pub fn findServer(servers: []const McpServer, name: []const u8) ?*const McpServe
 
 // --- tests ---
 
-// `findServer` is internal; public `findTool` tests live in
-// tests/tool_test.zig.
+// `findServer` is internal; public tool tests live in tests/tool_test.zig.
 test "lookup by name" {
     const tools = [_]Tool{
         .{ .name = "add", .description = "", .handler = undefined },

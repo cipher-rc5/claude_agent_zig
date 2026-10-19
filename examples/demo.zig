@@ -6,7 +6,6 @@ const agent = @import("agent");
 const demo_tools = @import("demo_tools.zig");
 
 test {
-    // Reference demo tools explicitly so their tests run.
     _ = demo_tools;
 }
 
@@ -22,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const out = &stdout.interface;
 
-    // Keep diagnostics on stderr so stdout contains only agent output.
+    // Reserve stdout for agent output.
     var stderr_buffer: [256]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const log = &stderr.interface;
@@ -30,11 +29,10 @@ pub fn main(init: std.process.Init) !void {
     const tools = demo_tools.build(init.environ_map);
     const servers = [_]agent.McpServer{.{ .name = "host", .tools = &tools }};
 
-    // AGENT_SKILLS is a comma-separated invocation allowlist; unset allows all.
+    // Unset allows all skills; empty allows none.
     var skill_names: std.ArrayList([]const u8) = .empty;
     defer skill_names.deinit(gpa);
     if (init.environ_map.get("AGENT_SKILLS")) |list| {
-        // An empty value explicitly allows no skills.
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |name| {
             const trimmed = std.mem.trim(u8, name, " ");
@@ -42,8 +40,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // AGENT_PERMISSIONS=host logs and allows prompts for calls outside the
-    // allowlist. Unset uses the CLI default, which refuses unauthorized calls.
+    // Host mode logs and allows unresolved calls; CLI defaults refuse them.
     const host_permissions = if (init.environ_map.get("AGENT_PERMISSIONS")) |v|
         std.mem.eql(u8, v, "host")
     else
@@ -61,19 +58,16 @@ pub fn main(init: std.process.Init) !void {
         .permission_handler = if (host_permissions) demo_tools.logAndAllow else null,
         .permission_context = @ptrCast(log),
     });
-    // Inspect the exit status after streaming to catch startup failures.
     defer {
         _ = client.terminate(250) catch {};
         _ = client.close();
     }
 
-    // The CLI dispatches prompts beginning with /name as skills or commands.
     try client.send(prompt);
-    // Keep stdin open for tool replies until the turn ends.
+    // Keep stdin open for foreground tool replies.
 
     while (true) {
-        // Invalid JSON and oversized lines discard one line; report and
-        // continue. Other read errors end the session.
+        // Malformed or oversized lines are recoverable; other read errors are terminal.
         const event = client.next() catch |err| switch (err) {
             error.ProtocolTooLong, error.InvalidJson => {
                 try log.print("[skipped] unreadable line: {t}\n", .{err});
@@ -106,23 +100,19 @@ pub fn main(init: std.process.Init) !void {
                 try out.print("\n[result] session={s}\n", .{e.sessionId() orelse "?"});
                 if (e.resultText()) |text| try out.print("{s}\n", .{text});
                 try out.flush();
-                // The single turn is complete; signal EOF.
                 client.closeStdin();
             },
             else => {},
         }
     }
 
-    // Forward the child exit status, including startup failures with no events.
-    // Flush stdout before `process.exit`, which skips deferred cleanup. The
-    // child is already reaped; remaining allocations end with this process.
+    // `process.exit` skips defers; flush output after reaping the child.
     switch (try client.wait()) {
         .exited => |code| if (code != 0) {
             try out.print("[exit] the CLI exited with status {d}\n", .{code});
             try out.flush();
             std.process.exit(code);
         },
-        // Use 1 when the child has no exit code to forward.
         else => |term| {
             try out.print("[exit] the CLI ended abnormally: {any}\n", .{term});
             try out.flush();

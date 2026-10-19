@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # scripts/docs-check.sh
-# Checks the README Layout table and compiles complete Zig usage examples. Runs
-# offline without the CLI or executing compiled examples.
+# Checks README layout and compiles usage examples offline, without running them.
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,12 +14,10 @@ if [ ! -f "$readme" ]; then
     exit 1
 fi
 
-# Layout table
 echo "docs-check: [layout] README '## Layout' table vs the real tree"
 
 actual="$(find src examples tests -name '*.zig' -type f 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort)"
 
-# Read backticked .zig paths from the Layout section until the next heading.
 documented="$(awk '
     /^## Layout[[:space:]]*$/ { in_section = 1; next }
     in_section && /^## / { in_section = 0 }
@@ -49,13 +46,11 @@ else
     fi
 fi
 
-# Usage examples
 echo "docs-check: [usage] README \`\`\`zig blocks compile against src/agent.zig"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# Extract Zig blocks, numbered by their opening line for diagnostics.
 awk -v dir="$work" '
     /^```zig[[:space:]]*$/ { inblk = 1; start = NR; out = dir "/block_" NR ".zig"; next }
     inblk && /^```[[:space:]]*$/ { inblk = 0; close(out); next }
@@ -68,8 +63,7 @@ if [ -z "$blocks" ]; then
     exit 1
 fi
 
-# Compile blocks containing Client.open; skip standalone fragments. Supply the
-# imports and locals established by the README prose.
+# Compile Client.open examples using context supplied by the README prose.
 compiled=0
 for blk in $blocks; do
     line="$(basename "$blk" .zig | sed 's/^block_//')"
@@ -86,14 +80,12 @@ for blk in $blocks; do
         echo 'const agent = @import("agent");'
         echo 'const Allocator = std.mem.Allocator;'
         echo ''
-        # Provide the tool fixtures introduced in the Usage prose.
         echo 'fn addNumbers(_: ?*anyopaque, arena: Allocator, _: std.json.Value) !agent.ToolResult {'
         echo '    return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{@as(u8, 0)}) };'
         echo '}'
         echo 'const tools = [_]agent.Tool{.{ .name = "add", .description = "d", .input_schema = "{}", .handler = addNumbers }};'
         echo 'const servers = [_]agent.McpServer{.{ .name = "host", .tools = &tools }};'
         echo ''
-        # Use the same main prologue as examples/demo.zig.
         echo 'pub fn main(init: std.process.Init) !void {'
         echo '    const io = init.io;'
         echo '    const gpa = init.gpa;'
@@ -104,8 +96,7 @@ for blk in $blocks; do
         echo '}'
     } > "$prog"
 
-    # Compile without running. Emit to a temporary file because the macOS linker
-    # cannot write to /dev/null.
+    # The macOS linker needs a real output file; never run the compiled example.
     if err="$(zig build-exe \
                 --dep agent \
                 -Mroot="$prog" \

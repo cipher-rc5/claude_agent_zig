@@ -1,5 +1,5 @@
 // tests/event_test.zig
-// Black-box tests for `Event`: one protocol line, read through the accessors.
+// Public Event accessor tests.
 
 const std = @import("std");
 const agent = @import("agent");
@@ -38,7 +38,6 @@ test "accessors ignore mismatched kinds and shapes" {
     defer event.deinit();
 
     try std.testing.expectEqualStrings("done", event.resultText().?);
-    // A delta shape on a non-stream_event line is not a token delta.
     try std.testing.expect(event.textDelta() == null);
     try std.testing.expect(event.getArray("result") == null);
     try std.testing.expect(event.getString("missing") == null);

@@ -1,6 +1,5 @@
 #!/bin/sh
-# Runs `just ci` for each pushed ref tip in a temporary worktree. Enable with
-# `just hooks-install`.
+# Pushed-tip CI in temporary worktrees; enable with `just hooks-install`.
 set -e
 
 echo "──────────────────────────────────────────────"
@@ -20,8 +19,6 @@ blocked() {
 repo=$(git rev-parse --show-toplevel) || blocked
 cd "$repo" || blocked
 
-# Read ref tips from Git stdin and validate each nonzero local SHA in a detached
-# worktree. Cleanup removes build output and worktree bookkeeping.
 wt=""
 cleanup() {
     if [ -n "$wt" ]; then
@@ -35,11 +32,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-# Share the content-addressed Zig cache to avoid rebuilding from scratch.
+# Reuse content-addressed build results across worktrees.
 ZIG_LOCAL_CACHE_DIR="$repo/.zig-cache"
 export ZIG_LOCAL_CACHE_DIR
 
-# Use `just ci` or equivalent commands; missing tools must fail the gate.
+# Missing gate tools must fail closed.
 run_gate() {
     if command -v just >/dev/null 2>&1; then
         just ci || return 1
@@ -67,12 +64,10 @@ checked=""
 gated=0
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ -z "$local_sha" ] && continue
-    # Deleted refs have no local commit to check.
     if [ "$local_sha" = "$zero" ]; then
         echo "pre-push: NOTE — $remote_ref is being deleted; nothing to verify."
         continue
     fi
-    # Check identical ref tips once.
     case " $checked " in
         *" $local_sha "*) continue ;;
     esac

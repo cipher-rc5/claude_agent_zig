@@ -1,6 +1,5 @@
 #!/bin/sh
-# Checks working-tree formatting and README consistency. Full CI runs on push.
-# Enable with `just hooks-install`.
+# Working-tree formatting/docs gate; enable with `just hooks-install`.
 set -e
 
 echo "pre-commit: fmt-check + docs-check"
@@ -24,7 +23,6 @@ if ! command -v zig >/dev/null 2>&1; then
     blocked
 fi
 
-# Check working-tree files here; pre-push validates committed snapshots.
 zig fmt --check build.zig src examples tests bench scripts || blocked
 
 if [ -f scripts/docs-check.sh ]; then

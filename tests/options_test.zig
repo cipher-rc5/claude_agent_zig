@@ -12,7 +12,6 @@ test "initialize is needed only for sdk servers or a skill allowlist" {
 }
 
 test "permission modes render the exact spellings the CLI accepts" {
-    // CLI mode names are case-sensitive.
     try std.testing.expectEqualStrings("manual", agent.PermissionMode.manual.cliName());
     try std.testing.expectEqualStrings("auto", agent.PermissionMode.auto.cliName());
     try std.testing.expectEqualStrings("dontAsk", agent.PermissionMode.dont_ask.cliName());
@@ -25,8 +24,6 @@ test "permission modes render the exact spellings the CLI accepts" {
 }
 
 test "min_cli_version is a dotted three-part version" {
-    // `just canary` parses this declaration for `sort -V`; require three
-    // decimal components without a prefix or suffix.
     const version: []const u8 = agent.min_cli_version;
     try std.testing.expect(version.len > 0);
 
@@ -62,8 +59,6 @@ test "permission prompts stay with the CLI unless a handler is installed" {
 }
 
 test "a permission decision is one of allow, allow with input, or deny" {
-    // An exhaustive switch requires explicit coverage for new decision
-    // variants.
     const decisions = [_]agent.PermissionDecision{
         .allow,
         .{ .allow_with_input = "{\"command\":\"ls -la\"}" },
@@ -85,7 +80,6 @@ test "a permission decision is one of allow, allow with input, or deny" {
 }
 
 test "a permission handler alone is enough to need the initialize handshake" {
-    // A permission handler alone must trigger the initialize handshake.
     try std.testing.expect((agent.Options{ .permission_handler = allowEverything }).needsInitialize());
     try std.testing.expect(!(agent.Options{}).needsInitialize());
 }

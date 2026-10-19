@@ -6,8 +6,7 @@ const builtin = @import("builtin");
 
 const manifest = @import("build.zig.zon");
 
-// Require the tested toolchain: the manifest minimum also accepts newer,
-// potentially incompatible stdlib APIs.
+// The manifest minimum alone accepts untested newer toolchains.
 comptime {
     const required = std.SemanticVersion.parse(manifest.minimum_zig_version) catch unreachable;
     if (builtin.zig_version.order(required) != .eq) {
@@ -23,7 +22,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const test_filters = b.option([]const []const u8, "test-filter", "Run tests whose names contain a filter") orelse &.{};
 
-    // Use a shared module: Zig forbids importing above a module root.
+    // Share a module because Zig forbids imports above a module root.
     const agent_mod = b.addModule("agent", .{
         .root_source_file = b.path("src/agent.zig"),
         .target = target,
@@ -48,9 +47,7 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run the demo client").dependOn(&run.step);
 
-    // Each root must reference its test modules; imports alone do not run
-    // tests. Cover library internals, public API tests, and demo tools
-    // separately.
+    // Each root must reference its tests; unused imports do not run them.
     const test_step = b.step("test", "Run unit tests");
     const test_compile_step = b.step("test-compile", "Compile all test roots without running them");
     for ([_][]const u8{
@@ -85,7 +82,7 @@ pub fn build(b: *std.Build) void {
         examples_step.dependOn(&example.step);
     }
 
-    // Run benchmarks separately in release mode; timing is not a test gate.
+    // Timing runs separately from test gates.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/next_bench.zig"),
         .target = target,
@@ -100,7 +97,6 @@ pub fn build(b: *std.Build) void {
     bench_run.addPassthruArgs();
     b.step("bench", "Measure Client.next() over a synthetic stream").dependOn(&bench_run.step);
 
-    // Generate docs from the library object; install only the emitted docs.
     const docs_obj = b.addObject(.{
         .name = "agent",
         .root_module = agent_mod,

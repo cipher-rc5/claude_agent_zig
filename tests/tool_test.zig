@@ -15,8 +15,6 @@ test "a server finds its own tools by name" {
 }
 
 test "a tool carries a default object schema and a default server version" {
-    // Both defaults appear on the wire: schema in tools/list, version in
-    // initialize.
     const tool: agent.Tool = .{ .name = "noop", .description = "", .handler = undefined };
     try std.testing.expectEqualStrings(
         "{\"type\":\"object\",\"properties\":{}}",

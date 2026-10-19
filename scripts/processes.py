@@ -28,13 +28,12 @@ while True:
 
 def run(argv: Sequence[str], *, timeout: float = 60, cwd=None, env=None, stdin=None):
     report, report_writer = os.pipe()
-    # EOF lets the guardian clean up even if this driver is killed abruptly.
+    # EOF triggers cleanup even if the driver is killed.
     lifetime, lifetime_writer = os.pipe()
     os.set_blocking(report, False)
     try:
         with tempfile.TemporaryFile() as output:
-            # The guardian keeps the group ID reserved and signalable after
-            # command exit, including Darwin's otherwise unsignalable zombies.
+            # Reserve the group ID and keep it signalable after child exit on Darwin.
             process = subprocess.Popen(
                 [sys.executable, "-c", _GUARD, str(report_writer), str(lifetime), *argv],
                 cwd=cwd, env=env, stdin=stdin, stdout=output,
@@ -69,8 +68,7 @@ def run(argv: Sequence[str], *, timeout: float = 60, cwd=None, env=None, stdin=N
                 except ProcessLookupError:
                     pass
                 except PermissionError:
-                    # Darwin returns EPERM for a group of zombies only. An
-                    # active guardian cannot take this path.
+                    # Darwin permits EPERM for zombie-only groups, never a live guardian.
                     completed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
                     if completed is None:
                         raise

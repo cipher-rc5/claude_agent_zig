@@ -22,29 +22,22 @@ const ToolResult = tool_mod.ToolResult;
 const PermissionHandler = tool_mod.PermissionHandler;
 const PermissionDecision = tool_mod.PermissionDecision;
 
-/// Maximum unescaped tool result text. The complete reply has a separate cap
-/// for escaping and metadata.
+/// Maximum tool text before escaping; complete replies have a separate cap.
 pub const max_tool_result_bytes: usize = 16 * 1024;
 
-/// Envelope headroom for reply metadata. Escaping is accounted for by measuring
-/// the rendered line.
+// Reply metadata allowance; the rendered frame also accounts for escaping.
 const tool_result_envelope_bytes: usize = 512;
 
-/// Maximum rendered reply size, including the newline. Oversized replies are
-/// replaced with a bounded error response.
+/// Complete reply cap, including newline; fallbacks obey the same bound.
 pub const max_reply_line_bytes: usize = max_tool_result_bytes + tool_result_envelope_bytes;
 
-/// Model-facing error for oversized tool results.
 const tool_result_too_long_message =
     "tool result too long: the SDK caps a tool result at 16384 bytes. " ++
     "Return less data, or a reference to it.";
 
-/// Maximum retained scratch and line-buffer capacity; larger allocations are
-/// released on the next use.
+// Release larger scratch and line buffers on their next use.
 const retain_bytes: usize = 1024 * 1024;
 
-/// Fixed capacity for pending initialize/interrupt requests; ID generation does
-/// not allocate.
 const max_pending_requests = 16;
 
 pub const OpenError = error{
@@ -55,14 +48,13 @@ pub const OpenError = error{
     InvalidRegistration,
     TransportFailed,
     WriteTimedOut,
-    /// A tool schema is invalid JSON or not an object; checked before spawning.
+    /// Schema is invalid JSON or not an object; checked before spawning.
     InvalidToolSchema,
 } || std.process.SpawnError || Allocator.Error || Io.Writer.Error;
 
-/// Explicit error set for allocation-free public writes; prevents stdlib
-/// changes from widening the API.
+/// Allocation-free write errors, pinned independently of stdlib error sets.
 pub const WriteError = error{
-    /// `closeStdin` has run; writing could target a recycled descriptor.
+    /// Stdin is closed; its descriptor may have been reused.
     StdinClosed,
     WriteFailed,
     WriteTimedOut,
@@ -123,35 +115,31 @@ pub const Client = struct {
     line: Io.Writer.Allocating,
     max_line_bytes: usize,
     servers: []const McpServer,
-    /// Borrowed from `Options`, like `servers`, so the caller keeps it alive.
+    /// Borrowed, like `servers`; valid through `close`.
     skills: ?[]const []const u8,
     permission_handler: ?PermissionHandler,
     permission_context: ?*anyopaque,
     scratch: std.heap.ArenaAllocator,
     next_request_id: u64 = 0,
-    /// Pending `zig_N` request numbers, oldest first; matched in `next`.
+    /// Pending `zig_N` numbers, oldest first.
     pending_requests: [max_pending_requests]u64 = undefined,
     pending_len: usize = 0,
-    /// Owned error text for the last rejected request; see `lastControlError`.
+    /// Owned rejection text, exposed by `lastControlError`.
     control_error: ?[]u8 = null,
     session_id: ?[]u8 = null,
     stdin_closed: bool = false,
-    /// Set after reaping; `next` then discards buffered output and returns
-    /// null. The descriptor stays open until `close` so concurrent reads can
-    /// finish.
+    /// Reaped or stopped: `next` returns null; the descriptor stays open until `close`.
     stdout_closed: bool = false,
     /// Observed child status. Use `status()` during concurrent operations.
     term: ?std.process.Child.Term = null,
-    /// Whether termination was requested. Use `status()` during concurrency.
+    /// Termination requested; read via `status()` during concurrency.
     killed: bool = false,
-    /// Test-only reply sink for dispatch tests without a subprocess.
+    // Test-only process and reply adapters.
     process_override: if (builtin.is_test) ?ProcessAdapter else void = if (builtin.is_test) null else {},
     reply_override: if (builtin.is_test) ?*Io.Writer else void = if (builtin.is_test) null else {},
-    /// Reap failure, separate from the observed exit status. Access under the
-    /// same rules as `term`.
+    /// Reap error, separate from `term`; read via `status()` during concurrency.
     wait_error: ?std.process.Child.WaitError = null,
-    /// Final stdin flush failure. Recorded because `wait` and `kill` cannot
-    /// return write errors; check after `closeStdin` or `wait` completes.
+    /// Final flush error; `wait` and `kill` cannot return write errors.
     flush_error: ?Io.Writer.Error = null,
     /// Lock order is write -> state. State never waits for either I/O lock.
     write_mutex: Io.Mutex = .init,
@@ -160,10 +148,8 @@ pub const Client = struct {
     /// Serializes nonblocking reap, signals, and published status.
     state_mutex: Io.Mutex = .init,
 
-    /// Spawns the CLI. The returned pointer is stable; the reader and writer
-    /// interfaces embed pointers into it.
+    /// Spawns the CLI at a stable address required by its embedded I/O interfaces.
     pub fn open(gpa: Allocator, io: Io, options: Options) OpenError!*Client {
-        // Validate configuration before allocating client state or spawning.
         if (options.max_line_bytes == 0) return error.InvalidMaxLineBytes;
         if (options.write_timeout_ms == 0) return error.InvalidWriteTimeout;
         if (options.stdin_buffer_size == 0 or options.stdout_buffer_size == 0) return error.InvalidBufferSize;
@@ -189,7 +175,7 @@ pub const Client = struct {
         const stdout_buffer = try gpa.alloc(u8, options.stdout_buffer_size);
         errdefer gpa.free(stdout_buffer);
 
-        // `spawn` consumes argv; the child retains no references to this arena.
+        // `spawn` does not retain argv.
         var child = blk: {
             var argv_arena: std.heap.ArenaAllocator = .init(gpa);
             defer argv_arena.deinit();
@@ -204,9 +190,7 @@ pub const Client = struct {
         };
         errdefer forceCleanup(&child, io);
 
-        // Own stdout separately: reaping `child` must not close a descriptor
-        // under a concurrent reader. `close` releases it after the reader
-        // finishes.
+        // Retain stdout across reaping; only `close` may release an active reader's fd.
         const stdout_file = child.stdout.?;
         child.stdout = null;
         errdefer stdout_file.close(io);
@@ -232,8 +216,6 @@ pub const Client = struct {
             .scratch = .init(gpa),
         };
 
-        // Cover allocations made during initialization after the client is
-        // assembled.
         errdefer client.line.deinit();
         errdefer client.scratch.deinit();
 
@@ -241,17 +223,15 @@ pub const Client = struct {
         return client;
     }
 
-    /// Closes stdin and waits for natural exit. This has no exit deadline;
-    /// another thread can call `terminate` or `forceKill` to stop the child.
+    /// Closes stdin and waits without a deadline; another thread may terminate the child.
     pub fn wait(client: *Client) std.process.Child.WaitError!std.process.Child.Term {
         client.closeStdin();
         return client.awaitExit(null);
     }
 
-    /// Sends SIGTERM, escalates after `grace_ms`, and reaps the direct child.
-    /// Stops pipe I/O immediately. Cleanup is cancellation-protected.
-    /// Callbacks must return before `close` can free
-    /// their resources. Descendants are not signaled.
+    /// Stops pipe I/O, sends SIGTERM, then escalates after `grace_ms` and reaps.
+    /// Cleanup blocks cancellation; only the direct child is signaled.
+    /// Host callbacks must return before `close` can free their resources.
     pub fn terminate(client: *Client, grace_ms: u32) std.process.Child.WaitError!std.process.Child.Term {
         const protection = client.io.swapCancelProtection(.blocked);
         defer _ = client.io.swapCancelProtection(protection);
@@ -318,8 +298,7 @@ pub const Client = struct {
                 client.state_mutex.unlock(io);
                 return err;
             }
-            // Reap and publish under the signal lock: the kernel cannot recycle
-            // the pid while another SDK thread still considers it signalable.
+            // Share the signal lock so reaped PIDs cannot be signaled after reuse.
             const result = client.pollProcess() catch |err| {
                 client.wait_error = err;
                 client.state_mutex.unlock(io);
@@ -364,9 +343,8 @@ pub const Client = struct {
         };
     }
 
-    /// Reaps the child and frees the client. Must be the final call; waits for
-    /// an active `next` to finish before releasing its resources. Returns
-    /// `.unknown` on reap failure; use `wait` to receive the error.
+    /// Final call: join other client users first. Reaps and frees the client.
+    /// Returns `.unknown` on reap failure; use `wait` to receive the error.
     pub fn close(client: *Client) std.process.Child.Term {
         const close_io = client.io;
         const protection = close_io.swapCancelProtection(.blocked);
@@ -381,7 +359,6 @@ pub const Client = struct {
         };
         client.read_mutex.lockUncancelable(client.io);
         client.read_mutex.unlock(client.io);
-        // Close stdout only after the reader has finished.
         client.stdout_reader.file.close(client.io);
         const gpa = client.gpa;
         if (client.session_id) |id| gpa.free(id);
@@ -394,30 +371,25 @@ pub const Client = struct {
         return term;
     }
 
-    /// CLI session id for `Options.resume_session_id`. Set once by `next`;
-    /// thread-safe and valid until `close`.
+    /// Resume ID set once by `next`; thread-safe and valid until `close`.
     pub fn sessionId(client: *Client) ?[]const u8 {
         client.state_mutex.lockUncancelable(client.io);
         defer client.state_mutex.unlock(client.io);
         return client.session_id;
     }
 
-    /// Most recent raw protocol line, including invalid JSON or the buffered
-    /// prefix of an oversized line. Empty before reading and after end of
-    /// stream. Borrowed until the next `next` call; access only on the reading
-    /// thread.
+    /// Last raw line or oversized prefix; empty before reading and at EOF.
+    /// Reader-thread only; borrowed until the next `next` call.
     pub fn lastLine(client: *const Client) []const u8 {
         return client.line.writer.buffered();
     }
 
-    /// Last CLI rejection text after either rejection error, or null.
-    /// Valid until the next rejection or `close`; access on the reading thread.
+    /// Last rejection or null; reader-thread only, valid until rejection or `close`.
     pub fn lastControlError(client: *const Client) ?[]const u8 {
         return client.control_error;
     }
 
-    /// Flushes and closes stdin so the CLI finishes its turn and exits. Records
-    /// flush failures in `flush_error`; closes the descriptor regardless.
+    /// Closes stdin even if flushing fails; retains the error in `flush_error`.
     pub fn closeStdin(client: *Client) void {
         client.write_mutex.lockUncancelable(client.io);
         defer client.write_mutex.unlock(client.io);
@@ -443,8 +415,7 @@ pub const Client = struct {
         }
     }
 
-    /// Returns stdin or `error.StdinClosed`, preventing writes to a recycled
-    /// descriptor in all build modes. Caller holds `write_mutex`.
+    // Caller holds `write_mutex`; reject closed or failed transport before I/O.
     fn stdin(client: *Client) WriteError!*Io.Writer {
         if (client.stdin_closed) return error.StdinClosed;
         if (client.transport_state.stopped.load(.acquire) or client.transport_state.failed.load(.acquire)) return error.TransportFailed;
@@ -452,8 +423,7 @@ pub const Client = struct {
         return &client.stdin_writer.interface;
     }
 
-    /// Queues a user turn; mid-turn messages become guidance. Thread-safe,
-    /// including from handlers; serializes whole lines with control replies.
+    /// Queues a turn or mid-turn guidance; thread-safe, including from handlers.
     pub fn send(client: *Client, text: []const u8) WriteError!void {
         client.write_mutex.lockUncancelable(client.io);
         defer client.write_mutex.unlock(client.io);
@@ -462,8 +432,7 @@ pub const Client = struct {
         finishLine(w) catch return client.writeFailure();
     }
 
-    /// Dispatches `/name arguments`, including skills omitted from the session
-    /// skill list. Streams escaped text without an intermediate allocation.
+    /// Sends `/name arguments`, including skills omitted from the session list.
     pub fn sendCommand(client: *Client, name: []const u8, arguments: []const u8) WriteError!void {
         client.write_mutex.lockUncancelable(client.io);
         defer client.write_mutex.unlock(client.io);
@@ -472,9 +441,7 @@ pub const Client = struct {
         finishLine(w) catch return client.writeFailure();
     }
 
-    /// Requests interruption of the current turn. Thread-safe while `next`
-    /// reads. CLI refusal surfaces from `next` as
-    /// `error.ControlRequestRejected`.
+    /// Thread-safe interruption; CLI refusal surfaces from `next` as `ControlRequestRejected`.
     pub fn interrupt(client: *Client) WriteError!void {
         client.write_mutex.lockUncancelable(client.io);
         defer client.write_mutex.unlock(client.io);
@@ -485,12 +452,9 @@ pub const Client = struct {
         try client.writeLineLocked(protocol.writeInterrupt, .{request_id});
     }
 
-    /// Returns the next conversation event, owned by the caller, or null at
-    /// EOF. Tool and permission handlers run synchronously on the calling
-    /// thread. Control requests after `closeStdin` return `error.StdinClosed`.
-    /// Drain events before reaping; after a reap, buffered output is discarded.
-    /// Concurrent calls serialize. Handlers must not call this non-reentrant
-    /// method. Another thread may call `wait` or `kill` while it reads.
+    /// Returns a caller-owned event or null at EOF; release events with `deinit`.
+    /// Calls serialize; synchronous handlers must not reenter. Concurrent wait/kill is safe.
+    /// Reaping discards buffered output. Replies after stdin closes fail with `StdinClosed`.
     pub fn next(client: *Client) ReadError!?Event {
         client.read_mutex.lockUncancelable(client.io);
         defer client.read_mutex.unlock(client.io);
@@ -523,7 +487,6 @@ pub const Client = struct {
             // `next` is the sole writer and holds `read_mutex`.
             if (client.session_id == null) {
                 if (event.sessionId()) |id| {
-                    // Free the event if copying its borrowed session id fails.
                     errdefer event.deinit();
                     const copy = try client.gpa.dupe(u8, id);
                     client.state_mutex.lockUncancelable(client.io);
@@ -535,8 +498,6 @@ pub const Client = struct {
             switch (event.kind) {
                 .control_request, .sdk_control_request => {
                     defer event.deinit();
-                    // Preserve host allocation failures separately from pipe
-                    // failures.
                     client.serveControlRequest(event.parsed.value) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.StdinClosed => return error.StdinClosed,
@@ -549,8 +510,6 @@ pub const Client = struct {
                         else => return error.WriteFailed,
                     };
                 },
-                // Report rejected client requests; successful responses need no
-                // event.
                 .control_response => {
                     defer event.deinit();
                     try client.noteControlResponse(event.parsed.value);
@@ -562,8 +521,7 @@ pub const Client = struct {
 
     // --- writing ---
 
-    /// Reserves an id without discarding any accepted request. Caller holds
-    /// `write_mutex`; failed sends remove their reservation.
+    // Caller holds `write_mutex`; failed sends release their reservation.
     fn nextRequestId(client: *Client, buf: []u8) WriteError![]const u8 {
         if (client.pending_len == max_pending_requests or client.next_request_id == std.math.maxInt(u64))
             return error.TooManyPendingRequests;
@@ -573,14 +531,12 @@ pub const Client = struct {
         return std.fmt.bufPrint(buf, "zig_{d}", .{client.next_request_id}) catch unreachable;
     }
 
-    /// Terminates and flushes a protocol line so the CLI can process it.
     fn finishLine(w: *Io.Writer) WriteError!void {
         try w.writeByte('\n');
         try w.flush();
     }
 
-    /// Reply sink: test override or child stdin. Rejects closed stdin to avoid
-    /// writing to a recycled descriptor. Caller holds `write_mutex`.
+    // Caller holds `write_mutex`; test overrides bypass the stdin guard.
     fn replyWriter(client: *Client) WriteError!*Io.Writer {
         if (builtin.is_test) {
             if (client.reply_override) |w| return w;
@@ -591,7 +547,7 @@ pub const Client = struct {
         return &client.stdin_writer.interface;
     }
 
-    /// Renders every control reply into a fixed frame budget before writing.
+    // Render before writing to enforce the complete frame budget.
     fn writeLine(client: *Client, comptime f: anytype, args: anytype) WriteError!void {
         var buffer: [max_reply_line_bytes]u8 = undefined;
         const line = renderLine(&buffer, f, args) catch {
@@ -601,7 +557,7 @@ pub const Client = struct {
         try client.writeRendered(line);
     }
 
-    /// Startup and outbound requests have a write deadline, without a reply cap.
+    // Outbound requests use the write deadline but not the control-reply cap.
     fn writeLineLocked(client: *Client, comptime f: anytype, args: anytype) WriteError!void {
         const w = try client.replyWriter();
         var js: std.json.Stringify = .{ .writer = w };
@@ -680,8 +636,7 @@ pub const Client = struct {
         try client.writeLine(protocol.writePermissionDeny, .{ request_id, message });
     }
 
-    /// The body and enclosing frame share a fixed upper bound. Oversized
-    /// bodies use a method-appropriate fallback through the same frame guard.
+    // Fallbacks must obey the same complete-frame bound as successful replies.
     fn sendMcpResultBody(
         client: *Client,
         request_id: []const u8,
@@ -745,8 +700,7 @@ pub const Client = struct {
     // --- control dispatch ---
 
     fn serveControlRequest(client: *Client, root: std.json.Value) (WriteError || Allocator.Error)!void {
-        // Accept current top-level and legacy nested ids, including integer
-        // ids.
+        // Accept top-level and legacy nested IDs, including integers.
         const request = objectField(root, "request");
         var id_buf: [request_id_buf_len]u8 = undefined;
         const request_id = requestId(root, &id_buf) orelse
@@ -754,8 +708,7 @@ pub const Client = struct {
             // No usable id: a reply cannot be correlated.
             return;
 
-        // Every request with a usable id must receive a reply to avoid CLI
-        // timeouts.
+        // Correlatable requests need a reply, including malformed requests.
         const req = request orelse
             return client.sendControlError(request_id, "missing request body");
         const subtype = stringField(req, "subtype") orelse
@@ -796,8 +749,7 @@ pub const Client = struct {
         }
 
         if (std.mem.startsWith(u8, method, "notifications/")) {
-            // The enclosing control request still needs an MCP reply. The CLI
-            // expects an empty result with id 0 for notifications.
+            // The CLI requires an empty MCP result with ID 0 for notifications.
             return client.sendMcpResult(request_id, .{ .integer = 0 }, "{}");
         }
 
@@ -821,11 +773,8 @@ pub const Client = struct {
             const tool = server.findTool(tool_name) orelse
                 return client.sendMcpError(request_id, message_id, -32601, "unknown tool");
 
-            // Handler errors become tool failures; propagate host allocation
-            // failures.
             const call = tool.handler(tool.context, client.scratch.allocator(), arguments) catch |err| switch (err) {
-                // Attempt a reply before propagating OOM so the CLI can stop
-                // waiting.
+                // Unblock the CLI before propagating host OOM.
                 error.OutOfMemory => {
                     client.sendMcpError(request_id, message_id, -32603, "out of memory") catch {};
                     return error.OutOfMemory;
@@ -833,8 +782,6 @@ pub const Client = struct {
                 else => ToolResult{ .text = @errorName(err), .is_error = true },
             };
 
-            // Reject oversized text before rendering; see
-            // `max_tool_result_bytes`.
             if (call.text.len > max_tool_result_bytes) {
                 return client.sendMcpResultBody(request_id, message_id, method, protocol.results.toolCall, .{
                     ToolResult{ .text = tool_result_too_long_message, .is_error = true },
@@ -852,7 +799,6 @@ pub const Client = struct {
         return client.sendMcpError(request_id, message_id, -32601, "unsupported mcp method");
     }
 
-    /// Dispatches `can_use_tool`; rejects requests if no handler is installed.
     fn servePermissionRequest(
         client: *Client,
         request_id: []const u8,
@@ -862,7 +808,6 @@ pub const Client = struct {
             return client.sendControlError(request_id, "unsupported control request");
         const tool_name = stringField(req, "tool_name") orelse
             return client.sendControlError(request_id, "missing tool_name");
-        // Missing input is valid for input-free tools; pass JSON null.
         const input = objectField(req, "input") orelse std.json.Value{ .null = {} };
 
         client.resetScratch();
@@ -878,14 +823,12 @@ pub const Client = struct {
         return client.sendPermissionDecision(request_id, input, decision);
     }
 
-    /// Reset before dispatch so handler data and rendered replies survive until
-    /// written. Retain at most `retain_bytes` between dispatches.
+    // Reset between dispatches, after handler data has been written.
     fn resetScratch(client: *Client) void {
         _ = client.scratch.reset(.{ .retain_with_limit = retain_bytes });
     }
 
-    /// Matches responses to pending client requests and reports rejections.
-    /// Unrecognized ids and successful replies produce no event.
+    // Ignore unknown IDs; only correlated rejections surface to the caller.
     fn noteControlResponse(client: *Client, root: std.json.Value) ReadError!void {
         const response = objectField(root, "response") orelse return;
         const request_id = stringField(response, "request_id") orelse return;
@@ -912,7 +855,7 @@ pub const Client = struct {
         }
         if (!rejected) return;
 
-        // Copy the error text before the caller frees the event.
+        // Retain rejection text beyond the event's lifetime.
         const text = stringField(response, "error") orelse "(no error text)";
         const copy = try client.gpa.dupe(u8, text);
         if (client.control_error) |old| client.gpa.free(old);
@@ -928,10 +871,8 @@ pub const Client = struct {
         return client.stdout_closed;
     }
 
-    /// The raw line, valid until the next call.
     fn nextLine(client: *Client) ReadError!?[]const u8 {
-        // Release large buffers on the next read, preserving `lastLine` until
-        // then.
+        // Preserve `lastLine` until the next read before releasing large buffers.
         if (client.line.writer.buffer.len > retain_bytes) {
             client.line.deinit();
             client.line = .init(client.gpa);
@@ -952,11 +893,10 @@ fn forceCleanup(child: *std.process.Child, io: Io) void {
     }
 }
 
-/// Decimal i64 width, including the sign.
+// Decimal i64 width, including sign.
 const request_id_buf_len = 20;
 
-/// Returns string ids directly and renders integer ids into `buf`. Missing and
-/// unsupported id types return null.
+// Borrow string IDs; render integer IDs into `buf`.
 fn requestId(value: std.json.Value, buf: []u8) ?[]const u8 {
     return switch (objectField(value, "request_id") orelse return null) {
         .string => |s| s,
@@ -965,7 +905,7 @@ fn requestId(value: std.json.Value, buf: []u8) ?[]const u8 {
     };
 }
 
-/// The N of a `zig_N` id this client minted, or null for any other string.
+// Accept only canonical `zig_N` spellings emitted by this client.
 fn ownRequestNumber(request_id: []const u8) ?u64 {
     const prefix = "zig_";
     if (!std.mem.startsWith(u8, request_id, prefix)) return null;
@@ -975,7 +915,7 @@ fn ownRequestNumber(request_id: []const u8) ?u64 {
     return std.fmt.parseInt(u64, number, 10) catch null;
 }
 
-/// Keeps reserialized CLI values below Stringify's fixed nesting capacity.
+// Keep CLI values below Stringify's fixed nesting capacity.
 fn jsonDepthWithin(text: []const u8) bool {
     var depth: usize = 0;
     var cursor: usize = 0;
@@ -1004,16 +944,13 @@ fn jsonDepthWithin(text: []const u8) bool {
     return true;
 }
 
-/// Validates JSON and requires an object; the allocator backs the scanner
-/// nesting stack.
 fn isJsonObject(allocator: Allocator, text: []const u8) Allocator.Error!bool {
     const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (trimmed.len == 0 or trimmed[0] != '{' or !jsonDepthWithin(trimmed)) return false;
     return std.json.validate(allocator, trimmed);
 }
 
-/// Streams `/name arguments` into a user-message JSON string without an
-/// intermediate buffer. Separate from `Client` for escaping tests.
+// Escape command fragments directly into the user-message string.
 fn writeCommandMessage(w: *Io.Writer, name: []const u8, arguments: []const u8) WriteError!void {
     var js: std.json.Stringify = .{ .writer = w };
     try js.beginObject();
@@ -1045,26 +982,21 @@ fn writeCommandMessage(w: *Io.Writer, name: []const u8, arguments: []const u8) W
     try js.endObject();
 }
 
-/// Reads a newline-delimited line; separate from `Client` for resync tests.
 fn readLine(
     r: *Io.Reader,
     line: *Io.Writer.Allocating,
     max_line_bytes: usize,
 ) ReadError!?[]const u8 {
     line.clearRetainingCapacity();
-    // Reserve one byte to detect the delimiter after an exactly-N-byte payload.
-    // Saturate so maxInt remains unlimited instead of wrapping to zero.
+    // Include the delimiter; saturate so maxInt remains unlimited.
     _ = r.streamDelimiterLimit(
         &line.writer,
         '\n',
         .limited(max_line_bytes +| 1),
     ) catch |err| switch (err) {
-        // Discard the oversized tail through the newline to resync the next
-        // read.
+        // Discard only this line's tail to preserve stream alignment.
         error.StreamTooLong => {
             _ = r.discardDelimiterInclusive('\n') catch |discard_err| switch (discard_err) {
-                // EOF inside the oversized line; the next call will also report
-                // EOF.
                 error.EndOfStream => {},
                 error.ReadFailed => return error.ReadFailed,
             };
@@ -1074,8 +1006,7 @@ fn readLine(
         error.ReadFailed => return error.ReadFailed,
     };
 
-    // `streamDelimiterLimit` leaves the delimiter buffered; an empty buffer is
-    // EOF.
+    // `streamDelimiterLimit` leaves the delimiter buffered.
     if (r.bufferedLen() == 0) {
         const written = line.written();
         return if (written.len == 0) null else written;
@@ -1086,17 +1017,14 @@ fn readLine(
 
 // --- tests ---
 
-// Tests use private read, write, and dispatch helpers plus `reply_override`.
-// Public API coverage lives in tests/client_test.zig.
+// Private read, write, dispatch, and adapter tests; public tests live in tests/.
 
-/// Expected `readLine` outcome: line, EOF, or error.
 const Expected = union(enum) {
     line: []const u8,
     end,
     fails: ReadError,
 };
 
-/// Drives `readLine` over a fixed buffer.
 fn expectLines(input: []const u8, max_line_bytes: usize, expected: []const Expected) !void {
     var r: Io.Reader = .fixed(input);
     var line: Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1135,7 +1063,6 @@ test "an oversized line at end of stream still terminates" {
 }
 
 test "a line of exactly max_line_bytes is accepted" {
-    // Exactly N payload bytes must fit alongside the delimiter.
     try expectLines(
         "12345678\n{\"b\":2}\n",
         8,
@@ -1144,7 +1071,6 @@ test "a line of exactly max_line_bytes is accepted" {
 }
 
 test "a line one byte over max_line_bytes is still rejected" {
-    // N+1 bytes must fail without losing the following line.
     try expectLines(
         "123456789\n{\"b\":2}\n",
         8,
@@ -1157,7 +1083,6 @@ test "an exactly-max line without a trailing newline is accepted" {
 }
 
 test "a max_line_bytes of maxInt does not wrap to a zero budget" {
-    // Saturating addition must keep maxInt unlimited.
     try expectLines(
         "{\"a\":1}\n",
         std.math.maxInt(usize),
@@ -1182,13 +1107,11 @@ test "a trailing line without a newline is still returned" {
 }
 
 test "the line buffer keeps what readLine last produced" {
-    // Preserve `lastLine` diagnostics for oversized lines and invalid JSON.
     var r: Io.Reader = .fixed("xxxxxxxxxxxxxxxxxxxx\nnot json\n");
     var line: Io.Writer.Allocating = .init(std.testing.allocator);
     defer line.deinit();
 
     try std.testing.expectError(error.ProtocolTooLong, readLine(&r, &line, 8));
-    // The N+1 read budget retains nine bytes.
     try std.testing.expectEqualStrings("xxxxxxxxx", line.written());
 
     try std.testing.expectEqualStrings("not json", (try readLine(&r, &line, 8)).?);
@@ -1213,7 +1136,6 @@ test "sendCommand builds the command turn without a temporary buffer" {
     try std.testing.expectEqualStrings("user", stringField(message, "role").?);
     const content = objectField(message, "content").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), content.len);
-    // Argument quotes must survive as JSON string data.
     try std.testing.expectEqualStrings(
         "/code-review src/ \"quoted\"",
         stringField(content[0], "text").?,
@@ -1237,7 +1159,7 @@ test "sendCommand omits the separator when there are no arguments" {
     try std.testing.expectEqualStrings("/compact", stringField(content[0], "text").?);
 }
 
-/// Dispatch-only client fixture; writes replies to `out` without a child.
+// Dispatch fixture using `out` instead of a child.
 fn dispatchFixture(out: *Io.Writer.Allocating, servers: []const McpServer) Client {
     var client: Client = undefined;
     client.io = std.testing.io;
@@ -1259,7 +1181,6 @@ fn dispatchFixture(out: *Io.Writer.Allocating, servers: []const McpServer) Clien
     return client;
 }
 
-/// Dispatches one control request and returns its reply.
 fn dispatch(out: *Io.Writer.Allocating, servers: []const McpServer, line: []const u8) !void {
     var client = dispatchFixture(out, servers);
     defer client.scratch.deinit();
@@ -1274,7 +1195,6 @@ fn dispatch(out: *Io.Writer.Allocating, servers: []const McpServer, line: []cons
     try client.serveControlRequest(parsed.value);
 }
 
-/// Parses exactly one newline-terminated JSON reply.
 fn parseReply(out: *Io.Writer.Allocating) !std.json.Parsed(std.json.Value) {
     const written = out.written();
     try std.testing.expect(written.len > 0);
@@ -1284,21 +1204,15 @@ fn parseReply(out: *Io.Writer.Allocating) !std.json.Parsed(std.json.Value) {
 }
 
 test "every malformed control request that can be answered is answered" {
-    // Malformed and unsupported requests must receive an error response.
     const cases = [_][]const u8{
-        // No `request` object at all, but the id is at the top level.
         \\{"type":"control_request","request_id":"r1"}
         ,
-        // A request body with no subtype to dispatch on.
         \\{"type":"control_request","request_id":"r2","request":{}}
         ,
-        // A permission prompt with no handler installed to answer it.
         \\{"type":"control_request","request_id":"r3","request":{"subtype":"can_use_tool"}}
         ,
-        // Older shape: the id is nested inside `request` rather than beside it.
         \\{"type":"control_request","request":{"request_id":"r4"}}
         ,
-        // A subtype this client does not implement at all.
         \\{"type":"control_request","request_id":"r5","request":{"subtype":"hook_callback"}}
         ,
     };
@@ -1319,7 +1233,6 @@ test "every malformed control request that can be answered is answered" {
 }
 
 test "a control request with no id is the only silent path" {
-    // Without a usable id, the CLI cannot correlate a reply.
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try dispatch(&out, &.{},
@@ -1339,7 +1252,6 @@ test "an mcp request against an unknown server gets a jsonrpc error" {
 }
 
 test "a numeric request_id is answered, not treated as missing" {
-    // Cover integer ids in both current and legacy placements.
     const cases = [_][]const u8{
         \\{"type":"control_request","request_id":7,"request":{"subtype":"hook_callback"}}
         ,
@@ -1356,7 +1268,6 @@ test "a numeric request_id is answered, not treated as missing" {
 }
 
 test "a negative numeric request_id round-trips through the buffer" {
-    // Include the sign when sizing the buffer for the widest i64.
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try dispatch(&out, &.{},
@@ -1369,12 +1280,11 @@ test "a negative numeric request_id round-trips through the buffer" {
     ) != null);
 }
 
-/// A handler that is never called: the handshake tests only list tools.
+// Handshake fixtures list tools without calling them.
 fn unreachableHandler(_: ?*anyopaque, _: Allocator, _: std.json.Value) anyerror!ToolResult {
     return error.NotCalled;
 }
 
-/// Handshake fixture with two tools, including a non-default schema.
 const handshake_tools = [_]tool_mod.Tool{
     .{ .name = "add", .description = "Add.", .handler = unreachableHandler },
     .{
@@ -1386,7 +1296,6 @@ const handshake_tools = [_]tool_mod.Tool{
 };
 const handshake_server: McpServer = .{ .name = "host", .version = "3.2.1", .tools = &handshake_tools };
 
-/// Extracts the `mcp_response.result` payload.
 fn mcpResult(root: std.json.Value) ?std.json.Value {
     const response = objectField(root, "response") orelse return null;
     const inner = objectField(response, "response") orelse return null;
@@ -1395,7 +1304,6 @@ fn mcpResult(root: std.json.Value) ?std.json.Value {
 }
 
 test "initialize echoes the offered protocol version through the dispatch" {
-    // Verify dispatch forwards `params.protocolVersion` to the renderer.
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try dispatch(&out, &.{handshake_server},
@@ -1414,7 +1322,6 @@ test "initialize echoes the offered protocol version through the dispatch" {
 }
 
 test "initialize falls back to the default protocol version" {
-    // Cover missing protocolVersion and missing params.
     const cases = [_][]const u8{
         \\{"type":"control_request","request_id":"h2","request":{"subtype":"mcp_message","server_name":"host","message":{"id":0,"method":"initialize","params":{"capabilities":{}}}}}
         ,
@@ -1435,7 +1342,6 @@ test "initialize falls back to the default protocol version" {
 }
 
 test "a notification is answered with an empty result under id 0" {
-    // Notifications still require a control reply with MCP id 0.
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try dispatch(&out, &.{handshake_server},
@@ -1464,13 +1370,11 @@ test "tools/list carries every tool name and splices the schemas" {
     try std.testing.expectEqual(@as(usize, 2), tools.len);
     try std.testing.expectEqualStrings("add", stringField(tools[0], "name").?);
     try std.testing.expectEqualStrings("env", stringField(tools[1], "name").?);
-    // The schema must remain a JSON object.
     const schema = objectField(tools[1], "inputSchema").?;
     try std.testing.expectEqualStrings("object", stringField(schema, "type").?);
     try std.testing.expect(objectField(objectField(schema, "properties").?, "name") != null);
 }
 
-/// A handler returning `size` bytes of filler, used to drive the reply bound.
 fn oversizedHandler(context: ?*anyopaque, arena: Allocator, arguments: std.json.Value) anyerror!ToolResult {
     _ = arguments;
     const size: *const usize = @ptrCast(@alignCast(context.?));
@@ -1479,7 +1383,6 @@ fn oversizedHandler(context: ?*anyopaque, arena: Allocator, arguments: std.json.
     return .{ .text = text };
 }
 
-/// Runs one `tools/call` against a handler returning `size` bytes.
 fn dispatchToolCall(out: *Io.Writer.Allocating, size: *const usize) !void {
     const server: McpServer = .{
         .name = "s",
@@ -1500,7 +1403,6 @@ test "an oversized tool result is replaced rather than written to the pipe" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "tool result too long") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"isError\":true") != null);
 
-    // Bound the full reply, including its envelope.
     try std.testing.expect(out.written().len < 4096);
 }
 
@@ -1525,7 +1427,6 @@ test "a tool result of exactly the cap is still delivered" {
 }
 
 test "the bound is measured on the whole line, envelope included" {
-    // Quotes double in JSON, pushing valid raw text beyond the reply limit.
     const server: McpServer = .{
         .name = "s",
         .tools = &.{.{ .name = "t", .description = "d", .handler = quoteHandler }},
@@ -1539,14 +1440,14 @@ test "the bound is measured on the whole line, envelope included" {
     try std.testing.expect(out.written().len <= max_reply_line_bytes);
 }
 
-/// A result of exactly the cap that doubles when escaped.
+// Escaping doubles an otherwise boundary-sized result.
 fn quoteHandler(_: ?*anyopaque, arena: Allocator, _: std.json.Value) anyerror!ToolResult {
     const text = try arena.alloc(u8, max_tool_result_bytes);
     @memset(text, '"');
     return .{ .text = text };
 }
 
-/// Valid 1 KiB schemas that push tools/list past the reply limit.
+// Valid schemas deliberately overflow the tools/list reply.
 const wide_schema = "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\",\"description\":\"" ++
     @as([960]u8, @splat('x')) ++ "\"}}}";
 const many_tools = blk: {
@@ -1563,7 +1464,6 @@ const many_tools = blk: {
 };
 
 test "an oversized tools/list gets a jsonrpc error, not a toolCall body" {
-    // tools/list failures require a JSON-RPC error, not a tool-call body.
     const server: McpServer = .{ .name = "host", .tools = &many_tools };
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -1582,7 +1482,6 @@ test "an oversized tools/list gets a jsonrpc error, not a toolCall body" {
 }
 
 test "an oversized initialize gets a jsonrpc error too" {
-    // Inflate the server name to exceed the initialize reply limit.
     const server: McpServer = .{ .name = &@as([max_reply_line_bytes + 1]u8, @splat('n')) };
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -1597,13 +1496,11 @@ test "an oversized initialize gets a jsonrpc error too" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"content\"") == null);
 }
 
-/// Simulates a host allocation failure.
 fn oomHandler(_: ?*anyopaque, _: Allocator, _: std.json.Value) anyerror!ToolResult {
     return error.OutOfMemory;
 }
 
 test "a handler that runs out of memory still answers the CLI" {
-    // OOM must reach the caller after an error reply is sent to the CLI.
     const server: McpServer = .{
         .name = "s",
         .tools = &.{.{ .name = "t", .description = "d", .handler = oomHandler }},
@@ -1626,8 +1523,7 @@ test "a handler that runs out of memory still answers the CLI" {
 
 // --- permission prompts ---
 
-/// Records handler input and the configured decision. Copy request data because
-/// its arena is freed before assertions run.
+// Copy handler input because the dispatch arena is freed before assertions.
 const PermissionProbe = struct {
     decision: PermissionDecision,
     fail: bool = false,
@@ -1657,13 +1553,11 @@ fn probeHandler(context: ?*anyopaque, arena: Allocator, tool_name: []const u8, i
         probe.command_len = @min(c.len, probe.command_buf.len);
         @memcpy(probe.command_buf[0..probe.command_len], c[0..probe.command_len]);
     }
-    // Exercise arena allocation for handler replies.
     _ = try arena.alloc(u8, 1);
     if (probe.fail) return error.HostRefused;
     return probe.decision;
 }
 
-/// Runs one `can_use_tool` through the dispatch with `probe` installed.
 fn dispatchPermission(out: *Io.Writer.Allocating, probe: *PermissionProbe, line: []const u8) !void {
     var client = dispatchFixture(out, &.{});
     defer client.scratch.deinit();
@@ -1679,7 +1573,6 @@ const bash_prompt =
     \\{"type":"control_request","request_id":"p1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls -la","timeout":5}}}
 ;
 
-/// The `response.response` object of a permission reply.
 fn permissionReply(root: std.json.Value) ?std.json.Value {
     const response = objectField(root, "response") orelse return null;
     return objectField(response, "response");
@@ -1700,7 +1593,6 @@ test "a permission allow echoes the proposed input back" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"request_id\":\"p1\"") != null);
     const reply = permissionReply(parsed.value).?;
     try std.testing.expectEqualStrings("allow", stringField(reply, "behavior").?);
-    // The CLI requires updatedInput even when unchanged.
     const updated = objectField(reply, "updatedInput").?;
     try std.testing.expectEqualStrings("ls -la", stringField(updated, "command").?);
     try std.testing.expectEqual(@as(i64, 5), objectField(updated, "timeout").?.integer);
@@ -1718,12 +1610,10 @@ test "a permission allow_with_input replaces the input" {
     try std.testing.expectEqualStrings("allow", stringField(reply, "behavior").?);
     const updated = objectField(reply, "updatedInput").?;
     try std.testing.expectEqualStrings("ls", stringField(updated, "command").?);
-    // Replacement input must not merge with the original.
     try std.testing.expect(objectField(updated, "timeout") == null);
 }
 
 test "a permission allow_with_input that is not an object becomes a deny" {
-    // Reject non-objects and malformed JSON before raw splicing.
     for ([_][]const u8{ "\"ls\"", "{\"command\":", "[]" }) |raw| {
         var probe: PermissionProbe = .{ .decision = .{ .allow_with_input = raw } };
         var out: Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1766,7 +1656,6 @@ test "a permission handler error becomes a deny naming the error" {
 }
 
 test "a permission prompt without a tool_name is answered with an error" {
-    // Malformed requests still need a reply.
     var probe: PermissionProbe = .{ .decision = .allow };
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -1792,7 +1681,6 @@ test "a permission prompt without input hands the handler null" {
 }
 
 test "an oversized permission reply becomes a deny that says why" {
-    // Echoed input is subject to the same rendered-line limit as tool results.
     const big = "{\"command\":\"" ++ @as([max_reply_line_bytes + 1]u8, @splat('y')) ++ "\"}";
     var probe: PermissionProbe = .{ .decision = .{ .allow_with_input = big } };
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1810,7 +1698,6 @@ test "an oversized permission reply becomes a deny that says why" {
 
 // --- control responses ---
 
-/// A client with just the fields `noteControlResponse` touches.
 fn responseFixture() Client {
     var client: Client = undefined;
     client.io = std.testing.io;
@@ -1846,7 +1733,6 @@ test "an error response to this client's own request is reported" {
     try std.testing.expectEqualStrings("sdkMcpServers rejected", client.lastControlError().?);
     try std.testing.expectEqual(@as(usize, 0), client.pending_len);
 
-    // Replacing error text must free the previous allocation.
     _ = try client.nextRequestId(&buf);
     try std.testing.expectError(error.ControlRequestRejected, noteResponse(&client,
         \\{"type":"control_response","response":{"subtype":"error","request_id":"zig_2"}}
@@ -1866,7 +1752,6 @@ test "a success response is consumed silently" {
 }
 
 test "responses to ids this client never sent are left alone" {
-    // Ignore errors for requests this client did not send.
     var client = responseFixture();
     var buf: [32]u8 = undefined;
     _ = try client.nextRequestId(&buf);
@@ -1969,7 +1854,6 @@ test "the pending list rejects overflow without discarding accepted requests" {
 
 // --- live child ---
 
-/// CLI shell stub spawned through `Client.open`.
 const StubChild = struct {
     dir: std.testing.TmpDir,
     path: [:0]u8,
@@ -2002,8 +1886,6 @@ const StubChild = struct {
 };
 
 test "open takes the stdout descriptor out of the Child" {
-    // The client must own stdout across reaping so concurrent reads cannot use
-    // a descriptor closed by `Child.wait`.
     var stub = try StubChild.init("#!/bin/sh\nexit 0\n");
     defer stub.deinit();
 
@@ -2011,12 +1893,10 @@ test "open takes the stdout descriptor out of the Child" {
     defer _ = client.close();
 
     try std.testing.expect(client.child.stdout == null);
-    // stdin stays with the `Child` until `closeStdin` takes it.
     try std.testing.expect(client.child.stdin != null);
 }
 
 test "open rejects a zero max_line_bytes instead of failing forever" {
-    // Reject zero before allocating or spawning.
     var threaded: Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     try std.testing.expectError(error.InvalidMaxLineBytes, Client.open(
@@ -2043,7 +1923,6 @@ test "open rejects a tool schema that is not a JSON object before spawning" {
         ));
     }
 
-    // Leading whitespace is still an object.
     const tools = [_]tool_mod.Tool{.{ .name = "t", .description = "d", .input_schema = "  {}", .handler = unreachableHandler }};
     const servers = [_]McpServer{.{ .name = "s", .tools = &tools }};
     try std.testing.expectError(error.FileNotFound, Client.open(
@@ -2054,7 +1933,6 @@ test "open rejects a tool schema that is not a JSON object before spawning" {
 }
 
 test "killed pairs with term rather than replacing it" {
-    // `killed` records the signal; `term` retains the observed exit status.
     var client: Client = undefined;
     client.io = std.testing.io;
     client.write_mutex = .init;
@@ -2072,8 +1950,6 @@ test "killed pairs with term rather than replacing it" {
 }
 
 test "kill still runs after a failed reap" {
-    // Simulate a prior wait failure with a live child handle. `kill` must still
-    // signal and reap; `wait_error` alone must not disable cleanup.
     var stub = try StubChild.init("#!/bin/sh\ntrap '' PIPE\nsleep 3\nexit 0\n");
     defer stub.deinit();
 
@@ -2088,7 +1964,6 @@ test "kill still runs after a failed reap" {
 }
 
 test "a rejected initialize surfaces from next with the CLI's text" {
-    // Reject initialize, then emit more lines to verify reading can continue.
     var stub = try StubChild.init(
         "#!/bin/sh\n" ++
             "trap '' PIPE\n" ++
@@ -2119,8 +1994,6 @@ test "a rejected initialize surfaces from next with the CLI's text" {
 }
 
 test "a control request arriving after closeStdin is refused, not written blind" {
-    // Exercise the closed-stdin guard without `reply_override`, which bypasses
-    // it.
     var client: Client = undefined;
     client.io = std.testing.io;
     client.write_mutex = .init;
@@ -2141,16 +2014,13 @@ test "a control request arriving after closeStdin is refused, not written blind"
 
     try std.testing.expectError(error.StdinClosed, client.serveControlRequest(parsed.value));
 
-    // Preserve `StdinClosed` through `next` instead of collapsing to
-    // WriteFailed.
     const e: ReadError = error.StdinClosed;
     try std.testing.expectEqual(ReadError.StdinClosed, e);
 }
 
 // --- fuzz ---
 
-// Fuzz private line reading and dispatch for panics and unbounded loops. `zig
-// build test` runs the corpus; `zig build test --fuzz` generates inputs.
+// Fuzz private line reading and dispatch; normal tests run the seed corpus.
 
 fn fuzzReadLine(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [1024]u8 = undefined;
@@ -2162,8 +2032,7 @@ fn fuzzReadLine(_: void, smith: *std.testing.Smith) anyerror!void {
     var line: Io.Writer.Allocating = .init(std.testing.allocator);
     defer line.deinit();
 
-    // Each call must consume input or reach EOF; bound calls to catch resync
-    // loops.
+    // Bound read attempts to detect resynchronization loops.
     var calls: usize = 0;
     while (true) : (calls += 1) {
         if (calls > input.len + 1) return error.ReadLineDidNotAdvance;

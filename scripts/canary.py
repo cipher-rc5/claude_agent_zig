@@ -47,8 +47,7 @@ def check(root: Path, binary: str, strict: bool):
     mode_help = re.search(r"--permission-mode[\s\S]{0,1000}", help_text)
     if mode_help is None or any(f'"{mode}"' not in mode_help[0] for mode in modes):
         raise ValueError("--permission-mode choices differ from PermissionMode.cliName")
-    # Every probe must identify our sentinel as an unknown option. A crash,
-    # credential error, or a rejected preceding flag cannot count as acceptance.
+    # Require sentinel rejection to distinguish flag acceptance from unrelated failures.
     for flags in ([], ["--max-turns", "3"], ["--permission-prompt-tool", "stdio"]):
         code, output = run([binary, "--print", *flags, SENTINEL], timeout=15, cwd=root)
         diagnostic = re.search(r"unknown (?:option|argument)[^\n]*" + re.escape(SENTINEL), output, re.I)

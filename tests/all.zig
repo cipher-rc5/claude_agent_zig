@@ -1,6 +1,5 @@
 // tests/all.zig
-// Test root for the public API suite. Add each test file with `_ =
-// @import(...)`; unused imports do not run tests.
+// Public test root; reference every test module so its tests run.
 
 test {
     _ = @import("client_test.zig");

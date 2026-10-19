@@ -148,8 +148,7 @@ pub fn pollChild(child: *std.process.Child) std.process.Child.WaitError!?std.pro
                 return if (posix.W.IFEXITED(bits)) .{ .exited = posix.W.EXITSTATUS(bits) } else if (posix.W.IFSIGNALED(bits)) .{ .signal = posix.W.TERMSIG(bits) } else if (posix.W.IFSTOPPED(bits)) .{ .stopped = posix.W.STOPSIG(bits) } else .{ .unknown = bits };
             },
             .INTR => continue,
-            // ECHILD means another host reaper consumed this child. Never signal
-            // that numeric pid again.
+            // Another reaper consumed the child; never signal this PID again.
             .CHILD => {
                 child.id = null;
                 return error.Unexpected;
@@ -161,6 +160,8 @@ pub fn pollChild(child: *std.process.Child) std.process.Child.WaitError!?std.pro
 }
 
 // --- tests ---
+
+// `Reader`, `Writer`, and pipe helpers are internal to this module.
 
 fn testPipe() ![2]Io.File {
     var fds: [2]posix.fd_t = undefined;

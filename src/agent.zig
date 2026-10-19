@@ -29,8 +29,7 @@ pub const Status = client.Status;
 pub const InitializationState = client.InitializationState;
 pub const max_reply_line_bytes = client.max_reply_line_bytes;
 
-/// Child exit status and wait error types used by `Client.wait` and
-/// `Client.close`.
+/// Child exit status returned by `wait` and `close`.
 pub const Term = @import("std").process.Child.Term;
 pub const WaitError = @import("std").process.Child.WaitError;
 

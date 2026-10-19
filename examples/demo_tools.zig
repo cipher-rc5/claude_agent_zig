@@ -4,8 +4,7 @@
 const std = @import("std");
 const agent = @import("agent");
 
-/// Environment variables exposed by `host_env`. Keep an explicit allowlist to
-/// prevent model-supplied names from exposing inherited credentials.
+// Allowlist prevents model-selected names from exposing inherited credentials.
 const readable_env = [_][]const u8{
     "HOME",
     "LANG",
@@ -16,7 +15,6 @@ const readable_env = [_][]const u8{
     "USER",
 };
 
-/// Reads an allowlisted environment variable from the context map.
 fn hostEnv(context: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
     const environ: *const std.process.Environ.Map = @ptrCast(@alignCast(context.?));
     const obj = switch (arguments) {
@@ -42,9 +40,7 @@ fn isReadable(name: []const u8) bool {
     return false;
 }
 
-/// Adds operands with exact i64 arithmetic when both are integers. Decimal
-/// strings preserve integers above 2^53 through CLI serialization; numeric JSON
-/// inputs are also accepted. Rejects non-decimal and out-of-range input.
+// Integer pairs use exact i64 arithmetic; decimal strings avoid CLI rounding above 2^53.
 fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Value) !agent.ToolResult {
     const obj = switch (arguments) {
         .object => |o| o,
@@ -76,15 +72,14 @@ fn addNumbers(_: ?*anyopaque, arena: std.mem.Allocator, arguments: std.json.Valu
     return .{ .text = try std.fmt.allocPrint(arena, "{d}", .{sum}) };
 }
 
-/// Keep integer range errors distinct so overflow never falls back to floats.
+// Distinguish integer overflow so it never falls back to floats.
 const Operand = union(enum) {
     integer: i64,
     float: f128,
     out_of_range,
     invalid,
 
-    /// Widens a validated operand for mixed arithmetic. Explicit rejected
-    /// variants keep this switch exhaustive when variants are added.
+    // Explicit rejected variants keep this exhaustive.
     fn wide(self: Operand) f128 {
         return switch (self) {
             .integer => |i| @floatFromInt(i),
@@ -94,7 +89,6 @@ const Operand = union(enum) {
     }
 };
 
-/// Classifies a JSON number or decimal string.
 fn operandOf(value: std.json.Value) Operand {
     return switch (value) {
         .integer => |i| .{ .integer = i },
@@ -104,15 +98,13 @@ fn operandOf(value: std.json.Value) Operand {
     };
 }
 
-/// Validate decimal syntax before parsing; `parseFloat` also accepts
-/// non-decimal forms, digit separators, and non-finite values.
+// `parseFloat` also accepts non-decimal and non-finite input; validate first.
 fn parseDecimal(s: []const u8) Operand {
     if (!isDecimal(s)) return .invalid;
     if (std.fmt.parseInt(i64, s, 10)) |i| {
         return .{ .integer = i };
     } else |err| switch (err) {
-        // Do not retry an overflowing integer as a float; it would lose
-        // precision.
+        // Float fallback would silently lose integer precision.
         error.Overflow => return .out_of_range,
         error.InvalidCharacter => {},
     }
@@ -120,14 +112,12 @@ fn parseDecimal(s: []const u8) Operand {
     return if (inF64Range(f)) .{ .float = f } else .out_of_range;
 }
 
-/// Limit values to finite f64 range while retaining f128 precision for mixed
-/// arithmetic.
+// Preserve f128 precision for mixed arithmetic within finite f64 range.
 fn inF64Range(f: f128) bool {
     return std.math.isFinite(f) and @abs(f) <= std.math.floatMax(f64);
 }
 
-/// Decimal grammar: optional sign, at least one digit around an optional
-/// decimal point, and an optional exponent. Narrower than `parseFloat`.
+// Decimal grammar excludes the extensions accepted by `parseFloat`.
 fn isDecimal(s: []const u8) bool {
     var rest = s;
     if (rest.len > 0 and (rest[0] == '+' or rest[0] == '-')) rest = rest[1..];
@@ -153,16 +143,13 @@ fn isDecimal(s: []const u8) bool {
     return rest.len == 0;
 }
 
-/// The length of the leading run of ASCII digits.
 fn digitRun(s: []const u8) usize {
     var n: usize = 0;
     while (n < s.len and std.ascii.isDigit(s[n])) n += 1;
     return n;
 }
 
-/// Demo-only handler for `AGENT_PERMISSIONS=host`: logs to the stderr writer in
-/// `context` and allows every call. Production handlers should decide based on
-/// `tool_name` and `input`.
+// Demo-only: log to the stderr context and allow all calls; production must authorize.
 pub fn logAndAllow(
     context: ?*anyopaque,
     _: std.mem.Allocator,
@@ -184,16 +171,14 @@ pub fn build(environ: *const std.process.Environ.Map) [2]agent.Tool {
             .description = "Read one of a fixed set of non-secret environment " ++
                 "variables from the host process: HOME, LANG, PATH, PWD, SHELL, " ++
                 "TERM, USER. Any other name is refused.",
-            // Advertise the allowlist in the schema; the handler still enforces
-            // it.
+            // Schema hints do not replace handler enforcement.
             .input_schema =
             \\{"type":"object","properties":{"name":{"type":"string","enum":["HOME","LANG","PATH","PWD","SHELL","TERM","USER"]}},"required":["name"]}
             ,
             .handler = hostEnv,
             .context = @ptrCast(@constCast(environ)),
         },
-        // Decimal strings avoid CLI rounding for large integers, even when the
-        // alternative schema type would be `integer`.
+        // JSON integers can lose precision during CLI serialization.
         .{
             .name = "add",
             .description = "Add two numbers. Send each as a decimal string so " ++
@@ -234,7 +219,6 @@ test "decimal strings are the shape that survives the wire" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Decimal strings preserve integers above 2^53 through CLI serialization.
     const exact = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -266,7 +250,6 @@ test "an integer too large for i64 is reported, not answered as a float" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // i64::MAX + 1 must be a range error, not a float fallback.
     for ([_][]const u8{
         "{\"a\":\"9223372036854775808\",\"b\":\"1\"}",
         "{\"a\":\"99999999999999999999999999\",\"b\":\"1\"}",
@@ -283,7 +266,6 @@ test "each operand keeps its own exactness" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Mixed arithmetic must preserve the integer above 2^53.
     const mixed = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -308,7 +290,6 @@ test "the handler honours its own schema" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Reject syntax outside the decimal grammar, including inf, nan, and hex.
     for ([_][]const u8{
         "{\"a\":\"inf\",\"b\":\"1\"}",
         "{\"a\":\"-inf\",\"b\":\"1\"}",
@@ -352,7 +333,6 @@ test "integer addition stays exact past the f64 mantissa" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // 2^53 + 1 exposes precision loss from an f64 round trip.
     const big = try std.json.parseFromSlice(
         std.json.Value,
         a,
@@ -374,7 +354,6 @@ test "integer addition stays exact past the f64 mantissa" {
 }
 
 test "host_env answers only for the allowlisted names" {
-    // The pre-authorized host_env tool must never expose inherited credentials.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -401,7 +380,6 @@ test "host_env answers only for the allowlisted names" {
     try std.testing.expect(refused.is_error);
     try std.testing.expect(std.mem.indexOf(u8, refused.text, "sk-must-not-leak") == null);
 
-    // Unset allowlisted names must remain distinct from refused names.
     const unset = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"TERM\"}", .{});
     try std.testing.expectEqualStrings("not set", (try hostEnv(ctx, a, unset.value)).text);
     const absent = try std.json.parseFromSlice(std.json.Value, a, "{\"name\":\"NOPE\"}", .{});
@@ -412,7 +390,6 @@ test "host_env answers only for the allowlisted names" {
 }
 
 test "the permission hook logs the call and allows it" {
-    // Verify the demo log contains the tool name and JSON input.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -10,8 +10,7 @@ const default_lines: usize = 20_000;
 
 const delta_text = "The quick brown fox jumps over the lazy dog, and then keeps running for a while longer than expected.";
 
-// Counts successful backing allocations and growth; transcript/timing storage
-// belongs to the harness and is excluded.
+// Count SDK allocations/growth, excluding transcript and timing storage.
 const CountingAllocator = struct {
     child: std.mem.Allocator,
     allocated_bytes: usize = 0,
@@ -63,7 +62,7 @@ const CountingAllocator = struct {
     }
 };
 
-/// Temporary transcript and streaming stub; `deinit` removes both.
+// Temporary transcript and stub, removed by `deinit`.
 const Stub = struct {
     parent: std.Io.Dir,
     dir: std.Io.Dir,
@@ -122,8 +121,7 @@ const Stub = struct {
         try out.writeAll("{\"type\":\"result\",\"result\":\"done\"}\n");
         try dir.writeFile(io, .{ .sub_path = "transcript.jsonl", .data = transcript.written() });
 
-        // Drain control replies concurrently; result closes stdin and releases
-        // the drain process's inherited stdout descriptor.
+        // Drain replies concurrently; closing stdin releases the drain's stdout copy.
         const script =
             \\#!/bin/sh
             \\cat <&0 >/dev/null &
@@ -209,8 +207,7 @@ fn measure(init: std.process.Init, out: *std.Io.Writer, stub: *Stub, lines: usiz
         _ = client.close();
     };
 
-    // Consume the ready event before timing; process startup is not a latency
-    // sample. Every subsequent event retains its normal owned lifetime.
+    // Exclude startup; measured events include their normal ownership and cleanup.
     var ready = (try client.next()) orelse return error.MissingReadyEvent;
     ready.deinit();
     const bytes_before = counting.allocated_bytes;

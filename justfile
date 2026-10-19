@@ -1,10 +1,8 @@
 # justfile — task runner for claude_agent_zig
 # Run `just` with no arguments to list every recipe.
 
-# Path to the Claude Code CLI the agent spawns.
 export CLAUDE_BIN := env_var_or_default("CLAUDE_BIN", "claude")
-# Inherit AGENT_SKILLS unchanged: unset allows all skills, empty allows none.
-# Exporting an empty default here would disable skills for every demo run.
+# Preserve AGENT_SKILLS: unset allows all skills, empty allows none.
 
 default:
     @just --list
@@ -21,8 +19,7 @@ test:
 test-release:
     zig build test -Doptimize=ReleaseSafe --test-timeout 10s
 
-# Example: just dev "explain this repo"
-# Build and run one agent turn with an optional prompt.
+# Run one agent turn; e.g. just dev "explain this repo".
 dev prompt="What is 17 plus 25? Use the add tool.":
     zig build run -- {{quote(prompt)}}
 
@@ -111,9 +108,7 @@ ci-extended:
 # Release validation requires completed local checks and CLI parser probes.
 ci-full: ci-extended canary-strict
 
-# Schedule Monday 09:00 canary checks via launchd; print a cron entry elsewhere.
-# Capture PATH at installation so launchd can find just, zig, and claude.
-# Schedule weekly CLI compatibility checks.
+# Schedule Monday 09:00 canary checks; capture PATH for launchd.
 canary-schedule-install:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -184,8 +179,7 @@ canary-schedule-uninstall:
         echo "canary-schedule: nothing installed at $plist"
     fi
 
-# Prints the tag command; tagging, committing, and pushing remain manual.
-# Build a tarball, SBOM, checksums, and optional signature in dist/.
+# Build dist/ artifacts and print the tag command; publication remains manual.
 release version:
     @bash scripts/release.sh {{version}}
 

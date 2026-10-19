@@ -78,7 +78,6 @@ test "transport contract: a failed send releases a reader without termination" {
         if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 1_000) break;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
-    // Observe completion before cleanup can unblock the reader for us.
     try std.testing.expect(task.done.load(.acquire));
     try std.testing.expectEqual(error.TransportFailed, task.failure.?);
     try std.testing.expect(client.status().transport_failed);

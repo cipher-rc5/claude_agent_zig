@@ -1,5 +1,5 @@
 // src/options.zig
-// Session configuration, and the CLI flags it translates into.
+// Session options and CLI arguments.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -8,8 +8,7 @@ const tool_mod = @import("tool.zig");
 const McpServer = tool_mod.McpServer;
 const PermissionHandler = tool_mod.PermissionHandler;
 
-/// Oldest tested `claude` CLI version. `just canary` checks compatibility;
-/// `Client.open` skips version probing to avoid an extra process spawn.
+/// Oldest tested CLI; checked by `just canary`, not `Client.open`.
 pub const min_cli_version = "2.1.228";
 
 pub const PermissionMode = enum {
@@ -17,8 +16,7 @@ pub const PermissionMode = enum {
     auto,
     dont_ask,
     accept_edits,
-    /// Bypasses all permission checks and tool allowlists. Grants the agent the
-    /// host process's access; use only in an isolated environment.
+    /// Bypasses permissions and allowlists; grants host access. Isolate the environment.
     bypass_permissions,
     plan,
 
@@ -35,16 +33,13 @@ pub const PermissionMode = enum {
 };
 
 pub const Options = struct {
-    /// Path to the CLI, or a bare name resolved through PATH.
+    /// CLI path or name resolved through PATH.
     claude_path: []const u8 = "claude",
-    /// Working directory for the agent.
     cwd: std.process.Child.Cwd = .inherit,
-    /// Skips configuration discovery and background setup. Requires
-    /// ANTHROPIC_API_KEY in the child environment instead of a CLI login.
-    /// Built-in tools and `/skill-name` remain available; use `allowed_tools`,
-    /// `tools`, and `permission_mode` to restrict access.
+    /// Skips discovery and setup; requires ANTHROPIC_API_KEY instead of CLI login.
+    /// Tools and `/skill-name` remain available; configure access separately.
     bare: bool = false,
-    /// Emit `stream_event` deltas as tokens are produced.
+    /// Emits token deltas as `stream_event` messages.
     include_partial_messages: bool = true,
     model: ?[]const u8 = null,
     /// Permission rule syntax, for example `Read,Edit,Bash(git diff *)`.
@@ -53,60 +48,48 @@ pub const Options = struct {
     append_system_prompt: ?[]const u8 = null,
     /// Path to an MCP config file, or an inline JSON object.
     mcp_config: ?[]const u8 = null,
-    /// Built-in tools to expose, e.g. `Read,Edit,Bash,WebSearch`; null keeps
-    /// all. Include `Skill` to allow skill invocation.
+    /// Built-in tool list; null keeps all. Include `Skill` for skill invocation.
     tools: ?[]const u8 = null,
-    /// Settings sources: a comma list of `user`, `project`, and `local`. `user`
-    /// loads ~/.claude/skills/; `project` loads .claude/skills/ from cwd
-    /// through the repository root. Null uses the CLI default.
+    /// Comma-separated `user`, `project`, `local`; null uses CLI defaults.
+    /// `user` loads ~/.claude/skills/; `project` loads .claude/skills/ from cwd to repo root.
     setting_sources: ?[]const u8 = null,
-    /// Extra working directories. Each contributes its `.claude/skills/`, but
-    /// not its commands or agents.
+    /// Extra directories contribute `.claude/skills/`, excluding commands and agents.
     add_dirs: []const []const u8 = &.{},
-    /// Plugin directories to load for this session. A plugin can carry skills,
-    /// subagents, hooks, and MCP servers.
+    /// Plugin directories providing skills, subagents, hooks, and MCP servers.
     plugin_dirs: []const []const u8 = &.{},
     /// Subagent definitions as a JSON object.
     agents_json: ?[]const u8 = null,
-    /// Disables all skills and commands for the session.
+    /// Disables skills and commands.
     disable_slash_commands: bool = false,
     /// Ignore every MCP source except `mcp_config`.
     strict_mcp_config: bool = false,
     max_turns: ?u32 = null,
-    /// Names of skills Claude may invoke. Discovery and `system/init` are
-    /// unfiltered. Null allows all discovered skills; an empty slice allows
-    /// none. Sent in `initialize`. The slice and strings are borrowed until
-    /// `Client.close`.
+    /// Invocation allowlist; discovery and `system/init` remain unfiltered.
+    /// Null allows all; empty allows none. Slice and strings are borrowed until `close`.
     skills: ?[]const []const u8 = null,
-    /// In-process MCP servers, reached over the control protocol. The slice and
-    /// all referenced data are borrowed until `Client.close`.
+    /// In-process MCP servers; slice and referenced data are borrowed until `close`.
     sdk_mcp_servers: []const McpServer = &.{},
-    /// Resume an existing session by id.
     resume_session_id: ?[]const u8 = null,
-    /// Handles permission prompts in `Client.next`. Only calls unresolved by
-    /// `allowed_tools` and `permission_mode` reach the handler. Null keeps CLI
-    /// handling, which refuses unauthorized calls. Requires both
-    /// `--permission-prompt-tool stdio` and `--permission-prompts host`.
+    /// Handles unresolved permission prompts in `Client.next`; null keeps CLI refusal.
+    /// Enables both `--permission-prompt-tool stdio` and `--permission-prompts host`.
     permission_handler: ?PermissionHandler = null,
-    /// Passed through to `permission_handler` untouched.
+    /// Opaque context passed to `permission_handler`.
     permission_context: ?*anyopaque = null,
-    /// Appended verbatim after the flags this module generates.
+    /// Appended verbatim after generated flags.
     extra_args: []const []const u8 = &.{},
 
-    /// I/O deadline for a stdin frame after acquiring the write lock,
-    /// including initialization. A timeout is terminal; zero is invalid.
+    /// Stdin frame deadline after acquiring the write lock, including initialization.
+    /// Timeout is terminal; zero is invalid.
     write_timeout_ms: u32 = 5_000,
     /// Grace before `kill` escalates SIGTERM to SIGKILL.
     termination_grace_ms: u32 = 250,
     stdout_buffer_size: usize = 64 * 1024,
     stdin_buffer_size: usize = 16 * 1024,
-    /// Inclusive maximum protocol line size. Oversized lines return
-    /// `error.ProtocolTooLong` and are discarded through the next newline.
-    /// `Client.open` rejects zero with `error.InvalidMaxLineBytes`.
+    /// Inclusive line limit; overflow returns `ProtocolTooLong` and skips to newline.
+    /// Zero fails `open` with `InvalidMaxLineBytes`.
     max_line_bytes: usize = 32 * 1024 * 1024,
 
-    /// Whether servers, a skill allowlist (including empty), or a permission
-    /// handler require an `initialize` handshake before the first turn.
+    /// Whether servers, skills (including empty), or permissions require initialization.
     pub fn needsInitialize(options: Options) bool {
         return options.sdk_mcp_servers.len > 0 or
             options.skills != null or
@@ -202,7 +185,6 @@ test "argv carries skill discovery flags" {
     try std.testing.expect(containsPair(argv, "--plugin-dir", "/opt/plugins/review"));
     try std.testing.expect(containsPair(argv, "--tools", "Skill,Read,Bash"));
     try std.testing.expect(containsPair(argv, "--max-turns", "12"));
-    // Discovery flags must not implicitly enable bare mode.
     for (argv) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--bare"));
 }
 
@@ -212,7 +194,6 @@ fn contains(argv: []const []const u8, flag: []const u8) bool {
 }
 
 test "the default argv is the bare protocol and nothing else" {
-    // Only partial messages are enabled by default.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
 
@@ -232,8 +213,6 @@ test "the default argv is the bare protocol and nothing else" {
 }
 
 test "every flag-emitting field emits its flag" {
-    // Check each option independently so missing flags identify the affected
-    // field.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
 
@@ -280,7 +259,6 @@ test "every flag-emitting field emits its flag" {
 }
 
 test "the permission-prompt flags follow the handler, not the mode" {
-    // Route prompts to stdio only when a handler can answer them.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
 
@@ -289,8 +267,7 @@ test "the permission-prompt flags follow the handler, not the mode" {
     try std.testing.expect(!contains(without, "--permission-prompt-tool"));
 
     const with = try buildArgv(arena.allocator(), .{ .permission_handler = stubPermissionHandler });
-    // CLI 2.1.261 requires both flags; host alone emits no can_use_tool
-    // requests.
+    // Both flags are required to receive host permission prompts.
     try std.testing.expect(containsPair(with, "--permission-prompt-tool", "stdio"));
     try std.testing.expect(containsPair(with, "--permission-prompts", "host"));
     try std.testing.expect((Options{ .permission_handler = stubPermissionHandler }).needsInitialize());
@@ -301,8 +278,6 @@ fn stubPermissionHandler(_: ?*anyopaque, _: Allocator, _: []const u8, _: std.jso
 }
 
 test "extra_args land after every generated flag" {
-    // All generated flags must precede extra_args so caller overrides remain
-    // last.
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
 

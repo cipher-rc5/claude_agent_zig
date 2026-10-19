@@ -7,11 +7,9 @@ const Io = std.Io;
 const McpServer = @import("tool.zig").McpServer;
 const ToolResult = @import("tool.zig").ToolResult;
 
-/// Used only when the CLI's initialize request carries no protocolVersion.
-/// Normally the version it offers is echoed back verbatim.
+// Fallback when initialize omits protocolVersion; otherwise echo the offered version.
 pub const default_protocol_version = "2025-06-18";
 
-/// Wire shape of a user turn on stdin.
 const TextBlock = struct {
     type: []const u8 = "text",
     text: []const u8,
@@ -25,15 +23,14 @@ const UserMessage = struct {
     },
 };
 
-/// A user turn. The CLI treats one sent mid-turn as guidance.
+// Mid-turn messages are treated as guidance.
 pub fn writeUserMessage(w: *Io.Writer, text: []const u8) !void {
     const content = [_]TextBlock{.{ .text = text }};
     const message: UserMessage = .{ .message = .{ .content = &content } };
     try std.json.Stringify.value(message, .{}, w);
 }
 
-/// Declares in-process MCP servers and the optional skill allowlist. SDK tool
-/// calls return over the control protocol.
+// SDK tools and skills are configured through the control protocol.
 pub fn writeInitialize(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -55,7 +52,7 @@ pub fn writeInitialize(
         for (servers) |server| try js.write(server.name);
         try js.endArray();
     }
-    // Null omits the field and allows all skills; an empty array allows none.
+    // Omitted allows all skills; empty allows none.
     if (skills) |list| {
         try js.objectField("skills");
         try js.beginArray();
@@ -66,7 +63,6 @@ pub fn writeInitialize(
     try js.endObject();
 }
 
-/// Asks the CLI to abandon the turn in progress.
 pub fn writeInterrupt(js: *std.json.Stringify, request_id: []const u8) !void {
     try js.beginObject();
     try js.objectField("type");
@@ -81,7 +77,7 @@ pub fn writeInterrupt(js: *std.json.Stringify, request_id: []const u8) !void {
     try js.endObject();
 }
 
-/// Opens the control-response envelope; finish with `endControlResponse`.
+// Paired with `endControlResponse`.
 fn beginControlResponse(
     js: *std.json.Stringify,
     subtype: []const u8,
@@ -103,8 +99,7 @@ fn endControlResponse(js: *std.json.Stringify) !void {
     try js.endObject();
 }
 
-/// Opens the required `mcp_response` wrapper and JSON-RPC object. The CLI
-/// cannot correlate the reply without this wrapper.
+// The CLI requires `mcp_response` to correlate JSON-RPC replies.
 fn beginMcpResponse(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -129,7 +124,7 @@ fn endMcpResponse(js: *std.json.Stringify) !void {
     try endControlResponse(js);
 }
 
-/// A successful MCP reply. `result_json` is spliced in verbatim.
+// `result_json` is spliced verbatim.
 pub fn writeMcpResult(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -144,7 +139,7 @@ pub fn writeMcpResult(
     try endMcpResponse(js);
 }
 
-/// Removes insignificant whitespace from validated JSON to preserve line framing.
+// Compact validated JSON to preserve newline framing.
 fn writeCompactJson(w: *Io.Writer, raw: []const u8) Io.Writer.Error!void {
     var quoted = false;
     var escaped = false;
@@ -162,8 +157,7 @@ fn writeCompactJson(w: *Io.Writer, raw: []const u8) Io.Writer.Error!void {
     try w.writeAll(raw[start..]);
 }
 
-/// A JSON-RPC error reply. Codes follow the spec: -32601 unknown method or
-/// server, -32602 bad params.
+// JSON-RPC errors: -32601 unknown method/server, -32602 invalid params.
 pub fn writeMcpError(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -182,7 +176,7 @@ pub fn writeMcpError(
     try endMcpResponse(js);
 }
 
-/// Rejects unsupported control requests so the CLI does not wait for a timeout.
+// Unsupported requests still need a reply to prevent CLI timeouts.
 pub fn writeControlError(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -194,14 +188,13 @@ pub fn writeControlError(
     try endControlResponse(js);
 }
 
-/// Permission reply input: the proposed value or pre-rendered replacement JSON.
 pub const PermissionInput = union(enum) {
     value: std.json.Value,
-    /// Spliced in verbatim. The client validates it before it gets here.
+    /// Validated by the client; spliced verbatim.
     raw: []const u8,
 };
 
-/// Allows `can_use_tool`. Always sends `updatedInput`, even when unchanged.
+// The CLI requires `updatedInput`, even when unchanged.
 pub fn writePermissionAllow(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -225,7 +218,7 @@ pub fn writePermissionAllow(
     try endControlResponse(js);
 }
 
-/// Denies a `can_use_tool` request. `message` is what the model sees.
+// Denial text is shown to the model.
 pub fn writePermissionDeny(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -242,9 +235,9 @@ pub fn writePermissionDeny(
     try endControlResponse(js);
 }
 
-/// MCP result bodies spliced into replies by `writeMcpResult`.
+// Bodies spliced into replies by `writeMcpResult`.
 pub const results = struct {
-    /// Echoes the offered `protocolVersion`; the CLI rejects a mismatch.
+    // Echo the offered version; the CLI rejects mismatches.
     pub fn initialize(
         js: *std.json.Stringify,
         server: *const McpServer,
@@ -271,7 +264,7 @@ pub const results = struct {
         try js.endObject();
     }
 
-    /// `tools/list`. Validated schemas are compacted to keep one-line framing.
+    // Compact validated schemas to keep one-line framing.
     pub fn toolsList(js: *std.json.Stringify, server: *const McpServer) !void {
         try js.beginObject();
         try js.objectField("tools");
@@ -292,7 +285,6 @@ pub const results = struct {
         try js.endObject();
     }
 
-    /// `tools/call`.
     pub fn toolCall(js: *std.json.Stringify, call: ToolResult) !void {
         try js.beginObject();
         try js.objectField("content");
@@ -312,7 +304,7 @@ pub const results = struct {
 
 // --- tests ---
 
-// Wire-format helpers are internal to the library; their tests stay here.
+// Private wire-format helpers require module-local tests.
 
 const Rendered = struct {
     out: Io.Writer.Allocating,
@@ -365,12 +357,10 @@ test "initialize request correlation belongs to the top-level envelope" {
 }
 
 test "skills distinguishes unset from empty" {
-    // Null omits the allowlist and allows all discovered skills.
     var unset = try render(writeInitialize, .{ "zig_1", &[_]McpServer{}, null });
     defer unset.deinit();
     try std.testing.expect(std.mem.indexOf(u8, unset.text(), "\"skills\"") == null);
 
-    // Empty is a real value meaning "allow none".
     const none: []const []const u8 = &.{};
     var empty = try render(writeInitialize, .{ "zig_1", &[_]McpServer{}, none });
     defer empty.deinit();
@@ -388,7 +378,6 @@ test "initialize omits sdkMcpServers when there are none" {
     defer skills_only.deinit();
     try std.testing.expect(std.mem.indexOf(u8, skills_only.text(), "sdkMcpServers") == null);
 
-    // CLI field names are case-sensitive.
     const servers = [_]McpServer{.{ .name = "host" }};
     var with_servers = try render(writeInitialize, .{ "zig_1", &servers, null });
     defer with_servers.deinit();
@@ -405,7 +394,6 @@ test "mcp result carries the load-bearing envelope" {
     try expectContains(r.text(), "\"mcp_response\"");
     try expectContains(r.text(), "\"jsonrpc\":\"2.0\"");
     try expectContains(r.text(), "\"id\":7");
-    // Keep the payload as JSON, not a JSON string.
     try expectContains(r.text(), "\"result\":{\"ok\":true}");
 }
 
@@ -483,7 +471,6 @@ test "permission allow echoes the proposed input under updatedInput" {
     var r = try render(writePermissionAllow, .{ "req_1", PermissionInput{ .value = parsed.value } });
     defer r.deinit();
 
-    // Permission replies use the control envelope without an MCP wrapper.
     try expectContains(r.text(), "\"subtype\":\"success\"");
     try expectContains(r.text(), "\"request_id\":\"req_1\"");
     try expectContains(r.text(), "\"behavior\":\"allow\"");

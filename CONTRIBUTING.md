@@ -212,6 +212,10 @@ part of the package: `build.zig.zon`'s `.paths` lists `src`, `examples`,
 it, and do not argue with its output — `just fmt-check` is part of `ci`, so
 unformatted code cannot be committed.
 
+Keep comments brief. Document contracts, constraints, and non-obvious reasons;
+let names and assertions explain routine operations. Preserve public ownership,
+threading, lifetime, and failure guarantees when shortening API documentation.
+
 **Every source file begins with a path comment naming itself**, followed by a
 short line describing the file's role. This holds in `src/`, `examples/`,
 `tests/` and `bench/` alike:

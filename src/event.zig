@@ -1,16 +1,15 @@
 // src/event.zig
-// One line of the stream-json protocol, and the accessors for reading it.
+// Owned protocol events and field accessors.
 
 const std = @import("std");
 
-/// Known protocol line types; unrecognized wire types map to `unknown`. Include
-/// an `else` switch arm to allow future enum variants.
+/// Unknown wire types map to `unknown`; use `else` in switches for future variants.
 pub const Kind = enum {
     /// Session lifecycle: `init`, `api_retry`, `plugin_install`.
     system,
     assistant,
     user,
-    /// Terminal message for a turn, carrying cost and session metadata.
+    /// Terminal turn message with cost and session metadata.
     result,
     /// Token-level delta, present only with `include_partial_messages`.
     stream_event,
@@ -20,7 +19,7 @@ pub const Kind = enum {
     unknown,
 };
 
-/// One protocol line. Owns an arena holding the parsed tree.
+/// One protocol line; owns its parsed tree.
 pub const Event = struct {
     kind: Kind,
     parsed: std.json.Parsed(std.json.Value),
@@ -30,8 +29,7 @@ pub const Event = struct {
         event.* = undefined;
     }
 
-    /// Full parsed line, including fields without typed accessors. Use
-    /// `objectField` and `stringField` to inspect nested values.
+    /// Full parsed line; inspect nested values with `objectField` and `stringField`.
     pub fn root(event: Event) std.json.Value {
         return event.parsed.value;
     }
@@ -40,8 +38,7 @@ pub const Event = struct {
         return stringField(event.parsed.value, key);
     }
 
-    /// Array field of the event object, for example `skills`, `tools`, or
-    /// `slash_commands` on `system/init`.
+    /// Array field, such as `skills` or `tools` on `system/init`.
     pub fn getArray(event: Event, key: []const u8) ?[]const std.json.Value {
         return switch (objectField(event.parsed.value, key) orelse return null) {
             .array => |a| a.items,
@@ -49,8 +46,7 @@ pub const Event = struct {
         };
     }
 
-    /// Whether the string array at `key` contains `needle`. Use with
-    /// `system/init` to check loaded skills and tools.
+    /// Tests membership in a string-array field, such as loaded skills or tools.
     pub fn arrayContains(event: Event, key: []const u8, needle: []const u8) bool {
         const items = event.getArray(key) orelse return false;
         for (items) |item| {
