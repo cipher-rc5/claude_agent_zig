@@ -91,7 +91,7 @@ class ArtifactTests(unittest.TestCase):
         cls.root = Path(cls.temporary.name) / "repo"
         cls.root.mkdir()
         # Test the actual package, including its build graph, in isolation.
-        for name in ("build.zig", "build.zig.zon", "src", "examples", "tests", "bench", "LICENSE", "README.md", "SECURITY.md", "CHANGELOG.md", "CONTRIBUTING.md"):
+        for name in ("build.zig", "build.zig.zon", "src", "examples", "tests", "bench", "README.md", "SECURITY.md", "CHANGELOG.md", "CONTRIBUTING.md"):
             source = ROOT / name
             if source.is_dir():
                 shutil.copytree(source, cls.root / name)
@@ -177,7 +177,7 @@ class ArtifactTests(unittest.TestCase):
             self.verify()
 
     def test_missing_source_file_is_rejected(self):
-        self.rewrite_archive(lambda entries: [(member, data) for member, data in entries if member.name != f"{self.name}/LICENSE"])
+        self.rewrite_archive(lambda entries: [(member, data) for member, data in entries if member.name != f"{self.name}/SECURITY.md"])
         with self.assertRaisesRegex(ValueError, "missing committed"):
             self.verify()
 
@@ -206,7 +206,7 @@ class ArtifactTests(unittest.TestCase):
     def test_rehashed_modified_source_still_fails_trusted_commit(self):
         def change_source(entries):
             for member, data in entries:
-                if member.name == f"{self.name}/LICENSE":
+                if member.name == f"{self.name}/SECURITY.md":
                     data = b"modified source"
                     member.size = len(data)
                 yield member, data

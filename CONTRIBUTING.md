@@ -2,7 +2,7 @@
 
 ## Licensing, first
 
-This is proprietary, all-rights-reserved software. See [LICENSE](LICENSE).
+This is proprietary, all-rights-reserved software.
 
 External contributions are **not** accepted by default. Do not open a pull
 request without prior written permission from the copyright holder
