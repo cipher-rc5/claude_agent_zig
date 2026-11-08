@@ -454,7 +454,7 @@ zig build docs               # autodocs for the agent module into zig-out/docs/
 ```
 
 `build.zig` refuses any Zig other than the one `build.zig.zon` names
-(`0.17.0`): the manifest's `minimum_zig_version` is only a floor, and a later
+(`0.17.1`): the manifest's `minimum_zig_version` is only a floor, and a later
 toolchain would otherwise be accepted there and fail somewhere inside `std`
 instead of at the first line of the build.
 

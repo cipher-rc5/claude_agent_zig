@@ -14,7 +14,7 @@ If you have found a security issue, do not open a public issue or PR — follow
 
 ## Toolchain
 
-Zig **0.17.0** exactly. `build.zig` checks the version declared in
+Zig **0.17.1** exactly. `build.zig` checks the version declared in
 `build.zig.zon` and rejects other toolchains before building. The manifest's
 minimum alone would also accept newer, potentially incompatible versions.
 

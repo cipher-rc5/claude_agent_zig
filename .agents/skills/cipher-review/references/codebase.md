@@ -6,7 +6,7 @@ Navigation for `claude_agent_zig`; verify declarations and constants against the
 
 The library spawns Claude Code CLI with `--print --input-format stream-json --output-format stream-json --verbose` and exchanges NDJSON over pipes. It implements no model loop, database, HTTP server, or direct network client. In-process MCP tools use the same control channel.
 
-The package uses only Zig's standard library. `build.zig.zon` pins Zig 0.17.0 and `build.zig` enforces exact equality. Python 3.12+, shell, `just`, Git, and SSH support delivery tooling. CommonJS security-skill helpers are not an application layer. README's TypeScript mention describes Anthropic's official SDK; there is no local TypeScript package. Inspect actual manifests before adding such workflows.
+The package uses only Zig's standard library. `build.zig.zon` pins Zig 0.17.1 and `build.zig` enforces exact equality. Python 3.12+, shell, `just`, Git, and SSH support delivery tooling. CommonJS security-skill helpers are not an application layer. README's TypeScript mention describes Anthropic's official SDK; there is no local TypeScript package. Inspect actual manifests before adding such workflows.
 
 | Responsibility | Source | Verification |
 | --- | --- | --- |

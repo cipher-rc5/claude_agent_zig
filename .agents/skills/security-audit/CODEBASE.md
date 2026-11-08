@@ -46,7 +46,7 @@ Use local-IPC companion blocks only for applicable process/descriptor boundaries
 
 ## Local validation choices
 
-Use exact Zig from `build.zig.zon` (currently 0.17.0), Python 3.12+, shell, and `just`. Supported native validation is macOS/Apple Silicon; Linux is untested, Windows unsupported. The sandbox requirements in `SKILL.md` still govern target execution; commands here are candidates, not an exemption.
+Use exact Zig from `build.zig.zon` (currently 0.17.1), Python 3.12+, shell, and `just`. Supported native validation is macOS/Apple Silicon; Linux is untested, Windows unsupported. The sandbox requirements in `SKILL.md` still govern target execution; commands here are candidates, not an exemption.
 
 - Prefer inline private tests or public black-box tests with scripted stub CLIs over real pipes: `tests/integration_test.zig`, `tests/transport_contract_test.zig`, and event/options/tool suites.
 - Public tests import the `agent` module via `src/agent.zig`; internal tests stay inline. `build.zig` has roots at `src/agent.zig`, `tests/all.zig`, and `examples/demo.zig`. Confirm reachability/counts rather than assuming a file was tested.

@@ -32,7 +32,7 @@ Check allocation failures, borrowed slices, callback arena resets, descriptor/PI
 
 ## Gather fresh evidence
 
-Use the exact compiler pin from `build.zig.zon` (currently Zig 0.17.0); `build.zig` enforces equality. Native macOS/Apple Silicon is the supported validated platform; Linux is untested and Windows unsupported.
+Use the exact compiler pin from `build.zig.zon` (currently Zig 0.17.1); `build.zig` enforces equality. Native macOS/Apple Silicon is the supported validated platform; Linux is untested and Windows unsupported.
 
 | Purpose | Existing command |
 | --- | --- |

@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Platform support and required validation now target macOS on Apple Silicon;
   Linux remains untested and is no longer part of the required gate.
-- Requires Zig 0.17.0 exactly; updated argument forwarding, array syntax, and
+- Requires Zig 0.17.1 exactly; updated argument forwarding, array syntax, and
   reflection assertions for that toolchain.
 - Client methods synchronize reads, writes, and lifecycle state. Keep one
   `next()` consumer and join all client-using threads before `close()`.
