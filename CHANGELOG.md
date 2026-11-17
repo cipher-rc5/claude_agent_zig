@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correlated rejection, and resumed sessions, with sanitized evidence and cleanup.
 - Local source archives, structured CycloneDX SBOMs, checksums, optional SSH
   signatures, and artifact verification with an isolated package consumer.
+- Technical documentation under `docs/`: architecture, API reference, client
+  lifecycle, read loop, control protocol, wire-message schemas, concurrency,
+  transport, and tooling, with Mermaid diagrams.
 
 ### Changed
 

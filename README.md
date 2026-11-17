@@ -26,6 +26,9 @@ explicitly). The oldest CLI this protocol has been exercised against is
 `open`, since that would cost a second spawn per session, so `just canary`
 checks the floor instead, once, against the CLI actually on PATH.
 
+Internals, wire-message schemas, and control-flow diagrams are documented in
+[docs/](docs/README.md).
+
 ## Tools
 
 Three layers, all supported.
