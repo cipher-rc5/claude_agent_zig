@@ -24,6 +24,7 @@ test "the write API declares an explicit error set" {
 test "the read and open APIs declare their error sets" {
     try std.testing.expectEqual(agent.OpenError!*agent.Client, returnType(agent.Client.open));
     try std.testing.expectEqual(agent.ReadError!?agent.Event, returnType(agent.Client.next));
+    try std.testing.expectEqual(agent.ReadError!?agent.EventView, returnType(agent.Client.nextView));
     try std.testing.expectEqual(agent.WaitError!agent.Term, returnType(agent.Client.wait));
     try std.testing.expectEqual(agent.Term, returnType(agent.Client.close));
 
@@ -58,6 +59,7 @@ test "the public surface re-exports every type a caller needs" {
     try std.testing.expect(@typeInfo(agent.Options) == .@"struct");
     try std.testing.expect(@typeInfo(agent.PermissionMode) == .@"enum");
     try std.testing.expect(@typeInfo(agent.Event) == .@"struct");
+    try std.testing.expect(@typeInfo(agent.EventView) == .@"struct");
     try std.testing.expect(@typeInfo(agent.Kind) == .@"enum");
     try std.testing.expect(@typeInfo(agent.Tool) == .@"struct");
     try std.testing.expect(@typeInfo(agent.ToolResult) == .@"struct");

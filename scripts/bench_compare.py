@@ -27,7 +27,7 @@ METRICS = (
     "latency_p99_ns", "latency_max_ns", "allocated_bytes_per_event",
     "allocations_per_event", "peak_sdk_bytes", "retained_sdk_bytes", "after_close_sdk_bytes",
 )
-BUILD_FIELDS = ("benchmark_schema", "zig_version", "optimize", "target")
+BUILD_FIELDS = ("benchmark_schema", "zig_version", "optimize", "target", "event_mode")
 
 
 def digest(path: Path) -> str:
@@ -84,6 +84,9 @@ def decode_record(output: str, workload: str, lines: int):
     record = json.loads(rows[0])
     if not isinstance(record, dict):
         raise ValueError("benchmark record must be an object")
+    record.setdefault("event_mode", "owned")  # Historical owned-only harnesses.
+    if record["event_mode"] not in ("owned", "view"):
+        raise ValueError("invalid benchmark event mode")
     expected = {"benchmark_schema": 1, "workload": workload, "run": 1,
                 "events": lines + 1 + (workload == "recovery"),
                 "controls": lines if workload == "control" else 0}
@@ -178,6 +181,9 @@ def parser():
     result.add_argument("--pairs", type=int, default=20)
     result.add_argument("--warmup", type=int, default=3, help="warmup pairs per workload, excluded from summaries")
     result.add_argument("--lines", type=int, default=20_000)
+    result.add_argument("--event-mode", choices=("owned", "view"), default="owned")
+    result.add_argument("--before-event-mode", choices=("owned", "view"), help="explicit mode override for the before executable")
+    result.add_argument("--after-event-mode", choices=("owned", "view"), help="explicit mode override for the after executable")
     result.add_argument("--workloads", nargs="+", choices=WORKLOADS, default=list(WORKLOADS))
     result.add_argument("--timeout-seconds", type=float, default=120)
     result.add_argument("--total-timeout-seconds", type=float, default=1800)
@@ -202,6 +208,7 @@ def main(argv=None):
     if len(set(args.workloads)) != len(args.workloads):
         command.error("workloads must be unique")
     binaries = {name: getattr(args, name).resolve() for name in ("before", "after")}
+    event_modes = {name: getattr(args, name + "_event_mode") or args.event_mode for name in binaries}
     if any(not file.is_file() or not os.access(file, os.X_OK) for file in binaries.values()):
         command.error("before and after must be executable files")
     output = args.output.resolve()
@@ -222,7 +229,7 @@ def main(argv=None):
         write_json(output / "schedule.json", jobs)
         manifest = {"schema": 1, "status": "running", "host_start": host(), "seed": args.seed,
                     "configuration": {key: getattr(args, key) for key in (
-                        "pairs", "warmup", "lines", "workloads", "timeout_seconds", "total_timeout_seconds", "bootstrap_samples")},
+                        "pairs", "warmup", "lines", "event_mode", "before_event_mode", "after_event_mode", "workloads", "timeout_seconds", "total_timeout_seconds", "bootstrap_samples")},
                     "sources": sources, "binaries": binary_fingerprints,
                     "source_provenance": "Provided source fingerprints are recorded, not proof of compilation provenance.",
                     "measurement_scope": "Benchmark timing excludes process startup, transcript creation, ready event, and wait/reap. Each returned event includes next/accessors/deinit. Process wall times include the complete supervised invocation.",
@@ -240,6 +247,8 @@ def main(argv=None):
                 if remaining <= 0:
                     raise TimeoutError("total measurement deadline expired")
                 argv = [str(binaries[implementation]), str(args.lines), job["workload"], "1"]
+                if event_modes[implementation] != "owned":
+                    argv.append(event_modes[implementation])
                 started = time.monotonic()
                 load = list(os.getloadavg())
                 code, text = run(argv, cwd=work, timeout=min(remaining, args.timeout_seconds))
@@ -251,7 +260,9 @@ def main(argv=None):
                 except (ValueError, TypeError) as error:
                     (output / "failed-output.txt").write_text(text)
                     raise ValueError(f"sample {sample}: {error}") from error
-                current_build = {field: record[field] for field in BUILD_FIELDS}
+                current_build = {field: record[field] for field in BUILD_FIELDS if field != "event_mode"}
+                if record["event_mode"] != event_modes[implementation]:
+                    raise ValueError("benchmark executable reported a different event mode than requested")
                 if current_build["optimize"] != "fast":
                     raise ValueError("benchmark executable must report optimize=fast (ReleaseFast)")
                 if build is None:

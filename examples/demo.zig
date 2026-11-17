@@ -4,6 +4,7 @@
 const std = @import("std");
 const agent = @import("agent");
 const demo_tools = @import("demo_tools.zig");
+const OutputMode = enum { auto, stream, buffered, final };
 
 test {
     _ = demo_tools;
@@ -20,6 +21,14 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const out = &stdout.interface;
+    defer out.flush() catch {};
+    const output_mode = std.meta.stringToEnum(OutputMode, init.environ_map.get("AGENT_OUTPUT") orelse "auto") orelse
+        return error.InvalidOutputMode;
+    const flush_deltas = switch (output_mode) {
+        .auto => try std.Io.File.stdout().isTty(io),
+        .stream => true,
+        .buffered, .final => false,
+    };
 
     // Reserve stdout for agent output.
     var stderr_buffer: [256]u8 = undefined;
@@ -57,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
             null,
         .permission_handler = if (host_permissions) demo_tools.logAndAllow else null,
         .permission_context = @ptrCast(log),
+        .include_partial_messages = output_mode != .final,
     });
     defer {
         _ = client.terminate(250) catch {};
@@ -68,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
 
     while (true) {
         // Malformed or oversized lines are recoverable; other read errors are terminal.
-        const event = client.next() catch |err| switch (err) {
+        const e = client.nextView() catch |err| switch (err) {
             error.ProtocolTooLong, error.InvalidJson => {
                 try log.print("[skipped] unreadable line: {t}\n", .{err});
                 try log.flush();
@@ -77,23 +87,22 @@ pub fn main(init: std.process.Init) !void {
             else => |fatal| return fatal,
         } orelse break;
 
-        var e = event;
-        defer e.deinit();
-
         switch (e.kind) {
             .system => {
                 if (e.subtype()) |s| {
                     try out.print("[system/{s}]\n", .{s});
-                    if (e.getArray("skills")) |skills| {
+                    var owned = try e.toOwned(gpa);
+                    defer owned.deinit();
+                    if (owned.getArray("skills")) |skills| {
                         try out.print("[skills] {d} discovered\n", .{skills.len});
                     }
-                    try out.flush();
+                    if (flush_deltas) try out.flush();
                 }
             },
             .stream_event => {
                 if (e.textDelta()) |text| {
                     try out.writeAll(text);
-                    try out.flush();
+                    if (flush_deltas) try out.flush();
                 }
             },
             .result => {
@@ -105,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
             else => {},
         }
     }
+    try out.flush();
 
     // `process.exit` skips defers; flush output after reaping the child.
     switch (try client.wait()) {

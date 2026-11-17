@@ -12,6 +12,7 @@ pub const PermissionMode = options.PermissionMode;
 pub const min_cli_version = options.min_cli_version;
 
 pub const Event = event.Event;
+pub const EventView = event.EventView;
 pub const Kind = event.Kind;
 
 pub const Tool = tool.Tool;

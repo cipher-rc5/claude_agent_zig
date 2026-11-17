@@ -16,7 +16,7 @@ import bench_compare as bench
 
 def record(workload="normal", lines=3):
     return {
-        "benchmark_schema": 1, "zig_version": "0.17.0", "optimize": "fast", "target": "aarch64-macos-none",
+        "benchmark_schema": 1, "zig_version": "0.17.0", "optimize": "fast", "target": "aarch64-macos-none", "event_mode": "owned",
         "workload": workload, "run": 1, "events": lines + 1 + (workload == "recovery"),
         "controls": lines if workload == "control" else 0, "delta_bytes": 303,
         "events_per_second": 1_000_000, "ns_per_event": 1000,
@@ -50,7 +50,8 @@ class RecordTests(unittest.TestCase):
         cases = ({"events": 3}, {"controls": 1}, {"run": 2}, {"benchmark_schema": True},
                  {"target": ""}, {"events_per_second": float("nan")}, {"allocations_per_event": True},
                  {"ns_per_event": 10}, {"latency_p95_ns": 800}, {"after_close_sdk_bytes": 1},
-                 {"retained_sdk_bytes": 100_000}, {"latency_p50_ns": 900.5}, {"peak_sdk_bytes": 10**1000})
+                 {"retained_sdk_bytes": 100_000}, {"latency_p50_ns": 900.5}, {"peak_sdk_bytes": 10**1000},
+                 {"event_mode": "unknown"})
         for changes in cases:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 bench.decode_record(json.dumps(record() | changes), "normal", 3)
@@ -61,6 +62,11 @@ class RecordTests(unittest.TestCase):
     def test_control_and_recovery_counts_follow_the_selected_workload(self):
         for workload in bench.WORKLOADS:
             self.assertEqual(record(workload), bench.decode_record(json.dumps(record(workload)), workload, 3))
+
+    def test_historical_records_default_to_owned_mode(self):
+        old = record()
+        del old["event_mode"]
+        self.assertEqual(bench.decode_record(json.dumps(old), "normal", 3)["event_mode"], "owned")
 
 
 class SummaryTests(unittest.TestCase):
@@ -165,6 +171,21 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(self.collect(["--pairs", "1", "--warmup", "0", "--workloads", "normal"]), 1)
         self.assertIn("source fingerprints changed", json.loads((self.output / "environment.json").read_text())["error"])
         self.assertFalse((self.output / "summary.json").exists())
+
+    def test_requested_and_reported_read_modes_must_match(self):
+        with patch.object(bench, "run", return_value=(0, json.dumps(record()))):
+            self.assertEqual(self.collect(["--event-mode", "view", "--pairs", "1", "--warmup", "0", "--workloads", "normal"]), 1)
+        self.assertIn("different event mode", json.loads((self.output / "environment.json").read_text())["error"])
+        self.assertFalse((self.output / "summary.json").exists())
+
+    def test_explicit_mode_overrides_allow_owned_and_view_comparisons(self):
+        def measured(argv, **_kwargs):
+            return 0, json.dumps(record() | {"event_mode": "view" if argv[-1] == "view" else "owned"})
+
+        with patch.object(bench, "run", side_effect=measured):
+            self.assertEqual(self.collect(["--after-event-mode", "view", "--pairs", "1", "--warmup", "0", "--workloads", "normal"]), 0)
+        raw = [json.loads(line) for line in (self.output / "raw.jsonl").read_text().splitlines()]
+        self.assertEqual({row["implementation"]: row["event_mode"] for row in raw}, {"before": "owned", "after": "view"})
 
     def test_interrupted_measurement_records_failure_and_does_not_report_success(self):
         with patch.object(bench, "run", side_effect=KeyboardInterrupt):

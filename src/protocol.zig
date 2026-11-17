@@ -10,24 +10,20 @@ const ToolResult = @import("tool.zig").ToolResult;
 // Fallback when initialize omits protocolVersion; otherwise echo the offered version.
 pub const default_protocol_version = "2025-06-18";
 
-const TextBlock = struct {
-    type: []const u8 = "text",
-    text: []const u8,
-};
-
-const UserMessage = struct {
-    type: []const u8 = "user",
-    message: struct {
-        role: []const u8 = "user",
-        content: []const TextBlock,
-    },
-};
-
 // Mid-turn messages are treated as guidance.
 pub fn writeUserMessage(w: *Io.Writer, text: []const u8) !void {
-    const content = [_]TextBlock{.{ .text = text }};
-    const message: UserMessage = .{ .message = .{ .content = &content } };
-    try std.json.Stringify.value(message, .{}, w);
+    try writeUserParts(w, &.{text});
+}
+
+pub fn writeCommandMessage(w: *Io.Writer, name: []const u8, arguments: []const u8) !void {
+    try writeUserParts(w, if (arguments.len == 0) &.{ "/", name } else &.{ "/", name, " ", arguments });
+}
+
+// Escape fragments into one string without a temporary command or JSON tree.
+fn writeUserParts(w: *Io.Writer, parts: []const []const u8) !void {
+    try w.writeAll("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"");
+    for (parts) |part| try std.json.Stringify.encodeJsonStringChars(part, .{}, w);
+    try w.writeAll("\"}]}}");
 }
 
 // SDK tools and skills are configured through the control protocol.
@@ -136,6 +132,19 @@ pub fn writeMcpResult(
     try js.beginWriteRaw();
     try js.writer.writeAll(result_json);
     js.endWriteRaw();
+    try endMcpResponse(js);
+}
+
+pub fn writeMcpResultBody(
+    js: *std.json.Stringify,
+    request_id: []const u8,
+    message_id: ?std.json.Value,
+    comptime f: anytype,
+    args: anytype,
+) !void {
+    try beginMcpResponse(js, request_id, message_id);
+    try js.objectField("result");
+    try @call(.auto, f, .{js} ++ args);
     try endMcpResponse(js);
 }
 

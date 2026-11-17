@@ -44,7 +44,7 @@ flowchart LR
     MCPX["Out-of-process MCP servers<br/>(via mcp_config)"]
 
     App -- "send / sendCommand / interrupt" --> Client
-    Client -- "Event values from next()" --> App
+    Client -- "owned Event / borrowed EventView" --> App
     Client -- "stdin: user turns,<br/>control requests and replies" --> CLI
     CLI -- "stdout: events,<br/>control requests and responses" --> Client
     CLI -. "stderr (inherited)" .-> App
@@ -168,7 +168,7 @@ flowchart TB
 | Decision | Reason |
 |---|---|
 | `Client` lives on the heap (`open` returns `*Client`). | `transport.Reader` and `transport.Writer` embed `Io.Reader` / `Io.Writer` interfaces that recover their parent with `@fieldParentPtr`, so the address must not move. |
-| Events are parsed to `std.json.Value`, not fixed structs. | The CLI adds event fields regularly. A strict struct would break on the next CLI release. Typed accessors sit on top. |
+| Owned events use `std.json.Value`; borrowed views project selected fields while validating the full line. | Both tolerate unknown fields. Views retain the raw line and can become a full owned event when arbitrary fields are needed. |
 | `Kind` is exhaustive, with an `unknown` member. | Every unrecognized wire `type` maps to `unknown`, so a non-exhaustive `_` tag would never occur. Callers should write an `else` arm. |
 | Control requests are handled inside `next()`. | The CLI sends tool calls over the same pipe and waits for the reply. Answering them on the reader's thread needs no extra thread or socket. |
 | Raw JSON is validated before it is spliced. | `Tool.input_schema` and `PermissionDecision.allow_with_input` are written verbatim. `open` and the permission path validate them so a bad value cannot break framing. |

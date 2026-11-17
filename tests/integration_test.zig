@@ -63,6 +63,68 @@ const two_line_stub =
     \\
 ;
 
+test "owned events survive subsequent reads and client closure through both APIs" {
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"owned\nfirst"}},"padding":"long enough to exercise the small-event arena reservation"}'
+        \\printf '%s\n' '{"type":"result","result":"borrowed\nsecond","future":{"kept":true}}'
+        \\
+    );
+    defer stub.deinit();
+    const client = try stub.open(.{});
+    var closed = false;
+    defer if (!closed) {
+        _ = client.close();
+    };
+    var first = (try client.next()).?;
+    defer first.deinit();
+    const view = (try client.nextView()).?;
+    try std.testing.expectEqualStrings("borrowed\nsecond", view.resultText().?);
+    var second = try view.toOwned(gpa);
+    defer second.deinit();
+    try std.testing.expect(try client.next() == null);
+    _ = client.close();
+    closed = true;
+    try std.testing.expectEqualStrings("owned\nfirst", first.textDelta().?);
+    try std.testing.expectEqualStrings("borrowed\nsecond", second.resultText().?);
+    try std.testing.expect(second.root().object.get("future").?.object.get("kept").?.bool);
+}
+
+test "streaming reads reject malformed and duplicate hidden fields and recover" {
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\printf '%s\n' '{"future":{"x":1,"x":2}}' '{"future":[1,]}' '{"type":"result","result":"ok"}'
+        \\
+    );
+    defer stub.deinit();
+    const client = try stub.open(.{ .stdout_buffer_size = 1 });
+    defer _ = client.close();
+    try std.testing.expectError(error.InvalidJson, client.nextView());
+    try std.testing.expectError(error.InvalidJson, client.nextView());
+    const view = (try client.nextView()).?;
+    try std.testing.expectEqualStrings("ok", view.resultText().?);
+    try std.testing.expectEqualStrings(view.raw, client.lastLine());
+    try std.testing.expect(try client.nextView() == null);
+}
+
+test "streaming control header shortcuts still validate the entire frame" {
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\printf '%s\n' '{"type":"control_request","type":"result"}' '{"type":"control_response","response":' '{"type":"control_request","session_id":"from-control","request_id":"c","request":{"subtype":"unsupported"}}'
+        \\IFS= read -r reply
+        \\printf '%s\n' '{"type":"result","result":"done"}'
+        \\
+    );
+    defer stub.deinit();
+    const client = try stub.open(.{});
+    defer _ = client.close();
+    try std.testing.expectError(error.InvalidJson, client.nextView());
+    try std.testing.expectError(error.InvalidJson, client.nextView());
+    const view = (try client.nextView()).?;
+    try std.testing.expectEqualStrings("done", view.resultText().?);
+    try std.testing.expectEqualStrings("from-control", client.sessionId().?);
+}
+
 // --- reads after reaping ---
 
 test "next after wait reports end of stream instead of reading a stale fd" {
@@ -143,6 +205,11 @@ const tool_call_stub =
     "exit 0\n";
 
 test "a tools/call from the child runs the handler and the reply reaches the child" {
+    try toolCallRead(false);
+    try toolCallRead(true);
+}
+
+fn toolCallRead(comptime borrowed: bool) !void {
     var record: CallRecord = .{};
     const servers = [_]agent.McpServer{.{
         .name = "s",
@@ -160,7 +227,13 @@ test "a tools/call from the child runs the handler and the reply reaches the chi
     const client = try stub.open(.{ .sdk_mcp_servers = &servers });
     defer _ = client.close();
 
-    try std.testing.expectEqual(@as(usize, 2), try drain(client));
+    var count: usize = 0;
+    while (try (if (borrowed) client.nextView() else client.next())) |value| {
+        var event = value;
+        if (!borrowed) event.deinit();
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 
     try std.testing.expect(record.ran);
     try std.testing.expectEqual(@as(i64, 41), record.n);
@@ -862,6 +935,33 @@ fn permissionDecision(root: std.json.Value) !std.json.Value {
     return outer.object.get("response").?;
 }
 
+test "streaming reads pump permissions and expose initialization rejections" {
+    var record: PermissionRecord = .{ .decision = .{ .allow_with_input = "{\"command\":\"pwd\"}" } };
+    var stub = try Stub.init(echo_permission_stub);
+    defer stub.deinit();
+    const client = try stub.open(.{ .permission_handler = recordingPermissionHandler, .permission_context = &record });
+    defer _ = client.close();
+    const view = (try client.nextView()).?;
+    var owned = try view.toOwned(gpa);
+    defer owned.deinit();
+    const decision = try permissionDecision(owned.root().object.get("reply").?);
+    try std.testing.expectEqualStrings("pwd", decision.object.get("updatedInput").?.object.get("command").?.string);
+    try std.testing.expectEqual(@as(usize, 1), record.calls);
+
+    var rejected_stub = try Stub.init(
+        \\#!/bin/sh
+        \\IFS= read -r line
+        \\printf '%s\n' '{"type":"control_response","response":{"subtype":"error","request_id":"zig_1","error":"view rejection"}}'
+        \\
+    );
+    defer rejected_stub.deinit();
+    const rejected = try rejected_stub.open(.{ .skills = &.{} });
+    defer _ = rejected.close();
+    try std.testing.expectError(error.InitializationRejected, rejected.nextView());
+    try std.testing.expectEqualStrings("view rejection", rejected.lastControlError().?);
+    try std.testing.expectEqual(agent.InitializationState.rejected, rejected.status().initialization);
+}
+
 test "a permission allow echoes the proposed input back to the child" {
     var record: PermissionRecord = .{ .decision = .allow };
     var parsed = try echoedPermissionReply(&record);
@@ -1382,6 +1482,11 @@ test "one-byte pipe buffers preserve fragmented frames and escaped commands" {
 }
 
 test "deep JSON is a terminal protocol error before reserialization" {
+    try deepRead(false);
+    try deepRead(true);
+}
+
+fn deepRead(comptime borrowed: bool) !void {
     var stub = try Stub.init(
         \\#!/bin/sh
         \\printf '{"type":"control_request","request_id":"deep","request":{"subtype":"can_use_tool","tool_name":"Read","input":'
@@ -1397,9 +1502,9 @@ test "deep JSON is a terminal protocol error before reserialization" {
     defer stub.deinit();
     const client = try stub.open(.{});
     defer _ = client.close();
-    try std.testing.expectError(error.ProtocolTooDeep, client.next());
+    try std.testing.expectError(error.ProtocolTooDeep, (if (borrowed) client.nextView() else client.next()));
     try std.testing.expect(client.status().term != null);
-    try std.testing.expect(try client.next() == null);
+    try std.testing.expect(try (if (borrowed) client.nextView() else client.next()) == null);
 }
 
 const StatusReader = struct {

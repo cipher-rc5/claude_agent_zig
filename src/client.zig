@@ -108,6 +108,7 @@ pub const Client = struct {
     stdin_writer: transport.Writer,
     stdout_reader: transport.Reader,
     transport_state: transport.State = .{},
+    process_watch: ?Io.File = null,
     termination_grace_ms: u32,
     force_killed: bool = false,
     initialization: InitializationState = .not_required,
@@ -120,6 +121,7 @@ pub const Client = struct {
     permission_handler: ?PermissionHandler,
     permission_context: ?*anyopaque,
     scratch: std.heap.ArenaAllocator,
+    view_scratch: ?std.heap.ArenaAllocator = null,
     next_request_id: u64 = 0,
     /// Pending `zig_N` numbers, oldest first.
     pending_requests: [max_pending_requests]u64 = undefined,
@@ -143,7 +145,7 @@ pub const Client = struct {
     flush_error: ?Io.Writer.Error = null,
     /// Lock order is write -> state. State never waits for either I/O lock.
     write_mutex: Io.Mutex = .init,
-    /// Serializes parsing and synchronous handlers; handlers must not reenter next.
+    /// Serializes both read APIs and handlers; handlers must not reenter either.
     read_mutex: Io.Mutex = .init,
     /// Serializes nonblocking reap, signals, and published status.
     state_mutex: Io.Mutex = .init,
@@ -174,6 +176,8 @@ pub const Client = struct {
         errdefer gpa.free(stdin_buffer);
         const stdout_buffer = try gpa.alloc(u8, options.stdout_buffer_size);
         errdefer gpa.free(stdout_buffer);
+        var transport_state = try transport.State.init(io);
+        errdefer transport_state.deinit(io);
 
         // `spawn` does not retain argv.
         var child = blk: {
@@ -197,6 +201,8 @@ pub const Client = struct {
 
         try transport.nonblocking(child.stdin.?);
         try transport.nonblocking(stdout_file);
+        const process_watch = if (transport.canPark(io)) try transport.watchChild(io, child.id.?) else null;
+        errdefer if (process_watch) |file| file.close(io);
 
         client.* = .{
             .gpa = gpa,
@@ -206,6 +212,8 @@ pub const Client = struct {
             .stdout_buffer = stdout_buffer,
             .stdin_writer = transport.Writer.init(child.stdin.?, io, &client.transport_state, stdin_buffer, options.write_timeout_ms),
             .stdout_reader = transport.Reader.init(stdout_file, io, &client.transport_state, stdout_buffer),
+            .transport_state = transport_state,
+            .process_watch = process_watch,
             .termination_grace_ms = options.termination_grace_ms,
             .line = .init(gpa),
             .max_line_bytes = options.max_line_bytes,
@@ -262,7 +270,7 @@ pub const Client = struct {
         client.state_mutex.lockUncancelable(io);
         defer client.state_mutex.unlock(io);
         if (client.term != null or client.child.id == null) return;
-        client.transport_state.stopped.store(true, .release);
+        client.transport_state.stop();
         if (client.initialization == .pending) client.initialization = .failed;
         client.stdout_closed = true;
         client.killed = true;
@@ -287,6 +295,10 @@ pub const Client = struct {
     fn awaitExit(client: *Client, escalation: ?Io.Timestamp) std.process.Child.WaitError!std.process.Child.Term {
         const io = client.io;
         var deadline = escalation;
+        // A wait's cancellation wakes only its own readiness task. It must not
+        // stop other waiters or disable a still-live conversation.
+        var wake: ?transport.Wake = null;
+        defer if (wake) |w| w.deinit(io);
         while (true) {
             client.state_mutex.lockUncancelable(io);
             if (client.term) |term| {
@@ -309,7 +321,7 @@ pub const Client = struct {
                 if (client.initialization == .pending) client.initialization = .failed;
                 client.wait_error = null;
                 client.stdout_closed = true;
-                client.transport_state.stopped.store(true, .release);
+                client.transport_state.stop();
                 client.state_mutex.unlock(io);
                 return term;
             }
@@ -322,8 +334,16 @@ pub const Client = struct {
                 }
             }
             client.state_mutex.unlock(io);
-            // Canceling a waiter does not release ownership of the child.
-            try io.sleep(.fromMilliseconds(2), .awake);
+            if (client.process_watch) |watch| {
+                if (wake == null) wake = transport.Wake.init(io) catch return error.Unexpected;
+                transport.waitReady(io, watch, std.posix.POLL.IN, &wake.?, deadline) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    error.WaitFailed => return error.Unexpected,
+                };
+            } else {
+                // Process fixtures and platforms without an exit descriptor.
+                try io.sleep(.fromMilliseconds(2), .awake);
+            }
         }
     }
 
@@ -354,16 +374,19 @@ pub const Client = struct {
             defer client.state_mutex.unlock(close_io);
             forceCleanup(&client.child, close_io);
             client.stdout_closed = true;
-            client.transport_state.stopped.store(true, .release);
+            client.transport_state.stop();
             break :blk std.process.Child.Term{ .unknown = 0 };
         };
         client.read_mutex.lockUncancelable(client.io);
         client.read_mutex.unlock(client.io);
         client.stdout_reader.file.close(client.io);
+        if (client.process_watch) |watch| watch.close(client.io);
+        client.transport_state.deinit(client.io);
         const gpa = client.gpa;
         if (client.session_id) |id| gpa.free(id);
         if (client.control_error) |text| gpa.free(text);
         client.scratch.deinit();
+        if (client.view_scratch) |*arena| arena.deinit();
         client.line.deinit();
         gpa.free(client.stdin_buffer);
         gpa.free(client.stdout_buffer);
@@ -379,7 +402,7 @@ pub const Client = struct {
     }
 
     /// Last raw line or oversized prefix; empty before reading and at EOF.
-    /// Reader-thread only; borrowed until the next `next` call.
+    /// Reader-thread only; borrowed until the next call to either read API.
     pub fn lastLine(client: *const Client) []const u8 {
         return client.line.writer.buffered();
     }
@@ -437,7 +460,7 @@ pub const Client = struct {
         client.write_mutex.lockUncancelable(client.io);
         defer client.write_mutex.unlock(client.io);
         const w = try client.stdin();
-        writeCommandMessage(w, name, arguments) catch return client.writeFailure();
+        protocol.writeCommandMessage(w, name, arguments) catch return client.writeFailure();
         finishLine(w) catch return client.writeFailure();
     }
 
@@ -456,49 +479,69 @@ pub const Client = struct {
     /// Calls serialize; synchronous handlers must not reenter. Concurrent wait/kill is safe.
     /// Reaping discards buffered output. Replies after stdin closes fail with `StdinClosed`.
     pub fn next(client: *Client) ReadError!?Event {
+        return client.nextEvent(false);
+    }
+
+    /// Returns a validated streaming projection, borrowed until the next call to
+    /// either read API or `close`. Pumps controls exactly like `next`.
+    pub fn nextView(client: *Client) ReadError!?event_mod.EventView {
+        return client.nextEvent(true);
+    }
+
+    fn nextEvent(client: *Client, comptime borrowed: bool) ReadError!?(if (borrowed) event_mod.EventView else Event) {
         client.read_mutex.lockUncancelable(client.io);
         defer client.read_mutex.unlock(client.io);
+        if (client.view_scratch) |*arena| _ = arena.reset(.{ .retain_with_limit = retain_bytes });
         if (client.stdoutClosed()) return null;
         if (client.transport_state.failed.load(.acquire)) return error.TransportFailed;
 
         while (true) {
             const line = (try client.nextLine()) orelse return null;
             if (line.len == 0) continue;
-            if (!jsonDepthWithin(line)) {
-                client.transport_state.failed.store(true, .release);
+            const shape = event_mod.inspectLine(line);
+            if (!shape.depth_ok) {
+                client.transport_state.fail();
                 _ = client.forceKill() catch {};
                 return error.ProtocolTooDeep;
             }
 
-            const parsed = std.json.parseFromSlice(
-                std.json.Value,
-                client.gpa,
-                line,
-                .{ .allocate = .alloc_always },
-            ) catch |err| switch (err) {
+            var event = (if (borrowed) blk: {
+                if (client.view_scratch == null) client.view_scratch = .init(client.gpa);
+                if (event_mod.controlPrefix(line)) |kind| break :blk event_mod.EventView{ .kind = kind, .raw = line };
+                break :blk event_mod.parseView(client.view_scratch.?.allocator(), line);
+            } else blk: {
+                const parsed = event_mod.parseOwnedWithShape(client.gpa, line, shape) catch |err| break :blk err;
+                const kind = if (stringField(parsed.value, "type")) |name|
+                    std.meta.stringToEnum(Kind, name) orelse .unknown
+                else
+                    .unknown;
+                break :blk Event{ .kind = kind, .parsed = parsed };
+            }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.InvalidJson,
             };
-
-            var event: Event = .{ .kind = .unknown, .parsed = parsed };
-            if (event.getString("type")) |t| {
-                event.kind = std.meta.stringToEnum(Kind, t) orelse .unknown;
-            }
-            // `next` is the sole writer and holds `read_mutex`.
-            if (client.session_id == null) {
-                if (event.sessionId()) |id| {
-                    errdefer event.deinit();
-                    const copy = try client.gpa.dupe(u8, id);
-                    client.state_mutex.lockUncancelable(client.io);
-                    client.session_id = copy;
-                    client.state_mutex.unlock(client.io);
-                }
+            {
+                errdefer if (!borrowed) event.deinit();
+                try client.captureSessionId(event.sessionId());
             }
 
             switch (event.kind) {
-                .control_request, .sdk_control_request => {
-                    defer event.deinit();
-                    client.serveControlRequest(event.parsed.value) catch |err| switch (err) {
+                .control_request, .sdk_control_request, .control_response => {
+                    defer if (!borrowed) event.deinit();
+                    defer if (borrowed) {
+                        _ = client.view_scratch.?.reset(.{ .retain_with_limit = retain_bytes });
+                    };
+                    const parsed = if (borrowed) event_mod.parseOwnedWithShape(client.gpa, line, shape) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.InvalidJson,
+                    } else event.parsed;
+                    defer if (borrowed) parsed.deinit();
+                    if (borrowed) try client.captureSessionId(stringField(parsed.value, "session_id"));
+                    if (event.kind == .control_response) {
+                        try client.noteControlResponse(parsed.value);
+                        continue;
+                    }
+                    client.serveControlRequest(parsed.value) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.StdinClosed => return error.StdinClosed,
                         error.WriteTimedOut => return error.WriteTimedOut,
@@ -510,13 +553,19 @@ pub const Client = struct {
                         else => return error.WriteFailed,
                     };
                 },
-                .control_response => {
-                    defer event.deinit();
-                    try client.noteControlResponse(event.parsed.value);
-                },
                 else => return event,
             }
         }
+    }
+
+    // Only the reader writes this field; publish the owned copy to other threads.
+    fn captureSessionId(client: *Client, value: ?[]const u8) Allocator.Error!void {
+        if (client.session_id != null) return;
+        const id = value orelse return;
+        const copy = try client.gpa.dupe(u8, id);
+        client.state_mutex.lockUncancelable(client.io);
+        defer client.state_mutex.unlock(client.io);
+        client.session_id = copy;
     }
 
     // --- writing ---
@@ -551,7 +600,7 @@ pub const Client = struct {
     fn writeLine(client: *Client, comptime f: anytype, args: anytype) WriteError!void {
         var buffer: [max_reply_line_bytes]u8 = undefined;
         const line = renderLine(&buffer, f, args) catch {
-            client.transport_state.failed.store(true, .release);
+            client.transport_state.fail();
             return error.ReplyTooLong;
         };
         try client.writeRendered(line);
@@ -569,7 +618,7 @@ pub const Client = struct {
         if (builtin.is_test) {
             if (client.reply_override != null) return error.WriteFailed;
         }
-        client.transport_state.failed.store(true, .release);
+        client.transport_state.fail();
         client.state_mutex.lockUncancelable(client.io);
         if (client.initialization == .pending) client.initialization = .failed;
         client.state_mutex.unlock(client.io);
@@ -645,16 +694,10 @@ pub const Client = struct {
         comptime f: anytype,
         args: anytype,
     ) (WriteError || Allocator.Error)!void {
-        var body_buffer: [max_reply_line_bytes]u8 = undefined;
-        var body: Io.Writer = .fixed(&body_buffer);
-        var js: std.json.Stringify = .{ .writer = &body };
-        const body_ok = if (@call(.auto, f, .{&js} ++ args)) |_| true else |_| false;
-        if (body_ok) {
-            var frame_buffer: [max_reply_line_bytes]u8 = undefined;
-            if (renderLine(&frame_buffer, protocol.writeMcpResult, .{ request_id, message_id, body.buffered() })) |line| {
-                return client.writeRendered(line);
-            } else |_| {}
-        }
+        var frame_buffer: [max_reply_line_bytes]u8 = undefined;
+        if (renderLine(&frame_buffer, protocol.writeMcpResultBody, .{ request_id, message_id, f, args })) |line| {
+            return client.writeRendered(line);
+        } else |_| {}
         if (std.mem.eql(u8, method, "tools/call")) {
             var small_buffer: [512]u8 = undefined;
             var small: Io.Writer = .fixed(&small_buffer);
@@ -675,13 +718,7 @@ pub const Client = struct {
         decision: PermissionDecision,
     ) (WriteError || Allocator.Error)!void {
         const reply: protocol.PermissionInput = switch (decision) {
-            .deny => |message| {
-                var buffer: [max_reply_line_bytes]u8 = undefined;
-                if (renderLine(&buffer, protocol.writePermissionDeny, .{ request_id, message })) |line| {
-                    return client.writeRendered(line);
-                } else |_| {}
-                return client.sendPermissionDeny(request_id, "permission reply too large; the call was denied");
-            },
+            .deny => |message| return client.sendPermissionReply(protocol.writePermissionDeny, .{ request_id, message }),
             .allow => .{ .value = input },
             .allow_with_input => |raw| blk: {
                 if (!try isJsonObject(client.scratch.allocator(), raw)) {
@@ -690,11 +727,15 @@ pub const Client = struct {
                 break :blk .{ .raw = raw };
             },
         };
+        return client.sendPermissionReply(protocol.writePermissionAllow, .{ request_id, reply });
+    }
+
+    fn sendPermissionReply(client: *Client, comptime f: anytype, args: anytype) WriteError!void {
         var buffer: [max_reply_line_bytes]u8 = undefined;
-        if (renderLine(&buffer, protocol.writePermissionAllow, .{ request_id, reply })) |line| {
+        if (renderLine(&buffer, f, args)) |line| {
             return client.writeRendered(line);
         } else |_| {}
-        return client.sendPermissionDeny(request_id, "permission reply too large; the call was denied");
+        return client.sendPermissionDeny(args[0], "permission reply too large; the call was denied");
     }
 
     // --- control dispatch ---
@@ -917,69 +958,13 @@ fn ownRequestNumber(request_id: []const u8) ?u64 {
 
 // Keep CLI values below Stringify's fixed nesting capacity.
 fn jsonDepthWithin(text: []const u8) bool {
-    var depth: usize = 0;
-    var cursor: usize = 0;
-    while (cursor < text.len) : (cursor += 1) {
-        switch (text[cursor]) {
-            '"' => {
-                var search = cursor + 1;
-                while (std.mem.indexOfScalarPos(u8, text, search, '"')) |quote| {
-                    var escape_start = quote;
-                    while (escape_start > cursor and text[escape_start - 1] == '\\') escape_start -= 1;
-                    if ((quote - escape_start) % 2 == 0) {
-                        cursor = quote;
-                        break;
-                    }
-                    search = quote + 1;
-                } else return true; // The JSON parser reports unterminated strings.
-            },
-            '{', '[' => {
-                depth += 1;
-                if (depth > 128) return false;
-            },
-            '}', ']' => depth -|= 1,
-            else => {},
-        }
-    }
-    return true;
+    return event_mod.inspectLine(text).depth_ok;
 }
 
 fn isJsonObject(allocator: Allocator, text: []const u8) Allocator.Error!bool {
     const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (trimmed.len == 0 or trimmed[0] != '{' or !jsonDepthWithin(trimmed)) return false;
     return std.json.validate(allocator, trimmed);
-}
-
-// Escape command fragments directly into the user-message string.
-fn writeCommandMessage(w: *Io.Writer, name: []const u8, arguments: []const u8) WriteError!void {
-    var js: std.json.Stringify = .{ .writer = w };
-    try js.beginObject();
-    try js.objectField("type");
-    try js.write("user");
-    try js.objectField("message");
-    try js.beginObject();
-    try js.objectField("role");
-    try js.write("user");
-    try js.objectField("content");
-    try js.beginArray();
-    try js.beginObject();
-    try js.objectField("type");
-    try js.write("text");
-    try js.objectField("text");
-    try js.beginWriteRaw();
-    try w.writeByte('"');
-    try w.writeByte('/');
-    try std.json.Stringify.encodeJsonStringChars(name, .{}, w);
-    if (arguments.len > 0) {
-        try w.writeByte(' ');
-        try std.json.Stringify.encodeJsonStringChars(arguments, .{}, w);
-    }
-    try w.writeByte('"');
-    js.endWriteRaw();
-    try js.endObject();
-    try js.endArray();
-    try js.endObject();
-    try js.endObject();
 }
 
 fn readLine(
@@ -1121,7 +1106,7 @@ test "the line buffer keeps what readLine last produced" {
 test "sendCommand builds the command turn without a temporary buffer" {
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeCommandMessage(&out.writer, "code-review", "src/ \"quoted\"");
+    try protocol.writeCommandMessage(&out.writer, "code-review", "src/ \"quoted\"");
 
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -1145,7 +1130,7 @@ test "sendCommand builds the command turn without a temporary buffer" {
 test "sendCommand omits the separator when there are no arguments" {
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeCommandMessage(&out.writer, "compact", "");
+    try protocol.writeCommandMessage(&out.writer, "compact", "");
 
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -2066,12 +2051,29 @@ fn fuzzDispatch(_: void, smith: *std.testing.Smith) anyerror!void {
     const input = buf[0..smith.sliceWithHash(&buf, 0x7ead21)];
     if (!jsonDepthWithin(input)) return;
 
-    // Only valid JSON reaches dispatch in `next`.
-    const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{}) catch |err| switch (err) {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const projection = event_mod.parseView(arena.allocator(), input);
+    const parsed = event_mod.parseOwned(std.testing.allocator, input) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => return,
+        else => {
+            if (projection) |_| return error.ViewAcceptedInvalidJson else |view_err| {
+                if (view_err == error.OutOfMemory) return view_err;
+            }
+            return;
+        },
     };
     defer parsed.deinit();
+    const view = try projection;
+    const event: Event = .{ .kind = if (stringField(parsed.value, "type")) |name|
+        std.meta.stringToEnum(Kind, name) orelse .unknown
+    else
+        .unknown, .parsed = parsed };
+    try std.testing.expectEqual(event.kind, view.kind);
+    try std.testing.expectEqualDeep(event.subtype(), view.subtype());
+    try std.testing.expectEqualDeep(event.sessionId(), view.sessionId());
+    try std.testing.expectEqualDeep(event.textDelta(), view.textDelta());
+    try std.testing.expectEqualDeep(event.resultText(), view.resultText());
 
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -2104,6 +2106,8 @@ test "serveControlRequest answers or stays silent on arbitrary JSON, never panic
         "[1,2,3]",
         "\"just a string\"",
         "{\"request\":{\"request_id\":{\"nested\":true},\"subtype\":\"mcp_message\"}}",
+        "{\"type\":\"stream_event\",\"event\":{\"delta\":{\"type\":\"text_delta\",\"text\":\"escaped\\n\\u1234\"}}}",
+        "{\"future\":{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9,\"\\u0061\":10}}",
     } });
 }
 

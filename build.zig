@@ -20,6 +20,7 @@ comptime {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Omit debug symbols and diagnostic support from executables");
     const test_filters = b.option([]const []const u8, "test-filter", "Run tests whose names contain a filter") orelse &.{};
 
     // Share a module because Zig forbids imports above a module root.
@@ -27,12 +28,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/agent.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
 
     const demo_mod = b.createModule(.{
         .root_source_file = b.path("examples/demo.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     demo_mod.addImport("agent", agent_mod);
 
@@ -59,6 +62,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(root),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         });
         // The library root must not import itself as a second module.
         if (!std.mem.eql(u8, root, "src/agent.zig")) mod.addImport("agent", agent_mod);
@@ -73,6 +77,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         });
         mod.addImport("agent", agent_mod);
         const example = b.addExecutable(.{
@@ -87,6 +92,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("bench/next_bench.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     bench_mod.addImport("agent", agent_mod);
     const bench_exe = b.addExecutable(.{

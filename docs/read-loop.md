@@ -1,9 +1,21 @@
-# The read loop: `Client.next()`
+# The read loop: `Client.next()` and `Client.nextView()`
 
-`next()` is the only way to receive events. It also drives the control
+`next()` returns owned events and `nextView()` returns borrowed projections.
+Both drive the control
 channel: tool calls, permission prompts and control responses are handled
 inside it and never reach the caller. A host that wants tool calls served
-while it does other work keeps one thread inside `next()`.
+while it does other work keeps one thread inside either read API.
+They share the same non-reentrant read lock and must have a single consumer.
+
+`nextView()` validates the complete line, including skipped values and duplicate
+keys, but retains only `kind`, `subtype`, `session_id`, `event.delta` text and
+`result` text. Unescaped strings borrow the line; escaped strings use a reusable
+arena. Unknown fields remain available in `view.raw`, or through
+`try view.toOwned(allocator)`. Views need no `deinit` and expire on the next call
+to either read API, even if it returns an error or EOF, or on client closure.
+Owned copies retain all fields and survive later reads and client closure.
+Control frames still use full owned trees for dispatch; a compact-header hint
+avoids projecting them first, and never bypasses full validation.
 
 ## Control flow
 
@@ -25,7 +37,7 @@ flowchart TD
         Empty -- yes --> RL
         Empty -- no --> Depth{"JSON depth at most 128?"}
         Depth -- no --> Deep["mark transport failed<br/>forceKill()"] --> EPD[["ProtocolTooDeep"]]
-        Depth -- yes --> Parse["std.json.parseFromSlice<br/>(alloc_always)"]
+        Depth -- yes --> Parse["owned tree or borrowed projection<br/>(complete validation)"]
         Parse -- "syntax error" --> EIJ[["InvalidJson"]]
         Parse -- "OOM" --> EOOM[["OutOfMemory"]]
         Parse -- ok --> Kind["kind = stringToEnum(type) or unknown"]
@@ -109,7 +121,8 @@ break exhaustive switches.
 |---|---|---|
 | `Event` returned by `next()` | Caller | `event.deinit()` |
 | Slices from `Event` accessors | The event's parse tree | `event.deinit()` |
-| `lastLine()` | Client, reader thread only | The next `next()` call |
+| `EventView`, its strings and `raw` | Client, reader thread only | The next read API call or `close()` |
+| `lastLine()` | Client, reader thread only | The next read API call |
 | `lastControlError()` | Client, reader thread only | The next rejection or `close()` |
 | `sessionId()` | Client, synchronized | `close()` |
 
@@ -130,6 +143,11 @@ session, both are released once they grow past 1 MiB:
   valid until the next read.
 - The scratch arena is reset with `retain_with_limit = 1 MiB` before each
   dispatch.
+- The view decoding arena uses the same retention cap between reads and
+  consumed controls. Small owned events reserve a block sized from the object
+  count already collected during the depth check. Flat envelopes use a smaller
+  reservation than nested ones; array-containing, large or complex shapes use
+  the standard parser to avoid reserve-driven growth of array storage.
 
 The benchmark's `recovery` workload (one 2 MiB event, then small deltas)
 checks this.

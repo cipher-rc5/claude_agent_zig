@@ -4,12 +4,71 @@
 const std = @import("std");
 const Io = std.Io;
 const posix = std.posix;
+const builtin = @import("builtin");
+
+// A persistent byte broadcasts a terminal state to every poll waiter. These
+// descriptors stay open until all client calls and their readiness tasks join.
+pub const Wake = struct {
+    files: [2]Io.File,
+
+    pub fn init(io: Io) error{TransportFailed}!Wake {
+        var fds: [2]posix.fd_t = undefined;
+        if (posix.errno(posix.system.pipe(&fds)) != .SUCCESS) return error.TransportFailed;
+        const wake: Wake = .{ .files = .{
+            .{ .handle = fds[0], .flags = .{ .nonblocking = false } },
+            .{ .handle = fds[1], .flags = .{ .nonblocking = false } },
+        } };
+        errdefer wake.deinit(io);
+        for (wake.files) |file| {
+            try nonblocking(file);
+            try closeOnExec(file);
+        }
+        return wake;
+    }
+
+    pub fn deinit(wake: Wake, io: Io) void {
+        for (wake.files) |file| file.close(io);
+    }
+
+    pub fn signal(wake: *const Wake) void {
+        const byte = [_]u8{1};
+        while (true) {
+            const rc = posix.system.write(wake.files[1].handle, &byte, byte.len);
+            // EAGAIN means a byte is already present; all waiters will wake.
+            if (posix.errno(rc) != .INTR) return;
+        }
+    }
+};
 
 pub const State = struct {
     stopped: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     stdin_closed: std.atomic.Value(bool) = .init(false),
+    wake: ?Wake = null,
+
+    pub fn init(io: Io) error{TransportFailed}!State {
+        return .{ .wake = try .init(io) };
+    }
+
+    pub fn deinit(state: *State, io: Io) void {
+        if (state.wake) |wake| wake.deinit(io);
+    }
+
+    pub fn stop(state: *State) void {
+        state.stopped.store(true, .release);
+        if (state.wake) |*wake| wake.signal();
+    }
+
+    pub fn fail(state: *State) void {
+        state.failed.store(true, .release);
+        if (state.wake) |*wake| wake.signal();
+    }
 };
+
+fn closeOnExec(file: Io.File) error{TransportFailed}!void {
+    if (posix.errno(posix.system.fcntl(file.handle, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC))) != .SUCCESS)
+        return error.TransportFailed;
+}
 
 pub fn nonblocking(file: Io.File) error{TransportFailed}!void {
     const flags = posix.system.fcntl(file.handle, posix.F.GETFL, @as(usize, 0));
@@ -19,13 +78,116 @@ pub fn nonblocking(file: Io.File) error{TransportFailed}!void {
         return error.TransportFailed;
 }
 
-fn waitReady(file: Io.File, events: i16) error{WaitFailed}!void {
-    var fds = [_]posix.pollfd{.{ .fd = file.handle, .events = events, .revents = 0 }};
-    const result = posix.system.poll(&fds, 1, 2);
-    switch (posix.errno(result)) {
-        .SUCCESS, .INTR => {},
+const Readiness = struct {
+    io: Io,
+    file: Io.File,
+    wake: *const Wake,
+    events: i16,
+    deadline: ?Io.Timestamp,
+    done: Io.Event = .unset,
+    failed: bool = false,
+
+    fn run(wait: *Readiness) void {
+        var fds = [_]posix.pollfd{
+            .{ .fd = wait.file.handle, .events = wait.events, .revents = 0 },
+            .{ .fd = wait.wake.files[0].handle, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const result = posix.system.poll(&fds, fds.len, remainingTimeout(wait.io, wait.deadline));
+        wait.failed = switch (posix.errno(result)) {
+            .SUCCESS, .INTR => false,
+            else => true,
+        };
+        wait.done.set(wait.io);
+    }
+};
+
+// Io.Event is a cancellation point; raw POSIX poll is not. A readiness task
+// blocks in poll while the caller parks in the Io runtime. Cancellation wakes
+// the task before joining it, so no background task can outlive its descriptors.
+pub fn canPark(io: Io) bool {
+    return io.vtable.concurrent == Io.Threaded.global_single_threaded.io().vtable.concurrent;
+}
+
+pub fn waitReady(io: Io, file: Io.File, events: i16, wake: ?*const Wake, deadline: ?Io.Timestamp) (error{WaitFailed} || Io.Cancelable)!void {
+    try io.checkCancel();
+    var timeout = remainingTimeout(io, deadline);
+    if (timeout == 0) return;
+    // Most pipe stalls resolve immediately as the peer writes its next chunk.
+    // Probe once before allocating a task; an idle pipe then parks indefinitely.
+    var fds = [_]posix.pollfd{
+        .{ .fd = file.handle, .events = events, .revents = 0 },
+        .{ .fd = if (wake) |w| w.files[0].handle else -1, .events = posix.POLL.IN, .revents = 0 },
+    };
+    const probe = posix.system.poll(&fds, fds.len, if (timeout < 0) 2 else @min(timeout, 2));
+    switch (posix.errno(probe)) {
+        .SUCCESS => if (probe > 0) return,
+        .INTR => return,
         else => return error.WaitFailed,
     }
+    timeout = remainingTimeout(io, deadline);
+    if (timeout == 0) return;
+    if (wake) |w| {
+        // Evented runtimes may run concurrent functions as fibers. Raw poll
+        // must not block their scheduler; only Threaded's worker pool is used.
+        // The toolchain is pinned, and its public io() exposes this vtable.
+        if (!canPark(io)) return;
+        var wait: Readiness = .{ .io = io, .file = file, .wake = w, .events = events, .deadline = deadline };
+        if (io.concurrent(Readiness.run, .{&wait})) |task| {
+            var future = task;
+            defer {
+                const protection = io.swapCancelProtection(.blocked);
+                defer _ = io.swapCancelProtection(protection);
+                future.await(io);
+            }
+            wait.done.wait(io) catch |err| {
+                w.signal();
+                return err;
+            };
+            if (wait.failed) return error.WaitFailed;
+            return;
+        } else |_| {}
+    }
+    // A runtime without a spare concurrent task retains bounded cancellation.
+    // Private fixtures without a wake descriptor use the same fallback.
+    // The probe above already performed this fallback's bounded wait.
+}
+
+fn remainingTimeout(io: Io, deadline: ?Io.Timestamp) c_int {
+    const limit = deadline orelse return -1;
+    const remaining = limit.nanoseconds - Io.Clock.awake.now(io).nanoseconds;
+    if (remaining <= 0) return 0;
+    return @intCast(@min(std.math.maxInt(c_int), @divTrunc(remaining + 999_999, 1_000_000)));
+}
+
+/// Observe exit without reaping. Keeping the ready event queued lets every
+/// waiter wake; `Client` still owns the single waitpid under its state lock.
+pub fn watchChild(io: Io, pid: std.process.Child.Id) error{TransportFailed}!?Io.File {
+    if (comptime builtin.os.tag == .macos) {
+        const fd = posix.system.kqueue();
+        if (fd < 0) return error.TransportFailed;
+        const file: Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+        errdefer file.close(io);
+        try closeOnExec(file);
+        const change = [_]posix.Kevent{.{
+            .ident = @intCast(pid),
+            .filter = std.c.EVFILT.PROC,
+            .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+            .fflags = std.c.NOTE.EXIT,
+            .data = 0,
+            .udata = 0,
+        }};
+        const zero: posix.timespec = .{ .sec = 0, .nsec = 0 };
+        var unused: [0]posix.Kevent = .{};
+        const result = posix.system.kevent(fd, &change, change.len, &unused, 0, &zero);
+        switch (posix.errno(result)) {
+            .SUCCESS => return file,
+            .SRCH => {
+                file.close(io);
+                return null; // Already exited; the next waitpid observes it.
+            },
+            else => return error.TransportFailed,
+        }
+    } else return null;
 }
 
 pub const Writer = struct {
@@ -53,7 +215,7 @@ pub const Writer = struct {
             if (w.state.stopped.load(.acquire) or w.state.failed.load(.acquire)) return error.WriteFailed;
             if (Io.Clock.awake.now(w.io).nanoseconds >= w.deadline.nanoseconds) {
                 w.timed_out = true;
-                w.state.failed.store(true, .release);
+                w.state.fail();
                 return error.WriteFailed;
             }
             const n = posix.system.write(w.file.handle, rest.ptr, @min(rest.len, 64 * 1024));
@@ -63,14 +225,14 @@ pub const Writer = struct {
                     rest = rest[@intCast(n)..];
                 },
                 .INTR => continue,
-                .AGAIN => waitReady(w.file, posix.POLL.OUT) catch return w.fail(),
+                .AGAIN => waitReady(w.io, w.file, posix.POLL.OUT, if (w.state.wake) |*wake| wake else null, w.deadline) catch return w.fail(),
                 else => return w.fail(),
             }
         }
     }
 
     fn fail(w: *Writer) Io.Writer.Error {
-        w.state.failed.store(true, .release);
+        w.state.fail();
         return error.WriteFailed;
     }
 
@@ -114,7 +276,10 @@ pub const Reader = struct {
         const use_buffer = r.buffer.len - r.end > data[0].len;
         const dest = if (use_buffer) r.buffer[r.end..] else data[0];
         while (true) {
-            self.io.checkCancel() catch return error.ReadFailed;
+            self.io.checkCancel() catch {
+                self.state.fail();
+                return error.ReadFailed;
+            };
             if (self.state.stopped.load(.acquire)) return error.EndOfStream;
             if (self.state.failed.load(.acquire)) return error.ReadFailed;
             const n = posix.system.read(self.file.handle, dest.ptr, dest.len);
@@ -128,7 +293,10 @@ pub const Reader = struct {
                     return @intCast(n);
                 },
                 .INTR => continue,
-                .AGAIN => waitReady(self.file, posix.POLL.IN) catch return error.ReadFailed,
+                .AGAIN => waitReady(self.io, self.file, posix.POLL.IN, if (self.state.wake) |*wake| wake else null, null) catch {
+                    self.state.fail();
+                    return error.ReadFailed;
+                },
                 else => return error.ReadFailed,
             }
         }
@@ -173,6 +341,21 @@ fn testPipe() ![2]Io.File {
     errdefer for (pair) |file| file.close(std.testing.io);
     for (pair) |file| try nonblocking(file);
     return pair;
+}
+
+test "a readiness task starting after its deadline completes without waiting for pipe activity" {
+    const io = std.testing.io;
+    const pair = try testPipe();
+    defer for (pair) |file| file.close(io);
+    const wake = try Wake.init(io);
+    defer wake.deinit(io);
+    const deadline = Io.Clock.awake.now(io);
+    var task: Readiness = .{ .io = io, .file = pair[0], .wake = &wake, .events = posix.POLL.IN, .deadline = deadline };
+    const start = Io.Clock.awake.now(io);
+    task.run();
+    try std.testing.expect(!task.failed);
+    try std.testing.expectEqual(Io.Event.is_set, task.done);
+    try std.testing.expect(start.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 100);
 }
 
 test "writer preserves buffered bytes and repeated slices through a pipe" {

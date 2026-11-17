@@ -242,7 +242,7 @@ Three directories, by role: `src/` is the library, `examples/` holds executable 
 |---|---|
 | `src/agent.zig` | Public surface. Re-exports the types below; import just this. |
 | `src/options.zig` | `Options`, `PermissionMode`, `min_cli_version`, and the CLI flags they become. |
-| `src/event.zig` | `Event` and `Kind`: one protocol line, and how to read it. |
+| `src/event.zig` | Owned `Event`, borrowed `EventView`, and `Kind`: parsing and accessors. |
 | `src/tool.zig` | `Tool`, `ToolResult`, `McpServer`, and the permission handler types. |
 | `src/protocol.zig` | The wire format — every line this process writes to the CLI. |
 | `src/client.zig` | `Client`: process lifecycle, the read loop, control dispatch. |
@@ -306,6 +306,17 @@ switch (try client.wait()) {
 }
 ```
 
+Streaming consumers can use `client.nextView()` in the same loop. It returns
+an `EventView` with `kind`, `raw`, `subtype()`, `sessionId()`, `textDelta()` and
+`resultText()`, without building a full JSON tree. Do not call `deinit` on a
+view: its raw JSON and decoded strings are borrowed until the next call to
+either `next()` or `nextView()`, or until `close()`. Call
+`var owned = try view.toOwned(gpa)` before that point to retain it or inspect
+arbitrary fields, and release the owned copy with `owned.deinit()`.
+Both APIs validate the complete JSON line, reject duplicate object keys,
+enforce the same nesting and line limits, and pump the same control channel.
+Keep one consumer across the two APIs; handlers must not reenter either one.
+
 These foreground-only examples cover [streaming](examples/streaming.zig),
 [permission decisions](examples/permissions.zig),
 [initialization rejection](examples/initialization.zig), and
@@ -364,7 +375,7 @@ result and do not manage background tasks.
 
 ## Notes on the implementation
 
-- `Client` is heap allocated because `Io.File.Reader` and `Io.File.Writer`
+- `Client` is heap allocated because its transport reader and writer
   embed the `Io.Reader` and `Io.Writer` interfaces that the vtable recovers
   with `@fieldParentPtr`. A stable address keeps that honest.
 - Lines are read with `streamDelimiterLimit` into an `Io.Writer.Allocating`,
@@ -375,12 +386,23 @@ result and do not manage background tasks.
   became of it: the line behind the event `next()` returned, the line that
   failed to parse behind `error.InvalidJson`, or the prefix that fit before
   `error.ProtocolTooLong` cut the rest off. It is empty before the first read
-  and after end of stream, and valid only until the next call to `next()`,
+  and after end of stream, and valid only until the next call to either read API,
   which reuses the buffer.
 - The line buffer and the scratch arena behind tool dispatch keep their
   capacity up to 1 MiB, so the usual small line costs no allocation, and are
   released past it. One event near `max_line_bytes` (32 MiB by default) no
   longer pins that much memory for the rest of the session.
+- Owned parsing reserves one arena block for ordinary small envelopes instead
+  of growing several blocks. Larger lines retain the standard parser path.
+  Borrowed views use a separate arena for escaped strings and wide-object key
+  validation; its retained capacity is also capped at 1 MiB between reads.
+- Pipe stalls receive one short readiness probe, then park in the I/O runtime
+  while a readiness task watches the pipe and a wake descriptor. Stop, failure
+  and cancellation wake blocked I/O without closing active descriptors. If a
+  runtime is not `std.Io.Threaded` or has no spare concurrent task, bounded
+  polling remains the fallback so raw polling cannot block a fiber scheduler.
+  On macOS with `std.Io.Threaded`, a process-exit notification wakes waiters; `waitpid` and signals
+  remain serialized under the same state lock.
 - Events are parsed to `std.json.Value` rather than to fixed structs. The event
   schema gains fields regularly, and a strict struct would break on the next
   CLI release. Typed accessors sit on top. `Kind` is exhaustive on purpose:
@@ -407,12 +429,13 @@ result and do not manage background tasks.
 - Public writes distinguish closed stdin, write failure, deadline expiration,
   terminal transport, and a full pending-interrupt list. A partial write or
   deadline failure disables further writes; start a new session after cleanup.
-- The control channel is pumped only while the caller is inside `next()`. That
+- The control channel is pumped only while the caller is inside `next()` or
+  `nextView()`. That
   is fine for a turn-driven loop, since the caller is always there while the
   agent is working. A host that wants tool calls serviced while it does other
   work keeps one thread in `next` and drives the rest from others.
 - Client methods synchronize stdin writes, event reading, and lifecycle state.
-  Keep a single `next()` consumer; handlers must not call its non-reentrant
+  Keep a single consumer across both read APIs; handlers must not call their non-reentrant
   read loop. `close()` destroys the client and must follow every other call
   and every thread join. Handlers may call send methods or termination APIs.
 - `lastLine()` belongs to the `next()` consumer until its next call.
@@ -449,10 +472,12 @@ benchmarks also require `/bin/sh`. Windows is not supported.
 
 ```
 zig build
+zig build -Doptimize=ReleaseFast -Dstrip=true # compact release executable
 zig build test
 CLAUDE_BIN=claude zig build run -- "explain this repo"
 zig build examples-check     # compile complete lifecycle examples
 zig build bench -Doptimize=ReleaseFast -- 20000 all 5
+zig build bench -Doptimize=ReleaseFast -- 20000 all 5 view
 zig build docs               # autodocs for the agent module into zig-out/docs/
 ```
 
@@ -466,6 +491,7 @@ alone lists every recipe:
 
 ```
 just build                        # zig build
+just build-release                # ReleaseFast with stripping
 just test                         # zig build test
 just test-release                 # zig build test -Doptimize=ReleaseSafe
 just dev "explain this repo"      # build and run one turn
@@ -476,7 +502,7 @@ just canary-strict                # fail if CLI compatibility cannot be checked
 just ci-full                      # extended gate plus strict CLI parser probes
 just runtime-validate _dev/validation/macos # fresh tests, 100 stress runs/group, generated fuzz
 just compatibility-live _dev/validation/live # opt-in model calls with sanitized evidence
-just bench [lines] [workload] [runs] # real-pipe benchmark, ReleaseFast
+just bench [lines] [workload] [runs] [owned|view] # real-pipe benchmark, ReleaseFast
 just docs                         # autodocs into zig-out/docs/
 just release <version>            # dist/: tarball, SHA256SUMS, SBOM, optional signature
 just release-verify <version>     # check dist/ sums, and the signature when configured
@@ -488,7 +514,9 @@ Benchmark workloads are `normal`, `escaped`, `large` (8 KiB deltas),
 `control` (one dispatched MCP tool call per delta), and `recovery` (one
 2 MiB event followed by normal deltas); `all` runs each. Output is JSONL,
 one record per repetition. Startup and transcript generation are excluded;
-latency includes `next()`, accessor work, and owned-event cleanup. Retained
+The optional fourth argument selects `owned` (default) or `view` reads;
+latency includes the selected read API, accessor work, and owned-event cleanup
+where applicable. Retained
 SDK memory is measured after EOF and before `close`; harness transcript and
 latency-array memory are excluded. The recovery workload checks that a large
 valid event does not pin its buffers for subsequent small events.
@@ -504,6 +532,11 @@ in seeded, balanced pairs, excluding warmups. It records build/source hashes,
 host load, raw metrics, and paired uncertainty estimates in a new ignored
 directory. Compile both executables with the same harness, Zig, mode, and
 target; the collector rejects mismatched metadata or changing inputs.
+`--event-mode view` measures views, while explicit `--before-event-mode` and
+`--after-event-mode` overrides allow a recorded comparison between read APIs.
+`-Dstrip=true` is opt-in and applies to the library and executable modules.
+Use `ReleaseFast` for the usual speed/size balance; `ReleaseSmall` remains
+available when executable size matters more than throughput.
 
 The tooling files, none of which are part of the package:
 
@@ -578,6 +611,9 @@ exe.root_module.addImport("agent", agent);
 ```
 
 Environment variables read by the demo: `CLAUDE_BIN` selects the CLI binary;
+`AGENT_OUTPUT` selects `auto` (default: flush deltas to terminals and buffer
+redirected output), `stream` (flush every delta), `buffered` (flush at results
+and EOF), or `final` (also disable partial messages in the CLI);
 `AGENT_SKILLS` is a comma list restricting which skills the agent may invoke
 on its own, where unset allows every discovered skill and the empty string
 allows none; and `AGENT_PERMISSIONS=host` routes the CLI's permission prompts

@@ -50,7 +50,8 @@ flowchart TD
 | `zig build test` | Runs the three test roots. Accepts `-Dtest-filter=<substr>`. |
 | `zig build test-compile` | Compiles the test roots without running them. |
 | `zig build examples-check` | Compiles the four complete examples without running them. |
-| `zig build bench -- <lines> <workload> <runs>` | Real-pipe benchmark of `Client.next()`. |
+| `zig build -Doptimize=ReleaseFast -Dstrip=true` | Compact release demo; stripping applies to both modules. |
+| `zig build bench -- <lines> <workload> <runs> [owned\|view]` | Real-pipe benchmark of either read API. |
 | `zig build docs` | Autodocs for the `agent` module. |
 
 ## Test roots and discovery
@@ -172,7 +173,8 @@ committer. Intermediate commits in a pushed range are not tested.
 ## Benchmark
 
 `bench/next_bench.zig` feeds a synthetic transcript through a real pipe and
-times `Client.next()`. Each repetition prints one JSONL record:
+times `Client.next()` (default) or `nextView()` (fourth argument `view`). Each
+repetition prints one JSONL record with an explicit `event_mode`:
 
 | Workload | Shape |
 |---|---|
@@ -189,6 +191,9 @@ and after-close SDK memory. Use at least five ReleaseFast runs. A repeatable
 regression above 10% in median throughput or allocated bytes per event is
 worth investigating. `scripts/bench_compare.py` runs seeded, balanced
 before/after pairs with build and source fingerprints.
+It validates the requested read mode against every sample. Use `--event-mode`
+for both executables, or explicit `--before-event-mode` and `--after-event-mode`
+overrides to compare the owned and borrowed APIs deliberately.
 
 ## Release pipeline
 
@@ -250,6 +255,7 @@ git but are not part of the package.
 | `CLAUDE_BIN` | demo, examples, `justfile`, canary | CLI binary. Default `claude`. |
 | `AGENT_SKILLS` | demo | Comma-separated skill allowlist. Unset allows all, empty allows none. |
 | `AGENT_PERMISSIONS` | demo | `host` installs the demo's log-and-allow permission handler. |
+| `AGENT_OUTPUT` | demo | `auto` flushes terminal deltas and buffers redirected output; `stream` flushes every delta; `buffered` flushes at results/EOF; `final` also disables partial messages. |
 | `LOCAL_GATE_TIMEOUT_SECONDS` | `scripts/gate.py` | Per-command deadline in seconds. |
 | `RELEASE_SIGNING_KEY` | `release.sh` | SSH private key used to sign `SHA256SUMS`. |
 | `RELEASE_ALLOWED_SIGNERS` | `release-verify.sh` | `allowed_signers` file; enables signature checking. |

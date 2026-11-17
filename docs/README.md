@@ -19,7 +19,7 @@ standard library.
 | [architecture.md](architecture.md) | Module graph, layering, build graph, trust boundaries. |
 | [api-reference.md](api-reference.md) | Public types re-exported by `src/agent.zig`, every `Options` field, error sets, limits. |
 | [client-lifecycle.md](client-lifecycle.md) | `open`, initialization handshake, `wait`/`terminate`/`forceKill`/`close`, state machines. |
-| [read-loop.md](read-loop.md) | `Client.next()`: line framing, parsing, event classification, error recovery. |
+| [read-loop.md](read-loop.md) | Owned `next()` and borrowed `nextView()`: framing, validation, lifetimes and error recovery. |
 | [control-protocol.md](control-protocol.md) | Control request dispatch: in-process MCP tools, permission prompts, request correlation. |
 | [wire-protocol.md](wire-protocol.md) | JSON schema of every message the client reads or writes, with examples. |
 | [concurrency.md](concurrency.md) | Mutexes, lock order, atomics, which calls are safe from which thread. |
@@ -32,7 +32,7 @@ standard library.
 |---|---|---|
 | `src/agent.zig` | Public surface; re-exports everything callers use. | [api-reference.md](api-reference.md) |
 | `src/options.zig` | `Options`, `PermissionMode`, `buildArgv`. | [api-reference.md](api-reference.md), [client-lifecycle.md](client-lifecycle.md) |
-| `src/event.zig` | `Event`, `Kind`, JSON field accessors. | [read-loop.md](read-loop.md) |
+| `src/event.zig` | `Event`, `EventView`, `Kind`, parsing and field accessors. | [read-loop.md](read-loop.md) |
 | `src/tool.zig` | `Tool`, `McpServer`, handler and decision types. | [control-protocol.md](control-protocol.md) |
 | `src/protocol.zig` | Serializers for every outbound line. | [wire-protocol.md](wire-protocol.md) |
 | `src/client.zig` | Process lifecycle, read loop, control dispatch. | [client-lifecycle.md](client-lifecycle.md), [read-loop.md](read-loop.md), [control-protocol.md](control-protocol.md) |

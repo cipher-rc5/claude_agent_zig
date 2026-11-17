@@ -46,8 +46,8 @@ the handler returns, so a handler may call `send`.
 | `failed` | A write fails or times out; `ProtocolTooDeep`; `ReplyTooLong` | Returns `ReadFailed` (`next` reports `TransportFailed`) | Returns `WriteFailed` |
 | `stdin_closed` | `closeStdin` | (not read) | Shown in `status()` |
 
-Because the reader and writer check these flags every 2 ms poll, setting
-`stopped` releases a thread blocked on a pipe without touching its
+State transitions also signal a persistent wake descriptor. This releases
+every readiness task blocked on a pipe without touching its active
 descriptor. This matters when a grandchild inherited the pipe and keeps it
 open after the direct child exits.
 
@@ -99,7 +99,10 @@ sequenceDiagram
 ## The single reaper
 
 `wait`, `terminate`, `kill`, `forceKill` and `close` all go through
-`awaitExit`. It polls `waitpid(WNOHANG)` every 2 ms under `state_mutex`. The
+`awaitExit`. It checks `waitpid(WNOHANG)` under `state_mutex` and, on macOS,
+waits on a process-exit descriptor between checks when using `std.Io.Threaded`.
+Other backends retain cancelable runtime sleeps; other platforms retain a
+2 ms polling fallback. The
 signal path takes the same lock, which prevents two problems:
 
 - **PID reuse**: once `waitpid` reports an exit, `child.id` is set to `null`
@@ -125,5 +128,8 @@ signal path takes the same lock, which prevents two problems:
 `swapCancelProtection(.blocked)` for their duration, so a cancellation
 request cannot interrupt cleanup halfway. Cancelling a thread that is waiting
 on the child does not give up ownership of that child. The transport's
-read and write loops call `io.checkCancel()` and turn a cancellation into
-`ReadFailed` / `WriteFailed`.
+read and write loops call `io.checkCancel()`. Parked I/O uses a cancelable
+`Io.Event` wait; cancellation signals the wake descriptor before joining the
+readiness task. Read cancellation makes the transport terminal and surfaces as
+`TransportFailed`; write cancellation surfaces as `WriteFailed`. A canceled
+process waiter leaves the conversation's transport intact and returns `Canceled`.

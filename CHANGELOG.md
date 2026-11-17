@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Borrowed `Client.nextView()` / `EventView` streaming projections with complete
+  validation and explicit conversion to independently owned events.
+- Opt-in `-Dstrip=true` and `just build-release`, plus owned/view benchmark
+  modes with explicit paired-comparison mode validation.
+- Demo output modes through `AGENT_OUTPUT`: terminal-aware buffering, forced
+  streaming, buffered output, and final-result-only CLI events.
 - Host permission callbacks with allow, replacement-input, and deny decisions.
 - `Client.status()` and `InitializationState` for synchronized lifecycle and
   handshake state. `InitializationRejected` distinguishes handshake rejection
@@ -37,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Small owned events reserve one parse-arena block; MCP results render once
+  into a complete bounded frame. User-message framing and permission fallbacks
+  share implementations.
+- Idle pipe waits park after one short probe and wake on terminal state or
+  cancellation. On macOS, exit notifications replace periodic child polling
+  while preserving synchronized reap ownership and escalation deadlines.
 - Platform support and required validation now target macOS on Apple Silicon;
   Linux remains untested and is no longer part of the required gate.
 - Requires Zig 0.17.1 exactly; updated argument forwarding, array syntax, and

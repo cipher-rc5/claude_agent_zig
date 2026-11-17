@@ -22,6 +22,7 @@ def main():
         ["zig", "build", "examples-check"],
         ["python3", "scripts/compatibility.py"],
         ["zig", "build", "bench", "-Doptimize=ReleaseFast", "--", "20", "normal", "1"],
+        ["zig", "build", "bench", "-Doptimize=ReleaseFast", "--", "20", "normal", "1", "view"],
         ["python3", "scripts/demo-smoke.py"],
     ]
     commands[0:0] = [["bash", "-n", str(file)] for file in sorted((root / "scripts").glob("*.sh"))]

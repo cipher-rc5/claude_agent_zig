@@ -149,3 +149,94 @@ test "transport contract: one-byte buffers preserve escaped user messages" {
     try std.testing.expect(try client.next() == null);
     try std.testing.expectEqual(agent.Term{ .exited = 0 }, try client.wait());
 }
+
+const CancelTask = struct {
+    client: *agent.Client,
+    started: std.Io.Event = .unset,
+
+    fn read(self: *CancelTask) agent.ReadError!void {
+        self.started.set(io);
+        var event = (try self.client.next()) orelse return;
+        event.deinit();
+    }
+
+    fn wait(self: *CancelTask) agent.WaitError!void {
+        self.started.set(io);
+        _ = try self.client.wait();
+    }
+};
+
+test "transport contract: canceling parked reads and waits joins their readiness tasks" {
+    inline for (.{ false, true }) |waiting| {
+        var stub = try Stub.init(
+            \\#!/bin/sh
+            \\printf '%s\n' '{"type":"system","subtype":"ready"}'
+            \\exec sleep 4
+            \\
+        );
+        defer stub.deinit();
+        const client = try stub.open(.{});
+        defer _ = client.close();
+        var ready = (try client.next()).?;
+        ready.deinit();
+        var task: CancelTask = .{ .client = client };
+        var future = try io.concurrent(if (waiting) CancelTask.wait else CancelTask.read, .{&task});
+        defer future.cancel(io) catch {};
+        try task.started.wait(io);
+        try io.sleep(.fromMilliseconds(25), .awake);
+        const start = std.Io.Clock.awake.now(io);
+        if (waiting) {
+            try std.testing.expectError(error.Canceled, future.cancel(io));
+            try std.testing.expect(!client.status().transport_failed);
+        } else {
+            try std.testing.expectError(error.TransportFailed, future.cancel(io));
+            try std.testing.expect(client.status().transport_failed);
+        }
+        try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 1_500);
+        _ = try client.forceKill();
+    }
+}
+
+test "transport contract: other Io backends retain cancelable process sleeps" {
+    const Backend = struct {
+        var sleeps: std.atomic.Value(usize) = .init(0);
+
+        fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+
+        fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            _ = sleeps.fetchAdd(1, .monotonic);
+            return io.vtable.sleep(userdata, timeout);
+        }
+    };
+    Backend.sleeps.store(0, .monotonic);
+    var vtable = io.vtable.*;
+    vtable.concurrent = Backend.concurrent;
+    vtable.sleep = Backend.sleep;
+    const fallback_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var stub = try Stub.init(
+        \\#!/bin/sh
+        \\printf '%s\n' '{"type":"system","subtype":"ready"}'
+        \\exec sleep 4
+        \\
+    );
+    defer stub.deinit();
+    const client = try agent.Client.open(gpa, fallback_io, .{ .claude_path = stub.path });
+    defer _ = client.close();
+    var ready = (try client.next()).?;
+    ready.deinit();
+    var task: CancelTask = .{ .client = client };
+    var future = try io.concurrent(CancelTask.wait, .{&task});
+    defer {
+        _ = client.forceKill() catch {};
+        future.cancel(io) catch {};
+    }
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(1_000));
+    while (Backend.sleeps.load(.monotonic) == 0) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.BackendNotYielding;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+    try std.testing.expect(!client.status().transport_failed);
+}

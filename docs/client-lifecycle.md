@@ -188,7 +188,7 @@ sequenceDiagram
     R-->>R: Reader sees stopped, returns EndOfStream
     R-->>R: next() returns null
 
-    loop every 2 ms until term is set
+    loop until term is set
         C->>S: lock
         C->>CLI: waitpid(WNOHANG)
         alt exited
@@ -199,7 +199,7 @@ sequenceDiagram
             C->>S: unlock
         else still running
             C->>S: unlock
-            C->>C: sleep 2 ms
+            C->>C: wait for process exit or grace deadline
         end
     end
     C->>C: closeStdin()
@@ -208,7 +208,9 @@ sequenceDiagram
 
 Setting `stopped` before sending the signal matters. A reader or writer
 blocked on a pipe that a descendant process still holds open would otherwise
-wait forever. The flag makes both return on their next 2 ms poll.
+wait forever. Publishing the flag also signals the wake descriptor, releasing
+both I/O waits. On macOS the exit descriptor avoids periodic process polling;
+other platforms and runtimes without concurrent capacity retain a fallback.
 
 ### `close`
 

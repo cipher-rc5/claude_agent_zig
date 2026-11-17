@@ -1,6 +1,6 @@
 // bench/next_bench.zig
 // Measures streaming, control dispatch, and allocator costs over real pipes.
-// Arguments: delta count (20000), workload (normal), repetitions (1).
+// Arguments: delta count (20000), workload (normal), repetitions (1), mode (owned).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -187,7 +187,7 @@ fn controlTool(context: ?*anyopaque, _: std.mem.Allocator, _: std.json.Value) !a
     return .{ .text = "ok" };
 }
 
-fn measure(init: std.process.Init, out: *std.Io.Writer, stub: *Stub, lines: usize, workload: Workload, repetition: usize) !void {
+fn measure(comptime borrowed: bool, init: std.process.Init, out: *std.Io.Writer, stub: *Stub, lines: usize, workload: Workload, repetition: usize) !void {
     var counting: CountingAllocator = .{ .child = init.gpa };
     var control_calls: usize = 0;
     const tools = [_]agent.Tool{.{
@@ -208,8 +208,8 @@ fn measure(init: std.process.Init, out: *std.Io.Writer, stub: *Stub, lines: usiz
     };
 
     // Exclude startup; measured events include their normal ownership and cleanup.
-    var ready = (try client.next()) orelse return error.MissingReadyEvent;
-    ready.deinit();
+    var ready = (try (if (borrowed) client.nextView() else client.next())) orelse return error.MissingReadyEvent;
+    if (!borrowed) ready.deinit();
     const bytes_before = counting.allocated_bytes;
     const allocations_before = counting.allocations;
     counting.peak_live_bytes = counting.live_bytes;
@@ -223,13 +223,13 @@ fn measure(init: std.process.Init, out: *std.Io.Writer, stub: *Stub, lines: usiz
     const started = std.Io.Clock.Timestamp.now(init.io, .awake);
     while (true) {
         const event_started = std.Io.Clock.Timestamp.now(init.io, .awake);
-        var event = (try client.next()) orelse break;
+        var event = (try (if (borrowed) client.nextView() else client.next())) orelse break;
         if (event.textDelta()) |text| {
             deltas += 1;
             delta_bytes += text.len;
         }
         if (event.kind == .result) client.closeStdin();
-        event.deinit();
+        if (!borrowed) event.deinit();
         if (events == latencies.len) return error.EventCountMismatch;
         latencies[events] = @intCast(event_started.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw.toNanoseconds());
         events += 1;
@@ -250,8 +250,9 @@ fn measure(init: std.process.Init, out: *std.Io.Writer, stub: *Stub, lines: usiz
     std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
     const ns: f64 = @floatFromInt(elapsed.raw.toNanoseconds());
     const count: f64 = @floatFromInt(events);
+    try out.print("{{\"event_mode\":\"{s}\",", .{if (borrowed) "view" else "owned"});
     try out.print(
-        "{{\"benchmark_schema\":1,\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"target\":\"{s}\",\"workload\":\"{t}\",\"run\":{d},\"events\":{d},\"controls\":{d},\"delta_bytes\":{d},\"events_per_second\":{d:.1},\"ns_per_event\":{d:.1},\"latency_p50_ns\":{d},\"latency_p95_ns\":{d},\"latency_p99_ns\":{d},\"latency_max_ns\":{d},\"allocated_bytes_per_event\":{d:.2},\"allocations_per_event\":{d:.3},\"peak_sdk_bytes\":{d},\"retained_sdk_bytes\":{d},\"after_close_sdk_bytes\":{d}}}\n",
+        "\"benchmark_schema\":1,\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"target\":\"{s}\",\"workload\":\"{t}\",\"run\":{d},\"events\":{d},\"controls\":{d},\"delta_bytes\":{d},\"events_per_second\":{d:.1},\"ns_per_event\":{d:.1},\"latency_p50_ns\":{d},\"latency_p95_ns\":{d},\"latency_p99_ns\":{d},\"latency_max_ns\":{d},\"allocated_bytes_per_event\":{d:.2},\"allocations_per_event\":{d:.3},\"peak_sdk_bytes\":{d},\"retained_sdk_bytes\":{d},\"after_close_sdk_bytes\":{d}}}\n",
         .{ builtin.zig_version_string, @tagName(builtin.mode), @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ @tagName(builtin.abi), workload, repetition, events, control_calls, delta_bytes, count * std.time.ns_per_s / ns, ns / count, percentile(latencies, 50), percentile(latencies, 95), percentile(latencies, 99), latencies[latencies.len - 1], @as(f64, @floatFromInt(loop_bytes)) / count, @as(f64, @floatFromInt(loop_allocations)) / count, peak, retained, counting.live_bytes },
     );
     try out.flush();
@@ -263,6 +264,8 @@ pub fn main(init: std.process.Init) !void {
     const lines = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else default_lines;
     const workload_name = args.next() orelse "normal";
     const repetitions = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 1;
+    const mode = args.next() orelse "owned";
+    if (!std.mem.eql(u8, mode, "owned") and !std.mem.eql(u8, mode, "view")) return error.InvalidReadMode;
     if (lines == 0 or repetitions == 0 or args.next() != null) return error.InvalidArguments;
     const all = std.mem.eql(u8, workload_name, "all");
     const selected = if (all) Workload.normal else std.meta.stringToEnum(Workload, workload_name) orelse return error.InvalidWorkload;
@@ -273,7 +276,13 @@ pub fn main(init: std.process.Init) !void {
         if (all or selected == workload) {
             var stub = try Stub.init(init.gpa, init.io, lines, workload);
             defer stub.deinit(init.gpa, init.io);
-            for (0..repetitions) |i| try measure(init, &stdout.interface, &stub, lines, workload, i + 1);
+            inline for (.{ false, true }) |borrowed| {
+                if (borrowed == std.mem.eql(u8, mode, "view")) {
+                    if (comptime borrowed and !@hasDecl(agent.Client, "nextView")) {
+                        return error.UnsupportedReadMode;
+                    } else for (0..repetitions) |i| try measure(borrowed, init, &stdout.interface, &stub, lines, workload, i + 1);
+                }
+            }
         }
     }
 }

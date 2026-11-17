@@ -11,7 +11,7 @@ pub const ToolResult = struct {
 };
 
 /// Runs synchronously in `next`; `arena` resets before each dispatch.
-/// Keep results valid through reply writing. May send/interrupt/kill, but never reenter `next`.
+/// Keep results valid through reply writing. May send/interrupt/kill, but never reenter either read API.
 pub const ToolHandler = *const fn (
     context: ?*anyopaque,
     arena: Allocator,

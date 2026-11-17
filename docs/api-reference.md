@@ -26,6 +26,7 @@ classDiagram
         +sendCommand(name, arguments) WriteError
         +interrupt() WriteError
         +next() ReadError opt Event
+        +nextView() ReadError opt EventView
         +closeStdin()
         +wait() WaitError Term
         +terminate(grace_ms) WaitError Term
@@ -135,6 +136,16 @@ classDiagram
         unknown
     }
 
+    class EventView {
+        kind : Kind
+        raw : str
+        +subtype() opt str
+        +sessionId() opt str
+        +textDelta() opt str
+        +resultText() opt str
+        +toOwned(allocator) Event
+    }
+
     class Status {
         initialization : InitializationState
         term : opt Term
@@ -176,6 +187,7 @@ classDiagram
 | `PermissionMode` | enum | `options.zig` |
 | `min_cli_version` | `"2.1.228"` | `options.zig` |
 | `Event` | struct | `event.zig` |
+| `EventView` | borrowed streaming projection | `event.zig` |
 | `Kind` | enum | `event.zig` |
 | `Tool` | struct | `tool.zig` |
 | `ToolHandler` | fn pointer | `tool.zig` |
@@ -334,6 +346,14 @@ and then the flags below, in this order. `extra_args` always comes last.
 | Retained buffer capacity | 1 MiB | Larger line buffers and scratch arenas are released on next use. |
 
 ## Event accessors
+
+`nextView()` shares the `ReadError` set and control handling of `next()`. Its
+`EventView` offers the four named accessors below, plus `kind` and `raw`. It
+validates the full line and duplicate keys while skipping unneeded values.
+All view data expires at the next call to either read API or at `close()`;
+no view `deinit` is needed. `try view.toOwned(allocator)` retains an independent
+full event, including unknown fields, and can fail with JSON parse errors or
+`OutOfMemory`. Release that copy with `deinit()`.
 
 | Accessor | Returns |
 |---|---|

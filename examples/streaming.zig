@@ -1,5 +1,5 @@
 // examples/streaming.zig
-// Streams one foreground turn and checks the child's exit status.
+// Streams borrowed text views for one foreground turn and checks exit status.
 
 const std = @import("std");
 const agent = @import("agent");
@@ -22,9 +22,7 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     try client.send(prompt);
-    while (try client.next()) |event| {
-        var e = event;
-        defer e.deinit();
+    while (try client.nextView()) |e| {
         if (e.textDelta()) |text| {
             try stdout.interface.writeAll(text);
             try stdout.interface.flush();

@@ -11,6 +11,10 @@ default:
 build:
     zig build
 
+# Build a compact executable while keeping ReleaseFast throughput.
+build-release:
+    zig build -Doptimize=ReleaseFast -Dstrip=true
+
 # Run the unit tests across all modules.
 test:
     zig build test --test-timeout 10s
@@ -48,8 +52,8 @@ docs-check:
 ci: fmt-check docs-check test test-release build
 
 # Measure Client.next() throughput, latency, and allocations.
-bench lines="20000" workload="normal" runs="1":
-    zig build bench -Doptimize=ReleaseFast -- {{quote(lines)}} {{quote(workload)}} {{quote(runs)}}
+bench lines="20000" workload="normal" runs="1" mode="owned":
+    zig build bench -Doptimize=ReleaseFast -- {{quote(lines)}} {{quote(workload)}} {{quote(runs)}} {{quote(mode)}}
 
 # Emit the agent module's autodocs into zig-out/docs/.
 docs:

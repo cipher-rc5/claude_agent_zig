@@ -13,12 +13,18 @@ because the number could be reused while another thread still holds it. The
 custom transport instead:
 
 1. Sets `O_NONBLOCK` on both pipes (`nonblocking`, via `fcntl`).
-2. Retries on `EAGAIN` after `poll` with a 2 ms timeout.
+2. On `EAGAIN`, probes readiness for up to 2 ms once. If still idle, starts a
+   `std.Io.Threaded` readiness task that polls the pipe plus a wake descriptor, while
+   the caller parks in a cancelable `Io.Event` wait. Writes retain their deadline.
 3. Checks the `stopped` / `failed` flags and `io.checkCancel()` on every
    iteration.
 
-So any thread can stop the I/O within about 2 ms by setting a flag, and no
-descriptor is closed under a thread that is still using it.
+Stopping or failing the transport publishes the flag and signals its wake
+descriptor, waking every blocked readiness task. Canceling a read or write also
+wakes and joins its task and makes the transport terminal. No descriptor closes
+under an active task. A runtime that cannot start a concurrent task falls back
+to bounded polling. Other I/O runtimes also use that fallback, so raw polling
+cannot block a fiber scheduler. The Threaded idle path has no periodic timer.
 
 ## Structure
 
@@ -83,7 +89,7 @@ flowchart TD
     J -- "n > 0" --> K["advance"] --> F
     J -- "n == 0" --> Fail
     J -- "EINTR" --> F
-    J -- "EAGAIN" --> P["poll(POLLOUT, 2 ms)"] --> F
+    J -- "EAGAIN" --> P["readiness wait + terminal wake<br/>bounded by frame deadline"] --> F
     J -- "other errno" --> Fail
 ```
 
@@ -115,7 +121,7 @@ flowchart TD
     R -- "n > 0" --> OK(["return count, or 0 if it went into the buffer"])
     R -- "n == 0" --> EOS
     R -- "EINTR" --> L
-    R -- "EAGAIN" --> P["poll(POLLIN, 2 ms)"] --> L
+    R -- "EAGAIN" --> P["readiness wait + terminal wake"] --> L
     R -- "other errno" --> RF
 ```
 
@@ -124,6 +130,14 @@ flowchart TD
 reported, not hidden.
 
 ## Reaping: `pollChild`
+
+On macOS with `std.Io.Threaded`, `watchChild` registers a process-exit notification in a close-on-exec
+kqueue. Waiters observe its readiness without draining the exit event, so all
+waiters wake. They still call `pollChild` under `state_mutex`; the notification
+never reaps the process or publishes its status. A canceled waiter wakes only
+its own readiness task and leaves the session and other waiters intact. The
+termination grace interval is the readiness deadline before SIGKILL escalation.
+Platforms without this exit descriptor retain the polling fallback.
 
 ```mermaid
 flowchart TD
