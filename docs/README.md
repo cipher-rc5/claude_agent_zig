@@ -51,5 +51,8 @@ the page that covers it. The constants quoted here come from:
 | `max_pending_requests` | 16 | `src/client.zig` |
 | `retain_bytes` (buffer retention cap) | 1 MiB | `src/client.zig` |
 | JSON nesting limit | 128 containers | `jsonDepthWithin` in `src/client.zig` |
-| `default_protocol_version` | `2025-06-18` | `src/protocol.zig` |
+| `default_protocol_version` | `2025-11-25` | `src/protocol.zig` |
+| `modern_protocol_version` | `2026-07-28` | `src/protocol.zig` |
+| `supported_protocol_versions` | `2026-07-28`, `2025-11-25`, `2025-06-18` | `src/protocol.zig` |
+| `list_cache_ttl_ms` / `list_cache_scope` | `0` / `private` | `src/protocol.zig` |
 | `min_cli_version` | `2.1.228` | `src/options.zig` |

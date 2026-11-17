@@ -35,6 +35,40 @@ const tool_result_too_long_message =
     "tool result too long: the SDK caps a tool result at 16384 bytes. " ++
     "Return less data, or a reference to it.";
 
+const codes = protocol.error_codes;
+
+// Protocol versions are dates; longer values cannot be echoed into a bounded reply.
+const max_protocol_version_bytes = 64;
+
+const EraSelection = union(enum) {
+    legacy,
+    modern,
+    unsupported: []const u8,
+    malformed: []const u8,
+};
+
+// Stateless era choice: modern requests declare their version in `params._meta`.
+fn selectEra(params: ?std.json.Value) EraSelection {
+    const meta = if (params) |p| objectField(p, "_meta") else null;
+    const declared = if (meta) |m| objectField(m, protocol.meta_keys.protocol_version) else null;
+    const value = declared orelse return .legacy;
+    const version = switch (value) {
+        .string => |text| text,
+        else => return .{ .malformed = "_meta " ++ protocol.meta_keys.protocol_version ++ " must be a string" },
+    };
+    if (version.len > max_protocol_version_bytes) {
+        return .{ .malformed = "_meta " ++ protocol.meta_keys.protocol_version ++ " is not a protocol version" };
+    }
+    if (protocol.isLegacyProtocolVersion(version)) return .legacy;
+    if (!std.mem.eql(u8, version, protocol.modern_protocol_version)) return .{ .unsupported = version };
+    const capabilities = objectField(meta.?, protocol.meta_keys.client_capabilities) orelse
+        return .{ .malformed = "missing _meta " ++ protocol.meta_keys.client_capabilities };
+    if (capabilities != .object) {
+        return .{ .malformed = "_meta " ++ protocol.meta_keys.client_capabilities ++ " must be an object" };
+    }
+    return .modern;
+}
+
 // Release larger scratch and line buffers on their next use.
 const retain_bytes: usize = 1024 * 1024;
 
@@ -699,16 +733,24 @@ pub const Client = struct {
             return client.writeRendered(line);
         } else |_| {}
         if (std.mem.eql(u8, method, "tools/call")) {
+            // Drop server identity so the fixed fallback fits whatever the name length.
+            const era: protocol.Era = if (comptime args.len == 2 and @TypeOf(args[1]) == protocol.Era)
+                switch (args[1]) {
+                    .legacy => .legacy,
+                    .modern => .{ .modern = null },
+                }
+            else
+                .legacy;
             var small_buffer: [512]u8 = undefined;
             var small: Io.Writer = .fixed(&small_buffer);
             var small_js: std.json.Stringify = .{ .writer = &small };
             protocol.results.toolCall(&small_js, ToolResult{
                 .text = tool_result_too_long_message,
                 .is_error = true,
-            }) catch unreachable;
+            }, era) catch unreachable;
             return client.sendMcpResult(request_id, message_id, small.buffered());
         }
-        return client.sendMcpError(request_id, message_id, -32603, "result too large: register fewer tools or shorten their metadata");
+        return client.sendMcpError(request_id, message_id, protocol.error_codes.internal_error, "result too large: register fewer tools or shorten their metadata");
     }
 
     fn sendPermissionDecision(
@@ -771,13 +813,22 @@ pub const Client = struct {
         const message_id = objectField(message, "id");
 
         const server = tool_mod.findServer(client.servers, server_name) orelse
-            return client.sendMcpError(request_id, message_id, -32601, "unknown server");
+            return client.sendMcpError(request_id, message_id, codes.method_not_found, "unknown server");
 
         client.resetScratch();
 
+        // Notifications carry no `_meta` requirement; the CLI still needs an ack.
+        if (std.mem.startsWith(u8, method, "notifications/")) {
+            // The CLI requires an empty MCP result with ID 0 for notifications.
+            return client.sendMcpResult(request_id, .{ .integer = 0 }, "{}");
+        }
+
+        const params = objectField(message, "params");
+
+        // `initialize` selects legacy semantics whatever its `_meta` says.
         if (std.mem.eql(u8, method, "initialize")) {
-            const offered = if (objectField(message, "params")) |params|
-                stringField(params, "protocolVersion") orelse protocol.default_protocol_version
+            const offered = if (params) |p|
+                stringField(p, "protocolVersion") orelse protocol.default_protocol_version
             else
                 protocol.default_protocol_version;
             return client.sendMcpResultBody(
@@ -789,9 +840,26 @@ pub const Client = struct {
             );
         }
 
-        if (std.mem.startsWith(u8, method, "notifications/")) {
-            // The CLI requires an empty MCP result with ID 0 for notifications.
-            return client.sendMcpResult(request_id, .{ .integer = 0 }, "{}");
+        const era = switch (selectEra(params)) {
+            .legacy => protocol.Era.legacy,
+            .modern => protocol.Era{ .modern = server },
+            .unsupported => |requested| return client.writeLine(
+                protocol.writeUnsupportedProtocolVersion,
+                .{ request_id, message_id, requested },
+            ),
+            .malformed => |reason| return client.sendMcpError(request_id, message_id, codes.invalid_params, reason),
+        };
+
+        if (std.mem.eql(u8, method, "server/discover")) {
+            if (era == .legacy) {
+                return client.sendMcpError(request_id, message_id, codes.invalid_params, "server/discover requires _meta " ++ protocol.meta_keys.protocol_version);
+            }
+            return client.sendMcpResultBody(request_id, message_id, method, protocol.results.discover, .{server});
+        }
+
+        // Removed in 2026-07-28; legacy revisions still require a prompt empty reply.
+        if (std.mem.eql(u8, method, "ping") and era == .legacy) {
+            return client.sendMcpResult(request_id, message_id, "{}");
         }
 
         if (std.mem.eql(u8, method, "tools/list")) {
@@ -800,24 +868,28 @@ pub const Client = struct {
                 message_id,
                 method,
                 protocol.results.toolsList,
-                .{server},
+                .{ server, era },
             );
         }
 
         if (std.mem.eql(u8, method, "tools/call")) {
-            const params = objectField(message, "params") orelse
-                return client.sendMcpError(request_id, message_id, -32602, "missing params");
-            const tool_name = stringField(params, "name") orelse
-                return client.sendMcpError(request_id, message_id, -32602, "missing tool name");
-            const arguments = objectField(params, "arguments") orelse std.json.Value{ .null = {} };
+            const call_params = params orelse
+                return client.sendMcpError(request_id, message_id, codes.invalid_params, "missing params");
+            const tool_name = stringField(call_params, "name") orelse
+                return client.sendMcpError(request_id, message_id, codes.invalid_params, "missing tool name");
+            const arguments = objectField(call_params, "arguments") orelse std.json.Value{ .null = {} };
+            if (arguments != .object and arguments != .null) {
+                return client.sendMcpError(request_id, message_id, codes.invalid_params, "Invalid params for tools/call: 'arguments' must be an object");
+            }
 
+            // The spec reports an unknown tool as invalid params, not an unknown method.
             const tool = server.findTool(tool_name) orelse
-                return client.sendMcpError(request_id, message_id, -32601, "unknown tool");
+                return client.sendMcpError(request_id, message_id, codes.invalid_params, "unknown tool");
 
             const call = tool.handler(tool.context, client.scratch.allocator(), arguments) catch |err| switch (err) {
                 // Unblock the CLI before propagating host OOM.
                 error.OutOfMemory => {
-                    client.sendMcpError(request_id, message_id, -32603, "out of memory") catch {};
+                    client.sendMcpError(request_id, message_id, codes.internal_error, "out of memory") catch {};
                     return error.OutOfMemory;
                 },
                 else => ToolResult{ .text = @errorName(err), .is_error = true },
@@ -826,6 +898,7 @@ pub const Client = struct {
             if (call.text.len > max_tool_result_bytes) {
                 return client.sendMcpResultBody(request_id, message_id, method, protocol.results.toolCall, .{
                     ToolResult{ .text = tool_result_too_long_message, .is_error = true },
+                    era,
                 });
             }
             return client.sendMcpResultBody(
@@ -833,11 +906,11 @@ pub const Client = struct {
                 message_id,
                 method,
                 protocol.results.toolCall,
-                .{call},
+                .{ call, era },
             );
         }
 
-        return client.sendMcpError(request_id, message_id, -32601, "unsupported mcp method");
+        return client.sendMcpError(request_id, message_id, codes.method_not_found, "unsupported mcp method");
     }
 
     fn servePermissionRequest(
@@ -1358,6 +1431,235 @@ test "tools/list carries every tool name and splices the schemas" {
     const schema = objectField(tools[1], "inputSchema").?;
     try std.testing.expectEqualStrings("object", stringField(schema, "type").?);
     try std.testing.expect(objectField(objectField(schema, "properties").?, "name") != null);
+}
+
+// --- 2026-07-28 stateless requests ---
+
+const modern_meta =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+;
+
+fn mcpLine(comptime message: []const u8) []const u8 {
+    return "{\"type\":\"control_request\",\"request_id\":\"m\",\"request\":{\"subtype\":\"mcp_message\",\"server_name\":\"host\",\"message\":" ++ message ++ "}}";
+}
+
+fn mcpError(root: std.json.Value) ?std.json.Value {
+    const response = objectField(root, "response") orelse return null;
+    const inner = objectField(response, "response") orelse return null;
+    const mcp = objectField(inner, "mcp_response") orelse return null;
+    return objectField(mcp, "error");
+}
+
+fn expectServerInfo(result: std.json.Value) !void {
+    const meta = objectField(result, "_meta").?;
+    const info = objectField(meta, protocol.meta_keys.server_info).?;
+    try std.testing.expectEqualStrings("host", stringField(info, "name").?);
+    try std.testing.expectEqualStrings("3.2.1", stringField(info, "version").?);
+}
+
+test "server/discover advertises versions, capabilities, identity, and caching" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try dispatch(&out, &.{handshake_server}, mcpLine(
+        \\{"jsonrpc":"2.0","id":"d1","method":"server/discover","params":{
+    ++ modern_meta ++ "}}"));
+    const parsed = try parseReply(&out);
+    defer parsed.deinit();
+
+    const result = mcpResult(parsed.value).?;
+    try std.testing.expectEqualStrings("complete", stringField(result, "resultType").?);
+    const versions = objectField(result, "supportedVersions").?.array.items;
+    try std.testing.expectEqual(protocol.supported_protocol_versions.len, versions.len);
+    try std.testing.expectEqualStrings("2026-07-28", versions[0].string);
+    const tools = objectField(objectField(result, "capabilities").?, "tools").?;
+    try std.testing.expect(objectField(tools, "listChanged").? == .bool);
+    try expectServerInfo(result);
+    try std.testing.expectEqual(@as(i64, protocol.list_cache_ttl_ms), objectField(result, "ttlMs").?.integer);
+    try std.testing.expectEqualStrings("private", stringField(result, "cacheScope").?);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"id\":\"d1\"") != null);
+}
+
+test "server/discover without modern _meta is malformed, not unknown" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try dispatch(&out, &.{handshake_server}, mcpLine(
+        \\{"jsonrpc":"2.0","id":2,"method":"server/discover"}
+    ));
+    const parsed = try parseReply(&out);
+    defer parsed.deinit();
+    const err = mcpError(parsed.value).?;
+    try std.testing.expectEqual(@as(i64, -32602), objectField(err, "code").?.integer);
+}
+
+test "modern tools/list carries resultType, cache hints, and serverInfo" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try dispatch(&out, &.{handshake_server}, mcpLine(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{
+    ++ modern_meta ++ "}}"));
+    const parsed = try parseReply(&out);
+    defer parsed.deinit();
+
+    const result = mcpResult(parsed.value).?;
+    try std.testing.expectEqualStrings("complete", stringField(result, "resultType").?);
+    try std.testing.expect(objectField(result, "ttlMs").? == .integer);
+    try std.testing.expectEqualStrings("private", stringField(result, "cacheScope").?);
+    try expectServerInfo(result);
+    try std.testing.expectEqual(@as(usize, 2), objectField(result, "tools").?.array.items.len);
+}
+
+fn echoHandler(_: ?*anyopaque, _: Allocator, arguments: std.json.Value) anyerror!ToolResult {
+    return .{ .text = if (arguments == .object) "object" else "null" };
+}
+
+const echo_server: McpServer = .{
+    .name = "host",
+    .version = "3.2.1",
+    .tools = &.{.{ .name = "echo", .description = "Echo.", .handler = echoHandler }},
+};
+
+test "modern tools/call carries resultType and serverInfo" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try dispatch(&out, &.{echo_server}, mcpLine(
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{},
+    ++ modern_meta ++ "}}"));
+    const parsed = try parseReply(&out);
+    defer parsed.deinit();
+
+    const result = mcpResult(parsed.value).?;
+    try std.testing.expectEqualStrings("complete", stringField(result, "resultType").?);
+    try expectServerInfo(result);
+    try std.testing.expect(objectField(result, "isError").?.bool == false);
+    try std.testing.expectEqualStrings("object", stringField(objectField(result, "content").?.array.items[0], "text").?);
+}
+
+test "legacy replies stay free of modern-only fields" {
+    const lines = [_][]const u8{
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":5,"method":"tools/list"}
+        ),
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"echo"}}
+        ),
+        // A legacy version in `_meta` is served with legacy semantics.
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}
+        ),
+    };
+    for (lines) |line| {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try dispatch(&out, &.{echo_server}, line);
+        const parsed = try parseReply(&out);
+        defer parsed.deinit();
+        const result = mcpResult(parsed.value).?;
+        try std.testing.expect(objectField(result, "resultType") == null);
+        try std.testing.expect(objectField(result, "_meta") == null);
+        try std.testing.expect(objectField(result, "ttlMs") == null);
+    }
+}
+
+test "an unsupported protocol version lists what is supported" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try dispatch(&out, &.{handshake_server}, mcpLine(
+        \\{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ));
+    const parsed = try parseReply(&out);
+    defer parsed.deinit();
+
+    const err = mcpError(parsed.value).?;
+    try std.testing.expectEqual(@as(i64, -32022), objectField(err, "code").?.integer);
+    const data = objectField(err, "data").?;
+    try std.testing.expectEqualStrings("1900-01-01", stringField(data, "requested").?);
+    const supported = objectField(data, "supported").?.array.items;
+    try std.testing.expectEqual(protocol.supported_protocol_versions.len, supported.len);
+    for (protocol.supported_protocol_versions, supported) |want, got| try std.testing.expectEqualStrings(want, got.string);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"id\":8") != null);
+}
+
+test "malformed modern _meta is rejected as invalid params" {
+    const lines = [_][]const u8{
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}
+        ),
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":[]}}}
+        ),
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":20260728}}}
+        ),
+        mcpLine("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"" ++
+            @as([65]u8, @splat('9')) ++ "\"}}}"),
+    };
+    for (lines) |line| {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try dispatch(&out, &.{handshake_server}, line);
+        const parsed = try parseReply(&out);
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, -32602), objectField(mcpError(parsed.value).?, "code").?.integer);
+    }
+}
+
+test "ping is answered in legacy mode and unknown in modern mode" {
+    var legacy: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer legacy.deinit();
+    try dispatch(&legacy, &.{handshake_server}, mcpLine(
+        \\{"jsonrpc":"2.0","id":10,"method":"ping"}
+    ));
+    const answered = try parseReply(&legacy);
+    defer answered.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mcpResult(answered.value).?.object.count());
+    try std.testing.expect(std.mem.indexOf(u8, legacy.written(), "\"id\":10") != null);
+
+    var modern: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer modern.deinit();
+    try dispatch(&modern, &.{handshake_server}, mcpLine(
+        \\{"jsonrpc":"2.0","id":11,"method":"ping","params":{
+    ++ modern_meta ++ "}}"));
+    const removed = try parseReply(&modern);
+    defer removed.deinit();
+    try std.testing.expectEqual(@as(i64, -32601), objectField(mcpError(removed.value).?, "code").?.integer);
+}
+
+test "an unknown tool and non-object arguments are invalid params" {
+    const lines = [_][]const u8{
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"missing"}}
+        ),
+        mcpLine(
+            \\{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":[1]}}
+        ),
+    };
+    for (lines) |line| {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try dispatch(&out, &.{echo_server}, line);
+        const parsed = try parseReply(&out);
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, -32602), objectField(mcpError(parsed.value).?, "code").?.integer);
+    }
+}
+
+test "a modern oversized tool result falls back within the frame cap" {
+    const long_name: [max_reply_line_bytes]u8 = @splat('n');
+    const server: McpServer = .{ .name = &long_name };
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var client = dispatchFixture(&out, &.{server});
+    defer client.scratch.deinit();
+    try client.sendMcpResultBody("r", .{ .integer = 1 }, "tools/call", protocol.results.toolCall, .{
+        ToolResult{ .text = "ok" },
+        protocol.Era{ .modern = &server },
+    });
+    const parsed = try parseReply(&out);
+    defer parsed.deinit();
+    const result = mcpResult(parsed.value).?;
+    try std.testing.expectEqualStrings("complete", stringField(result, "resultType").?);
+    try std.testing.expect(objectField(result, "_meta") == null);
+    try std.testing.expect(objectField(result, "isError").?.bool);
 }
 
 fn oversizedHandler(context: ?*anyopaque, arena: Allocator, arguments: std.json.Value) anyerror!ToolResult {
@@ -2155,9 +2457,9 @@ test "oversized correlation metadata is terminal on every reply path" {
         const result = switch (case) {
             0 => client.sendControlError(&large, "unsupported request"),
             1 => client.sendPermissionDecision(&large, .null, .{ .deny = &large }),
-            2 => client.sendMcpError("r", .{ .string = &large }, -32601, "unknown server"),
-            3 => client.sendMcpResultBody(&large, .{ .integer = 1 }, "tools/list", protocol.results.toolsList, .{&server}),
-            else => client.sendMcpResultBody("r", .{ .string = &large }, "tools/call", protocol.results.toolCall, .{ToolResult{ .text = &large }}),
+            2 => client.sendMcpError("r", .{ .string = &large }, codes.method_not_found, "unknown server"),
+            3 => client.sendMcpResultBody(&large, .{ .integer = 1 }, "tools/list", protocol.results.toolsList, .{ &server, protocol.Era.legacy }),
+            else => client.sendMcpResultBody("r", .{ .string = &large }, "tools/call", protocol.results.toolCall, .{ ToolResult{ .text = &large }, protocol.Era.legacy }),
         };
         try std.testing.expectError(error.ReplyTooLong, result);
         try std.testing.expectEqual(@as(usize, 0), out.written().len);

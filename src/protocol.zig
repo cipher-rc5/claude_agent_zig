@@ -7,8 +7,49 @@ const Io = std.Io;
 const McpServer = @import("tool.zig").McpServer;
 const ToolResult = @import("tool.zig").ToolResult;
 
+/// Stateless MCP revision: version, identity, and capabilities ride in each request's `_meta`.
+pub const modern_protocol_version = "2026-07-28";
+
 // Fallback when initialize omits protocolVersion; otherwise echo the offered version.
-pub const default_protocol_version = "2025-06-18";
+pub const default_protocol_version = "2025-11-25";
+
+/// Advertised by `server/discover` and `UnsupportedProtocolVersionError`, newest first.
+/// Legacy revisions are served through the `initialize` handshake.
+pub const supported_protocol_versions = [_][]const u8{ modern_protocol_version, "2025-11-25", "2025-06-18" };
+
+pub fn isLegacyProtocolVersion(version: []const u8) bool {
+    for (supported_protocol_versions[1..]) |legacy| {
+        if (std.mem.eql(u8, legacy, version)) return true;
+    }
+    return false;
+}
+
+/// Request `_meta` keys reserved by the 2026-07-28 revision.
+pub const meta_keys = struct {
+    pub const protocol_version = "io.modelcontextprotocol/protocolVersion";
+    pub const client_capabilities = "io.modelcontextprotocol/clientCapabilities";
+    pub const server_info = "io.modelcontextprotocol/serverInfo";
+};
+
+/// JSON-RPC error codes this server emits.
+pub const error_codes = struct {
+    pub const method_not_found: i32 = -32601;
+    /// Unknown tools and malformed requests, including missing required `_meta`.
+    pub const invalid_params: i32 = -32602;
+    pub const internal_error: i32 = -32603;
+    pub const unsupported_protocol_version: i32 = -32022;
+};
+
+/// Modern results may be cached; tools are host-defined, so never share or reuse them.
+pub const list_cache_ttl_ms: u32 = 0;
+pub const list_cache_scope = "private";
+
+/// Selects the result shape: legacy replies stay byte-compatible with the handshake era.
+pub const Era = union(enum) {
+    legacy,
+    /// 2026-07-28: `resultType`, plus `serverInfo` in `_meta` when known.
+    modern: ?*const McpServer,
+};
 
 // Mid-turn messages are treated as guidance.
 pub fn writeUserMessage(w: *Io.Writer, text: []const u8) !void {
@@ -166,7 +207,7 @@ fn writeCompactJson(w: *Io.Writer, raw: []const u8) Io.Writer.Error!void {
     try w.writeAll(raw[start..]);
 }
 
-// JSON-RPC errors: -32601 unknown method/server, -32602 invalid params.
+// JSON-RPC errors: -32601 unknown method/server, -32602 invalid params or unknown tool.
 pub fn writeMcpError(
     js: *std.json.Stringify,
     request_id: []const u8,
@@ -183,6 +224,37 @@ pub fn writeMcpError(
     try js.write(message);
     try js.endObject();
     try endMcpResponse(js);
+}
+
+/// `UnsupportedProtocolVersionError`: lists every version this server can serve.
+pub fn writeUnsupportedProtocolVersion(
+    js: *std.json.Stringify,
+    request_id: []const u8,
+    message_id: ?std.json.Value,
+    requested: []const u8,
+) !void {
+    try beginMcpResponse(js, request_id, message_id);
+    try js.objectField("error");
+    try js.beginObject();
+    try js.objectField("code");
+    try js.write(error_codes.unsupported_protocol_version);
+    try js.objectField("message");
+    try js.write("Unsupported protocol version");
+    try js.objectField("data");
+    try js.beginObject();
+    try js.objectField("supported");
+    try writeSupportedVersions(js);
+    try js.objectField("requested");
+    try js.write(requested);
+    try js.endObject();
+    try js.endObject();
+    try endMcpResponse(js);
+}
+
+fn writeSupportedVersions(js: *std.json.Stringify) !void {
+    try js.beginArray();
+    for (supported_protocol_versions) |version| try js.write(version);
+    try js.endArray();
 }
 
 // Unsupported requests still need a reply to prevent CLI timeouts.
@@ -256,26 +328,29 @@ pub const results = struct {
         try js.objectField("protocolVersion");
         try js.write(offered);
         try js.objectField("capabilities");
-        try js.beginObject();
-        try js.objectField("tools");
-        try js.beginObject();
-        try js.objectField("listChanged");
-        try js.write(false);
-        try js.endObject();
-        try js.endObject();
+        try writeCapabilities(js);
         try js.objectField("serverInfo");
-        try js.beginObject();
-        try js.objectField("name");
-        try js.write(server.name);
-        try js.objectField("version");
-        try js.write(server.version);
+        try writeImplementation(js, server);
         try js.endObject();
+    }
+
+    /// `server/discover`; only reachable with modern `_meta`.
+    pub fn discover(js: *std.json.Stringify, server: *const McpServer) !void {
+        try js.beginObject();
+        try writeModernFields(js, .{ .modern = server });
+        try js.objectField("supportedVersions");
+        try writeSupportedVersions(js);
+        try js.objectField("capabilities");
+        try writeCapabilities(js);
+        try writeCacheFields(js);
         try js.endObject();
     }
 
     // Compact validated schemas to keep one-line framing.
-    pub fn toolsList(js: *std.json.Stringify, server: *const McpServer) !void {
+    pub fn toolsList(js: *std.json.Stringify, server: *const McpServer, era: Era) !void {
         try js.beginObject();
+        try writeModernFields(js, era);
+        if (era == .modern) try writeCacheFields(js);
         try js.objectField("tools");
         try js.beginArray();
         for (server.tools) |tool| {
@@ -294,8 +369,9 @@ pub const results = struct {
         try js.endObject();
     }
 
-    pub fn toolCall(js: *std.json.Stringify, call: ToolResult) !void {
+    pub fn toolCall(js: *std.json.Stringify, call: ToolResult, era: Era) !void {
         try js.beginObject();
+        try writeModernFields(js, era);
         try js.objectField("content");
         try js.beginArray();
         try js.beginObject();
@@ -308,6 +384,49 @@ pub const results = struct {
         try js.objectField("isError");
         try js.write(call.is_error);
         try js.endObject();
+    }
+
+    fn writeCapabilities(js: *std.json.Stringify) !void {
+        try js.beginObject();
+        try js.objectField("tools");
+        try js.beginObject();
+        try js.objectField("listChanged");
+        try js.write(false);
+        try js.endObject();
+        try js.endObject();
+    }
+
+    fn writeImplementation(js: *std.json.Stringify, server: *const McpServer) !void {
+        try js.beginObject();
+        try js.objectField("name");
+        try js.write(server.name);
+        try js.objectField("version");
+        try js.write(server.version);
+        try js.endObject();
+    }
+
+    // Servers implementing 2026-07-28 MUST send `resultType` and SHOULD identify themselves.
+    fn writeModernFields(js: *std.json.Stringify, era: Era) !void {
+        const identity = switch (era) {
+            .legacy => return,
+            .modern => |server| server,
+        };
+        try js.objectField("resultType");
+        try js.write("complete");
+        if (identity) |server| {
+            try js.objectField("_meta");
+            try js.beginObject();
+            try js.objectField(meta_keys.server_info);
+            try writeImplementation(js, server);
+            try js.endObject();
+        }
+    }
+
+    fn writeCacheFields(js: *std.json.Stringify) !void {
+        try js.objectField("ttlMs");
+        try js.write(list_cache_ttl_ms);
+        try js.objectField("cacheScope");
+        try js.write(list_cache_scope);
     }
 };
 
@@ -444,19 +563,19 @@ test "tools/list splices input schemas verbatim" {
     }};
     const server: McpServer = .{ .name = "host", .tools = &tools };
 
-    var r = try render(results.toolsList, .{&server});
+    var r = try render(results.toolsList, .{ &server, Era.legacy });
     defer r.deinit();
     try expectContains(r.text(), "\"name\":\"add\"");
     try expectContains(r.text(), "\"inputSchema\":{\"type\":\"object\"");
 }
 
 test "tool call result reports the error flag" {
-    var ok = try render(results.toolCall, .{ToolResult{ .text = "42" }});
+    var ok = try render(results.toolCall, .{ ToolResult{ .text = "42" }, Era.legacy });
     defer ok.deinit();
     try expectContains(ok.text(), "\"text\":\"42\"");
     try expectContains(ok.text(), "\"isError\":false");
 
-    var failed = try render(results.toolCall, .{ToolResult{ .text = "boom", .is_error = true }});
+    var failed = try render(results.toolCall, .{ ToolResult{ .text = "boom", .is_error = true }, Era.legacy });
     defer failed.deinit();
     try expectContains(failed.text(), "\"isError\":true");
 }

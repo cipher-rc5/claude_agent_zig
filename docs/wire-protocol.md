@@ -228,7 +228,7 @@ none.
 ### MCP error
 
 ```json
-{"type":"control_response","response":{"subtype":"success","request_id":"req_8","response":{"mcp_response":{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"unknown tool"}}}}}
+{"type":"control_response","response":{"subtype":"success","request_id":"req_8","response":{"mcp_response":{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"unknown tool"}}}}}
 ```
 
 A JSON-RPC error still travels in a `success` control response. The control
@@ -236,9 +236,24 @@ layer worked; the error is at the MCP layer.
 
 | Code | Messages used |
 |---|---|
-| `-32601` | `unknown server`, `unknown tool`, `unsupported mcp method` |
-| `-32602` | `missing params`, `missing tool name` |
+| `-32601` | `unknown server`, `unsupported mcp method` (including `ping` on a `2026-07-28` request) |
+| `-32602` | `missing params`, `missing tool name`, `unknown tool`, `Invalid params for tools/call: 'arguments' must be an object`, malformed `_meta` (`io.modelcontextprotocol/protocolVersion` not a string or over 64 bytes, `io.modelcontextprotocol/clientCapabilities` missing or not an object), `server/discover requires _meta io.modelcontextprotocol/protocolVersion` |
 | `-32603` | `out of memory`, `result too large: register fewer tools or shorten their metadata` |
+| `-32022` | `Unsupported protocol version`, with `data.supported` (every entry of `supported_protocol_versions`) and `data.requested` |
+
+### Modern (`2026-07-28`) results
+
+When the request's `params._meta` declares
+`io.modelcontextprotocol/protocolVersion` = `2026-07-28`, every result adds
+`resultType` and identifies the server in `_meta`:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"req_13","response":{"mcp_response":{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"host","version":"0.1.0"}},"ttlMs":0,"cacheScope":"private","tools":[{"name":"add","description":"Add two numbers.","inputSchema":{"type":"object"}}]}}}}}
+```
+
+`ttlMs` and `cacheScope` appear on `tools/list` and `server/discover`. The
+`tools/call` fallback for an oversized reply drops `_meta` so it always fits.
+Legacy replies are unchanged.
 
 ### Notification acknowledgement
 
@@ -287,8 +302,17 @@ removed, so it stays on one line) and spliced in.
 ```
 
 Methods the client handles: `initialize`, `notifications/*`, `tools/list`,
-`tools/call`. For `initialize`, `params.protocolVersion` is echoed back. If
-it is missing, `2025-06-18` is used.
+`tools/call`, `server/discover` (modern requests only), and `ping` (legacy
+requests only; MCP `2026-07-28` removed it). For `initialize`,
+`params.protocolVersion` is echoed back. If it is missing, `2025-11-25` is
+used.
+
+A `2026-07-28` request carries its version and capabilities in `_meta`
+instead of relying on a handshake:
+
+```json
+{"type":"control_request","request_id":"req_14","request":{"subtype":"mcp_message","server_name":"host","message":{"jsonrpc":"2.0","id":"d1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}}}
+```
 
 ### `can_use_tool` request
 

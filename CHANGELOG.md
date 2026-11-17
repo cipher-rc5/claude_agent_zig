@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MCP `2026-07-28` support for SDK servers, alongside the legacy handshake.
+  Requests declaring `io.modelcontextprotocol/protocolVersion` in `_meta`
+  are served statelessly: `server/discover`, `resultType` on every result,
+  `io.modelcontextprotocol/serverInfo` in result `_meta`, and `ttlMs` /
+  `cacheScope` on `tools/list`. Unknown versions get
+  `UnsupportedProtocolVersionError` (`-32022`) listing the supported ones.
+  Legacy requests answer `ping`.
+
 - Borrowed `Client.nextView()` / `EventView` streaming projections with complete
   validation and explicit conversion to independently owned events.
 - Opt-in `-Dstrip=true` and `just build-release`, plus owned/view benchmark
@@ -42,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport, and tooling, with Mermaid diagrams.
 
 ### Changed
+
+- An unknown SDK tool now answers JSON-RPC `-32602` (invalid params) rather
+  than `-32601`, as both the `2025-06-18` and `2026-07-28` MCP schemas
+  specify. `tools/call` with non-object `arguments` is rejected with `-32602`
+  instead of reaching the handler.
+- The `initialize` fallback, used only when the CLI omits
+  `protocolVersion`, is now `2025-11-25`, the newest handshake revision.
 
 - Small owned events reserve one parse-arena block; MCP results render once
   into a complete bounded frame. User-message framing and permission fallbacks

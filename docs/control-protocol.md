@@ -62,6 +62,21 @@ Integer ids are converted to decimal text (up to 20 characters, so
 In-process tools are exposed to the CLI as SDK MCP servers. The CLI wraps
 each JSON-RPC message in a `mcp_message` control request naming the server.
 
+The server is dual-era, as MCP `2026-07-28` permits. The era is chosen per
+request, with no connection state:
+
+- `initialize` selects the legacy (handshake) semantics of `2025-11-25` and
+  earlier. Today's CLI opens this way.
+- A request whose `params._meta` carries
+  `io.modelcontextprotocol/protocolVersion` = `2026-07-28` is served
+  statelessly: results gain `resultType`, `_meta` with
+  `io.modelcontextprotocol/serverInfo`, and, for `tools/list` and
+  `server/discover`, the `ttlMs` / `cacheScope` cache hints.
+- A legacy version in `_meta` (`2025-11-25`, `2025-06-18`) is served with
+  legacy semantics. Any other version gets `UnsupportedProtocolVersionError`
+  (`-32022`) listing `supported_protocol_versions`.
+- No version in `_meta` is a legacy request.
+
 ```mermaid
 flowchart TD
     M(["subtype = mcp_message"]) --> Msg{"message object<br/>with a method?"}
@@ -70,20 +85,33 @@ flowchart TD
     Msg -- yes --> Srv{"findServer(server_name)"}
     Srv -- "not found" --> J1["JSON-RPC -32601 unknown server"]
     Srv -- found --> Reset["reset scratch arena"]
-    Reset --> Meth{"method"}
+    Reset --> Pre{"method"}
 
-    Meth -- "initialize" --> Init["results.initialize:<br/>echo offered protocolVersion<br/>(default 2025-06-18),<br/>tools.listChanged = false,<br/>serverInfo name and version"]
-    Meth -- "notifications/*" --> Notif["mcp result {} with id 0"]
+    Pre -- "notifications/*" --> Notif["mcp result {} with id 0"]
+    Pre -- "initialize" --> Init["results.initialize:<br/>echo offered protocolVersion<br/>(default 2025-11-25),<br/>tools.listChanged = false,<br/>serverInfo name and version"]
+    Pre -- other --> Era{"params._meta<br/>protocolVersion"}
+
+    Era -- "absent or legacy version" --> Meth{"method"}
+    Era -- "2026-07-28 with<br/>clientCapabilities object" --> Meth
+    Era -- "other version" --> J6["-32022 Unsupported protocol version<br/>data: supported, requested"]
+    Era -- "not a string, over 64 bytes,<br/>or capabilities missing" --> J7["-32602 malformed _meta"]
+
+    Meth -- "server/discover" --> Disc{"modern?"}
+    Disc -- no --> J8["-32602 server/discover requires _meta"]
+    Disc -- yes --> DR["results.discover:<br/>supportedVersions, capabilities,<br/>serverInfo, ttlMs, cacheScope"]
+    Meth -- "ping (legacy)" --> Ping["mcp result {}"]
     Meth -- "tools/list" --> List["results.toolsList:<br/>name, description,<br/>inputSchema spliced compact"]
     Meth -- "tools/call" --> Call
-    Meth -- other --> J2["JSON-RPC -32601 unsupported mcp method"]
+    Meth -- "other, or ping (modern)" --> J2["JSON-RPC -32601 unsupported mcp method"]
 
     subgraph Call["tools/call"]
         P{"params present?"} -- no --> J3["-32602 missing params"]
         P -- yes --> N{"params.name present?"}
         N -- no --> J4["-32602 missing tool name"]
-        N -- yes --> FT{"findTool(name)"}
-        FT -- no --> J5["-32601 unknown tool"]
+        N -- yes --> AR{"arguments absent<br/>or an object?"}
+        AR -- no --> J9["-32602 arguments must be an object"]
+        AR -- yes --> FT{"findTool(name)"}
+        FT -- no --> J5["-32602 unknown tool"]
         FT -- yes --> H["handler(context, arena, arguments or null)"]
         H -- "OutOfMemory" --> OOM["reply -32603 out of memory,<br/>then return OutOfMemory"]
         H -- "other error" --> ER["ToolResult{ text = errorName, is_error = true }"]
@@ -93,6 +121,7 @@ flowchart TD
         SZ -- no --> OK["results.toolCall(result)"]
     end
 
+    DR --> Budget
     Init --> Budget["sendMcpResultBody: render under frame budget"]
     List --> Budget
     TL --> Budget
